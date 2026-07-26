@@ -6,13 +6,13 @@
             "port": 59075
         },
         {
-            "name": "gpunode2",
-            "host": "202.199.13.237",
+            "name": "gpunode1",
+            "host": "202.199.13.4",
             "port": 59075
         },
         {
-            "name": "gpunode1",
-            "host": "202.199.13.4",
+            "name": "gpunode2",
+            "host": "219.216.65.42",
             "port": 59075
         }
     ]
