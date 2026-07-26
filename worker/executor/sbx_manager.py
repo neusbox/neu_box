@@ -473,6 +473,20 @@ class SbxManager:
                     self.destroy_sandbox(name)
                     cleaned += 1
 
+        # 补充：文件系统孤儿扫描（cgroup 目录存在但 DB 无记录）
+        db_names = set(self._list_sandbox_names())
+        fs_names = set(self.list_sandboxes_via_script())
+        orphans = fs_names - db_names
+        for name in orphans:
+            logger.warning("清理文件系统孤儿沙盒 '%s' (DB 无记录)", name)
+            try:
+                self._run_script('destroy', name)
+            except Exception as e:
+                logger.warning("孤儿沙盒 '%s' 清理失败: %s", name, e)
+            cleaned += 1
+        if orphans:
+            logger.warning("文件系统孤儿清理完成: %s 个 (%s)", len(orphans), sorted(orphans))
+
         return cleaned
 
 

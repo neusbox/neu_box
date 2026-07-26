@@ -42,7 +42,7 @@ def run():
         resp = Nodes_Pool.get_nodes_pool().forward_to_node(node_id, '/command/run', req)
         return resp.json(), resp.status_code
     except ValueError as e:
-        return {'error': str(e)}, 404
+        return {'error': f'{e}。请检查是否选择了正确的节点'}, 404
 
 
 @command_bp.route('/tasks/delete', methods=['POST'])
@@ -65,7 +65,7 @@ def delete_tasks():
             node_id, '/command/tasks/delete', {'task_ids': task_ids})
         return resp.json(), resp.status_code
     except ValueError as e:
-        return {'error': str(e)}, 404
+        return {'error': f'{e}。请检查是否选择了正确的节点'}, 404
 
 
 @command_bp.route('/queue', methods=['GET'])
@@ -82,7 +82,7 @@ def queue():
         resp = Nodes_Pool.get_nodes_pool().forward_get_to_node(node_id, '/command/queue')
         return resp.json(), resp.status_code
     except ValueError as e:
-        return {'error': str(e)}, 404
+        return {'error': f'{e}。请检查是否选择了正确的节点'}, 404
 
 
 @command_bp.route('/result/<task_id>', methods=['GET'])
@@ -100,7 +100,7 @@ def result(task_id: str):
             node_id, f'/command/result/{task_id}')
         return resp.json(), resp.status_code
     except ValueError as e:
-        return {'error': str(e)}, 404
+        return {'error': f'{e}。请检查是否选择了正确的节点'}, 404
 
 
 @command_bp.route('/result/<task_id>/log', methods=['GET'])
@@ -128,4 +128,4 @@ def result_log(task_id: str):
             return resp.text, resp.status_code, {'Content-Type': resp.headers.get('Content-Type', 'text/plain')}
         return resp.json(), resp.status_code
     except ValueError as e:
-        return {'error': str(e)}, 404
+        return {'error': f'{e}。请检查是否选择了正确的节点'}, 404

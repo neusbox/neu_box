@@ -46,7 +46,9 @@ def create():
         'password': password,
     }
 
-    response = Nodes_Pool.get_nodes_pool().req_node(node_id, req)
+    try:
+        response = Nodes_Pool.get_nodes_pool().req_node(node_id, req)
+    except ValueError as e:
+        return {'error': f'{e}。请检查左侧是否选择了正确的节点'}, 404
 
-    # 暂返模拟响应
     return response.json(), response.status_code
