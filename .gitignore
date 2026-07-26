@@ -13,3 +13,4 @@ master/static/uploads/*
 *.log
 *.pytest_cache/
 nohup.out
+config.json
