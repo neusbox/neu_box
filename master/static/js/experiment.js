@@ -1075,6 +1075,17 @@ document.getElementById('logContent').addEventListener('click', async (e) => {
   }
 });
 
+// ── Ctrl+S 保存实验 ──
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    const saveBtn = document.getElementById('nbSaveBtn');
+    if (saveBtn && saveBtn.offsetParent !== null) {
+      e.preventDefault();
+      saveBtn.click();
+    }
+  }
+});
+
 // Initial queue load if node is selected
 if (state.selectedNodeId) {
   fetchQueue();
