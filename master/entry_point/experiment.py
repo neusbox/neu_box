@@ -14,6 +14,7 @@ from datetime import datetime
 from flask import Blueprint, request
 
 from src_manager.db import Database
+from entry_point.auth import login_required
 
 experiment_bp = Blueprint('experiment', __name__)
 db = Database.get_instance()
@@ -33,6 +34,7 @@ ALLOWED_MIMETYPES = {
 
 
 @experiment_bp.route('/', methods=['POST'])
+@login_required
 def create_experiment():
     """创建实验。
 
@@ -56,6 +58,7 @@ def create_experiment():
 
 
 @experiment_bp.route('/', methods=['GET'])
+@login_required
 def list_experiments():
     search = (request.args.get('search') or '').strip()
     tag = (request.args.get('tag') or '').strip()
@@ -70,6 +73,7 @@ def list_experiments():
 
 
 @experiment_bp.route('/<exp_id>', methods=['GET'])
+@login_required
 def get_experiment(exp_id: str):
     exp = db.get_experiment(exp_id)
     if not exp:
@@ -78,6 +82,7 @@ def get_experiment(exp_id: str):
 
 
 @experiment_bp.route('/<exp_id>', methods=['PUT'])
+@login_required
 def update_experiment(exp_id: str):
     """全量更新实验（含 blocks）。"""
     exp = db.get_experiment(exp_id)
@@ -96,6 +101,7 @@ def update_experiment(exp_id: str):
 
 
 @experiment_bp.route('/upload-image', methods=['POST'])
+@login_required
 def upload_image():
     """上传图片，返回 Markdown 可用的 URL。
 
@@ -151,6 +157,7 @@ def upload_image():
 # ═══════════════════════════════════════════════════════════════
 
 @experiment_bp.route('/folders', methods=['GET'])
+@login_required
 def list_folders():
     """获取文件夹树。"""
     tree = db.get_folder_tree()
@@ -158,6 +165,7 @@ def list_folders():
 
 
 @experiment_bp.route('/folders', methods=['POST'])
+@login_required
 def create_folder():
     """创建文件夹。
 
@@ -172,6 +180,7 @@ def create_folder():
 
 
 @experiment_bp.route('/folders/<fid>', methods=['PUT'])
+@login_required
 def update_folder(fid: str):
     """重命名或移动文件夹。
 
@@ -189,6 +198,7 @@ def update_folder(fid: str):
 
 
 @experiment_bp.route('/folders/<fid>', methods=['DELETE'])
+@login_required
 def delete_folder(fid: str):
     if not db.delete_folder(fid):
         return {'error': '文件夹不存在'}, 404
@@ -196,6 +206,7 @@ def delete_folder(fid: str):
 
 
 @experiment_bp.route('/<exp_id>', methods=['DELETE'])
+@login_required
 def delete_experiment(exp_id: str):
     # 清理实验引用的图片
     exp = db.get_experiment(exp_id)
@@ -263,6 +274,7 @@ def _save_logs(logs: dict):
 
 
 @experiment_bp.route('/log/<task_id>', methods=['GET'])
+@login_required
 def serve_exp_log(task_id: str):
     """提供缓存的实验日志（副本，不受 worker 任务删除影响）。"""
     path = os.path.join(EXP_LOG_DIR, f'{task_id}.log')

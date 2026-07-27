@@ -1,9 +1,11 @@
 from flask import Blueprint, request
 from src_manager.nodes_pool import Nodes_Pool
+from entry_point.auth import login_required
 
 terminal_bp = Blueprint('terminal', __name__)
 
 @terminal_bp.route('/create', methods=['POST'])
+@login_required
 def create():
     data = request.get_json()
 

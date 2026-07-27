@@ -20,28 +20,21 @@ async function fetchSandboxes() {
 }
 
 function parseSandboxName(name) {
-  // term_<pid>.slice          → TTYD Web 终端 (type: 'terminal')
-  // term_<user>_<pid>.slice   → 手动 acquire (type: 'acquire')
-  // cmd_<task_id>             → 命令任务 (type: 'command')
-  if (name.startsWith('term_')) {
-    // 去掉 .slice 后缀
+  // 统一格式: sbx_{owner}_{id}.slice
+  if (name.startsWith('sbx_')) {
     const clean = name.endsWith('.slice') ? name.slice(0, -6) : name;
-    const parts = clean.slice(5).split('_');
-    const pid = parts.pop();
-    const user = parts.join('_');
-    // 只有一个数字 PID → TTYD 终端；有用户名 → 手动 acquire
-    const type = user ? 'acquire' : 'terminal';
-    return { type, user: user || '?', pid };
+    const parts = clean.split('_');
+    // parts = ['sbx', owner, id, ...]
+    const owner = parts.length > 1 ? parts[1] : '?';
+    const id = parts.length > 2 ? parts.slice(2).join('_') : '';
+    return { owner, id };
   }
-  if (name.startsWith('cmd_')) {
-    return { type: 'command', id: name.slice(4) };
-  }
-  return { type: 'other', name };
+  return { owner: '?', id: name };
 }
 
 function renderSandboxes(sandboxes) {
   if (!sandboxes || sandboxes.length === 0) {
-    queueList.innerHTML = '<div class="queue-empty">无活跃终端 / 沙盒</div>';
+    queueList.innerHTML = '<div class="queue-empty">无活跃沙盒</div>';
     return;
   }
 
@@ -51,63 +44,30 @@ function renderSandboxes(sandboxes) {
     const devices = (sb.devices && sb.devices.length > 0)
       ? sb.devices.map(d => {
           const parts = (d+'').split(':');
-          return parts[1] || parts[0];  // show minor number
+          return parts[1] || parts[0];
         }).join(', ')
       : '';
     const res = [];
     if (sb.cpu) res.push(`CPU ${sb.cpu}`);
     if (sb.mem && sb.mem !== '0') res.push(sb.mem);
     const resStr = res.length > 0 ? res.join(' ') : '';
+    const hasPort = !!sb.port;
+    const icon = hasPort ? '⌨' : '📦';
 
-    if (info.type === 'terminal') {
-      return `
-        <div class="sandbox-item sandbox-terminal">
-          <span class="sandbox-icon">⌨</span>
-          <div class="sandbox-info">
-            <div class="sandbox-line1">
-              <span class="sandbox-label">终端</span>
-              ${info.user !== '?' ? `<span class="sandbox-user">${escapeHtml(info.user)}</span>` : ''}
-            </div>
-            <div class="sandbox-line2">
-              ${devices ? `<span class="sandbox-dev">卡 ${devices}</span>` : ''}
-              ${resStr ? `<span class="sandbox-res">${resStr}</span>` : ''}
-            </div>
+    return `
+      <div class="sandbox-item">
+        <span class="sandbox-icon">${icon}</span>
+        <div class="sandbox-info">
+          <div class="sandbox-line1">
+            <span class="sandbox-user">${escapeHtml(info.owner)}</span>
+            <span class="sandbox-id" title="${escapeHtml(info.id)}">${escapeHtml(info.id.slice(0, 12))}</span>
           </div>
-        </div>`;
-    }
-    if (info.type === 'acquire') {
-      return `
-        <div class="sandbox-item sandbox-acquire">
-          <span class="sandbox-icon">🔗</span>
-          <div class="sandbox-info">
-            <div class="sandbox-line1">
-              <span class="sandbox-user">${escapeHtml(info.user)}</span>
-              <span class="sandbox-label">手动挂载</span>
-            </div>
-            <div class="sandbox-line2">
-              ${devices ? `<span class="sandbox-dev">卡 ${devices}</span>` : ''}
-              ${resStr ? `<span class="sandbox-res">${resStr}</span>` : ''}
-            </div>
+          <div class="sandbox-line2">
+            ${devices ? `<span class="sandbox-dev">卡 ${devices}</span>` : ''}
+            ${resStr ? `<span class="sandbox-res">${resStr}</span>` : ''}
           </div>
-        </div>`;
-    }
-    if (info.type === 'command') {
-      return `
-        <div class="sandbox-item sandbox-command">
-          <span class="sandbox-icon">⚡</span>
-          <div class="sandbox-info">
-            <div class="sandbox-line1">
-              <span class="sandbox-label">命令任务</span>
-              <span class="sandbox-id" title="${escapeHtml(info.id)}">${escapeHtml(info.id.slice(0, 10))}…</span>
-            </div>
-            <div class="sandbox-line2">
-              ${devices ? `<span class="sandbox-dev">卡 ${devices}</span>` : ''}
-              ${resStr ? `<span class="sandbox-res">${resStr}</span>` : ''}
-            </div>
-          </div>
-        </div>`;
-    }
-    return `<div class="sandbox-item"><span class="sandbox-icon">?</span><span>${escapeHtml(name)}</span></div>`;
+        </div>
+      </div>`;
   }).join('');
 }
 

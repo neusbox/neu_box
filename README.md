@@ -38,6 +38,11 @@ sudo python main.py
 | `db_dir` | `./db` | SQLite 数据库目录（实验记录） |
 | `poll_interval` | `15` | 节点状态轮询间隔（秒） |
 | `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `SECRET_KEY` | (随机) | Flask session 加密密钥，生产环境务必设置固定值 |
+| `ADMIN_USER` | `admin` | 初始管理员用户名 |
+| `ADMIN_PASS` | `admin` | 初始管理员密码 |
+| `upload_max_size` | `10485760` | 实验图片上传大小限制（字节），默认 10MB |
+| `EXP_LOG_DIR` | `./logs/exp` | 实验日志缓存目录 |
 
 节点列表由 `master/config.json` 中的 `nodes_pool` 数组管理，支持前端 UI 动态增删：
 
@@ -163,6 +168,28 @@ destroy_sandbox(name)
        ├─ 清理 BPF map 设备预留
        └─ rmdir cgroup
 ```
+
+## Master 用户系统
+
+Master 内置统一的用户登录认证。首次启动自动创建管理员账号（默认 `admin`/`admin`，通过 `ADMIN_USER` / `ADMIN_PASS` 环境变量修改）。
+
+- 登录后可配置每个节点的凭据（节点名 → 用户名 + 密码），操作时自动填入，无需反复输入
+- 未登录无法调用任何写操作 API（终端创建、命令提交、实验管理、节点增删等）
+- 节点状态查询等只读接口保持公开，前端无需登录即可看到节点列表
+- `neu-sbox` CLI 直连 Worker，完全不受 Master 认证影响
+- Worker 侧零改动
+
+## 公网暴露安全注意事项
+
+如需将 Master 暴露到公网，建议以下防护措施：
+
+- TLS 终止（Nginx/Caddy 反代 + Let's Encrypt 证书）
+- 登录接口速率限制（`limit_req` 防暴力破解）
+- `SECRET_KEY` 设为强随机值（`python -c "import secrets; print(secrets.token_hex(32))"`）
+- Session cookie 配置 `secure=True, httponly=True, samesite=Strict`
+- Worker 节点仅监听内网地址，不对外暴露端口
+- Master ↔ Worker 之间走 VPN/内网专线（如 WireGuard、Tailscale）
+- **推荐方案**：不直接暴露 Master，改用 VPN 接入内网后访问
 
 ## 前端功能
 

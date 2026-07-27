@@ -306,17 +306,18 @@ class SbxManager:
 
     # ── 终端专用 ─────────────────────────────────────────────────
 
-    def allocate_for_terminal(self, terminal_id: str,
+    def allocate_for_terminal(self, owner: str, terminal_id: str,
                               cpu: int = 0, mem: str = "0",
                               device_num: int = 0,
                               device_ids: Optional[List[str]] = None,
                               port: int = None) -> Optional[dict]:
         """为终端/手动 acquire 分配沙盒。
 
-        沙盒命名为 term_<terminal_id>。
+        沙盒命名为 sbx_{owner}_{terminal_id}.slice。
 
         Args:
-            terminal_id: 终端唯一标识（如 ttyd 的 PID 或 user_pid）
+            owner:       沙盒所有者（系统用户名）
+            terminal_id: 终端唯一标识（ttyd 的 PID 或 acquire 的 pid）
             device_num:  要分配的设备数量 (0=不分配，device_ids 为空时自动选取)
             device_ids:  用户指定的设备号列表 (如 ["235:1","235:3"])，优先于 device_num
             cpu/mem/port: 同 create_sandbox
@@ -324,7 +325,7 @@ class SbxManager:
         Returns:
             成功返回 {'sandbox_name': str, 'devices': [str]}，失败返回 None。
         """
-        sandbox_name = f"term_{terminal_id}.slice"
+        sandbox_name = f"sbx_{owner}_{terminal_id}.slice"
 
         devices = []
         if device_ids:
@@ -380,7 +381,7 @@ class SbxManager:
 
     def cleanup_orphaned(self) -> int:
         """清理所有进程已退出的沙盒，释放设备资源。
-        对于 term_* 沙盒，增加终端超时未连接检查：若进程存活但端口无
+        对于有端口的沙盒，增加终端超时未连接检查：若进程存活但端口无
         ESTABLISHED 连接且超过 terminal_idle_timeout 秒，则强制杀进程并清理。
 
         Returns:
@@ -452,8 +453,8 @@ class SbxManager:
                     Port_Pool_Manager.get_Port_Pool_Manager().release_port(port)
                 self.destroy_sandbox(name)
                 cleaned += 1
-            elif name.startswith('term_'):
-                # 终端沙盒：进程还活着但端口无 ESTABLISHED 连接 → 无人使用，直接清理
+            elif record.get('port'):
+                # 终端沙盒（有端口）：进程还活着但端口无 ESTABLISHED 连接 → 无人使用，直接清理
                 port = record.get('port')
                 if port and port not in active_ports:
                     logger.warning("终端沙盒 '%s' 端口 %s 无活跃连接，清理", name, port)

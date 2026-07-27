@@ -125,6 +125,7 @@ if not sbs:
 else:
     for s in sbs:
         name = s.get('name', '')
+        owner = s.get('owner', '?')
         cpu = s.get('cpu', 0) or 0
         mem = s.get('mem', '0') or '0'
         devices = s.get('devices', [])
@@ -133,14 +134,9 @@ else:
         if cpu: res_parts.append(f'CPU={cpu}')
         if mem and mem != '0': res_parts.append(f'mem={mem}')
         res_str = ' '.join(res_parts) if res_parts else '资源不限'
-        # 从沙盒名提取用户名：term_<user>_<pid>.slice
-        user = '?'
-        if name.startswith('term_'):
-            parts = name[5:].replace('.slice','').split('_')
-            if len(parts) >= 2:
-                user = parts[0]
+        port_str = f' 端口={s[\"port\"]}' if s.get('port') else ''
         print(f'  {name}')
-        print(f'    用户: {user}  |  设备: {dev_str}  |  {res_str}')
+        print(f'    用户: {owner}  |  设备: {dev_str}  |  {res_str}{port_str}')
 " 2>/dev/null || curl -s "${WORKER_URL}/sandbox/list?username=${USER}"
         ;;
 
@@ -152,6 +148,26 @@ else:
             grep -E "sandbox_" "$cgroup_path" 2>/dev/null || echo "  未在任何沙盒中"
         else
             echo "  无法读取 cgroup 信息"
+        fi
+        ;;
+
+    join|j)
+        sandbox_name="${2:-}"
+        if [ -z "$sandbox_name" ]; then
+            echo "用法: neu-sbox join <sandbox_name>"
+            echo "先用 neu-sbox list 查看可用沙盒"
+            exit 1
+        fi
+        shell_pid=$PPID
+        echo "[neu-sbox] 加入沙盒: ${sandbox_name}"
+        echo "[neu-sbox] PID=${shell_pid} user=${USER}"
+        resp=$(curl -s -X POST "${WORKER_URL}/sandbox/join" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${USER}\",\"pid\":${shell_pid},\"sandbox_name\":\"${sandbox_name}\"}")
+        echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
+        if echo "$resp" | grep -q '"pid"'; then
+            echo ""
+            echo "✓ 已加入沙盒 ${sandbox_name}"
         fi
         ;;
 
@@ -237,7 +253,7 @@ print(line)
     *)
         echo "neu-sbox — 终端沙盒隔离 / 命令任务提交"
         echo ""
-        echo "用法: neu-sbox {acquire|release|list|status|tasks|result} [参数]"
+        echo "用法: neu-sbox {acquire|release|list|status|join|tasks|result} [参数]"
         echo ""
         echo "  acquire [选项...]                        创建沙盒或提交任务"
         echo ""
@@ -252,6 +268,7 @@ print(line)
         echo "  release <sandbox_name>                   释放沙盒"
         echo "  list                                     列出我的沙盒（含资源详情）"
         echo "  status                                   查看当前 shell 沙盒状态"
+        echo "  join <sandbox_name>                      将当前 shell 加入已有沙盒（需归属校验）"
         echo "  tasks                                    查看任务队列"
         echo "  result <task_id>                         查看任务结果和日志"
         echo ""
@@ -262,6 +279,7 @@ print(line)
         echo "  neu-sbox acquire --devices 1 --cpu 4 --command \"npu-smi info\"  # 提交任务"
         echo "  neu-sbox list                            # 列出沙盒（显示设备/资源）"
         echo "  neu-sbox tasks                           # 查看队列"
+        echo "  neu-sbox join sbx_pengyt_67890.slice      # 将当前 shell 加入已有沙盒"
         echo "  neu-sbox result abc123                   # 查看任务 abc123 结果和日志"
         echo "  neu-sbox release user_pengyt_12345"
         echo ""
@@ -276,7 +294,7 @@ print(line)
         echo "    neu-sbox acquire --devices 6,7"
         echo "    # 2. 记下 sandbox_name（如 term_pengyt_12345.slice）"
         echo "    # 3. Docker 挂在沙盒 cgroup 下运行"
-        echo "    docker run --rm --cgroup-parent /sandbox_term_pengyt_12345.slice -it IMAGE bash"
+        echo "    docker run --rm --cgroup-parent sandbox_term_pengyt_12345.slice -it IMAGE bash"
         echo ""
         echo "  容器内所有进程自动归属沙盒 cgroup，无需 --device 参数。"
         echo "  --pid 将 bash PID 加入沙盒仅影响 bash 自身，不影响 Docker 容器。"

@@ -109,8 +109,10 @@ def create():
             normalized_ids = _normalize_device_ids(device_ids, sbx._discover_device_nodes())
 
         # 6. 分配沙盒并加入 ttyd 进程
+        owner = username if username else 'root'
         result = sbx.allocate_for_terminal(
-            str(process.pid),
+            owner=owner,
+            terminal_id=str(process.pid),
             cpu=sandbox_cpu,
             mem=sandbox_mem,
             device_num=device_num if not normalized_ids else 0,

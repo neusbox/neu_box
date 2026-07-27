@@ -3,11 +3,13 @@
 import requests
 from flask import Blueprint, request
 from src_manager.nodes_pool import Nodes_Pool
+from entry_point.auth import login_required
 
 command_bp = Blueprint('command', __name__)
 
 
 @command_bp.route('/run', methods=['POST'])
+@login_required
 def run():
     """提交命令到指定 Worker 的任务队列。"""
     data = request.get_json(silent=True) or {}
@@ -46,6 +48,7 @@ def run():
 
 
 @command_bp.route('/tasks/delete', methods=['POST'])
+@login_required
 def delete_tasks():
     """批量删除任务，转发到指定 Worker。
 
@@ -69,6 +72,7 @@ def delete_tasks():
 
 
 @command_bp.route('/queue', methods=['GET'])
+@login_required
 def queue():
     """查看指定 Worker 上的任务队列。
 
@@ -86,6 +90,7 @@ def queue():
 
 
 @command_bp.route('/result/<task_id>', methods=['GET'])
+@login_required
 def result(task_id: str):
     """查看任务结果元数据（状态、返回码等）。
 
@@ -104,6 +109,7 @@ def result(task_id: str):
 
 
 @command_bp.route('/result/<task_id>/log', methods=['GET'])
+@login_required
 def result_log(task_id: str):
     """获取任务日志文件内容（分块）。
 

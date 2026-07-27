@@ -18,6 +18,12 @@
   <div class="panel panel-form" id="formPanel">
     <div class="header">
       <h1>neu_box</h1>
+      <div class="user-area" id="userArea">
+        <span class="user-status" id="userStatus">未登录</span>
+        <button class="header-btn" id="loginBtn" title="登录">🔑 登录</button>
+        <button class="header-btn" id="credentialBtn" title="凭据配置" style="display:none">🔐</button>
+        <button class="header-btn" id="logoutBtn" title="登出" style="display:none">退出</button>
+      </div>
       <button class="theme-toggle" id="themeToggle" title="切换浅色/深色模式">🌙</button>
       <!-- 模式切换 -->
       <div class="mode-toggle" id="modeToggle">
@@ -227,7 +233,7 @@
 </div>
 
 <!-- ═══ 通知弹窗 ═══ -->
-<div class="modal-overlay" id="noticeModal" style="display:none">
+<div class="modal-overlay" id="noticeModal" style="display:none;z-index:3000">
   <div class="modal-card" style="max-width:480px">
     <div class="modal-header">
       <span>📢 通知</span>
@@ -268,6 +274,79 @@
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="submit-btn" id="rerunConfirmBtn" style="flex:1;margin-top:0">确认执行</button>
         <button class="submit-btn cancel" id="rerunCancelBtn" style="flex:1;margin-top:0;background:var(--card-bg);color:var(--text);border:1px solid var(--border)">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 登录弹窗 ═══ -->
+<div class="modal-overlay" id="loginModal" style="display:none">
+  <div class="modal-card" style="max-width:380px">
+    <div class="modal-header">
+      <span>🔑 登录 neu_box</span>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" class="text-input" id="loginUsername" placeholder="输入用户名" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" class="text-input" id="loginPassword" placeholder="输入密码" autocomplete="current-password">
+      </div>
+      <div id="loginError" style="color:var(--danger);font-size:12px;margin-bottom:8px;display:none"></div>
+      <button class="submit-btn" id="loginSubmitBtn" style="width:100%;margin-top:4px">登录</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 账户管理弹窗 ═══ -->
+<div class="modal-overlay" id="accountModal" style="display:none">
+  <div class="modal-card" style="max-width:540px">
+    <div class="modal-header">
+      <span>🔐 账户管理</span>
+      <button class="modal-close" id="accountModalClose" title="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <!-- 用户信息 -->
+      <div class="account-section">
+        <div class="account-section-title">👤 用户信息</div>
+        <div class="account-info-row">
+          <span class="account-label">用户名</span>
+          <span class="account-value" id="acctUsername">—</span>
+        </div>
+        <div class="account-info-row">
+          <span class="account-label">角色</span>
+          <span class="account-value" id="acctRole">—</span>
+        </div>
+      </div>
+
+      <!-- 修改密码 -->
+      <div class="account-section">
+        <div class="account-section-title">🔒 修改密码</div>
+        <div class="account-pw-fields">
+          <input type="password" class="text-input" id="acctOldPw" placeholder="旧密码" autocomplete="off">
+          <input type="password" class="text-input" id="acctNewPw" placeholder="新密码（至少4位）" autocomplete="off">
+          <input type="password" class="text-input" id="acctConfirmPw" placeholder="确认新密码" autocomplete="off">
+        </div>
+        <div id="acctPwMsg" style="font-size:12px;margin-top:4px;display:none"></div>
+        <button class="submit-btn" id="acctPwBtn" style="margin-top:8px;width:100%">修改密码</button>
+      </div>
+
+      <!-- 节点凭据 -->
+      <div class="account-section">
+        <div class="account-section-title">🔗 节点凭据</div>
+        <div style="font-size:11px;color:var(--sub);margin-bottom:8px">为每个节点配置用户名和密码，操作时自动填入。</div>
+        <div id="credentialList" class="account-cred-list">
+          <div style="color:var(--sub);font-size:13px;text-align:center;padding:12px">加载中…</div>
+        </div>
+        <div class="modal-field-row" style="gap:6px;flex-wrap:wrap">
+          <input type="text" class="text-input" id="credNodeName" placeholder="节点名称" style="flex:1;min-width:100px" list="credNodeList">
+          <datalist id="credNodeList"></datalist>
+          <input type="text" class="text-input" id="credUsername" placeholder="用户名" style="flex:1;min-width:100px" autocomplete="off">
+          <input type="password" class="text-input" id="credPassword" placeholder="密码 (终端用)" style="flex:1;min-width:100px" autocomplete="off">
+          <button class="modal-add-btn" id="credSaveBtn">保存</button>
+        </div>
       </div>
     </div>
   </div>

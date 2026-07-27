@@ -47,7 +47,7 @@ def _find_sandbox_for_pid(pid: int) -> str | None:
     try:
         with open(f'/proc/{pid}/cgroup') as f:
             for line in f:
-                # cgroup v2 格式: "0::/sandbox_term_pengyt_12345"
+                # cgroup v2 格式: "0::/sandbox_sbx_pengyt_12345.slice"
                 if 'sandbox_' in line:
                     return line.strip().rsplit('/', 1)[-1]
     except Exception:
@@ -122,9 +122,9 @@ def acquire():
 
     # 创建沙盒并分配设备
     sbx = SbxManager.get_instance()
-    terminal_id = f"{username}_{pid}"
     result = sbx.allocate_for_terminal(
-        terminal_id,
+        owner=username,
+        terminal_id=str(pid),
         cpu=cpu,
         mem=sandbox_mem,
         device_num=device_num if not normalized_ids else 0,
@@ -172,13 +172,72 @@ def release():
         return {'message': f'沙盒 {sandbox_name} 不存在或已销毁', 'sandbox_name': sandbox_name}, 200
 
 
+@sandbox_bp.route('/join', methods=['POST'])
+def join():
+    """将指定 PID 加入已有沙盒。
+
+    请求体: { "username": "pengyt", "pid": 12345, "sandbox_name": "sbx_pengyt_67890.slice" }
+
+    校验:
+      1. PID 必须属于 username（通过 /proc/<pid>/status 的 UID 校验）
+      2. 沙盒名的 owner 段必须与 username 一致
+    """
+    body = request.get_json(silent=True) or {}
+    username = (body.get('username') or '').strip()
+    pid = body.get('pid', 0)
+    sandbox_name = (body.get('sandbox_name') or '').strip()
+
+    if not username or not pid:
+        return {'error': 'username 和 pid 为必填参数'}, 400
+    if not isinstance(pid, int) or pid <= 0:
+        return {'error': 'pid 必须为正整数'}, 400
+    if not sandbox_name:
+        return {'error': 'sandbox_name 为必填参数'}, 400
+
+    # 校验 PID 归属
+    if not _verify_pid_owner(pid, username):
+        return {'error': f'PID {pid} 不属于用户 {username}，或进程不存在'}, 403
+
+    # 校验沙盒归属：从沙盒名提取 owner
+    if sandbox_name.startswith('sbx_'):
+        parts = sandbox_name[:-6].split('_', 2) if sandbox_name.endswith('.slice') else sandbox_name.split('_', 2)
+        owner = parts[1] if len(parts) > 1 else ''
+        if owner != username:
+            return {'error': f'沙盒 "{sandbox_name}" 不属于用户 {username}（属于 {owner}）'}, 403
+    else:
+        return {'error': '不支持的沙盒名称格式'}, 400
+
+    # 如果 PID 已在某个沙盒中，先退出旧的
+    sbx = SbxManager.get_instance()
+    old_name = _find_sandbox_for_pid(pid)
+    if old_name:
+        logger.warning("join: PID %s 已在沙盒 '%s' 中，先退出", pid, old_name)
+        # 从旧沙盒 cgroup 中移除（移到根 cgroup）
+        try:
+            with open('/sys/fs/cgroup/cgroup.procs', 'w') as f:
+                f.write(str(pid))
+        except Exception:
+            pass
+
+    # 加入目标沙盒
+    if not sbx.join_sandbox(sandbox_name, pid):
+        return {'error': '加入沙盒失败'}, 500
+
+    logger.warning("用户 %s 将 PID %s 加入沙盒 '%s'", username, pid, sandbox_name)
+    return {
+        'sandbox_name': sandbox_name,
+        'pid': pid,
+        'message': f'PID {pid} 已加入沙盒 {sandbox_name}',
+    }, 200
+
+
 @sandbox_bp.route('/list', methods=['GET'])
 def list_sandboxes():
     """列出沙盒及其资源信息。
 
     Query: ?username=pengyt  可选，过滤指定用户
 
-    响应: { sandboxes: [{ name, cpu, mem, devices, port, created_at, pids }] }
+    响应: { sandboxes: [{ name, owner, cpu, mem, devices, port, created_at, pids }] }
     """
     username = (request.args.get('username') or '').strip()
     db = Database.get_instance()
@@ -187,10 +246,16 @@ def list_sandboxes():
     sandboxes = []
     for s in all_records:
         name = s.get('name') or ''
-        if username and not name.startswith(f"term_{username}_"):
+        if username and not name.startswith(f"sbx_{username}_"):
             continue
+        # 从沙盒名提取 owner
+        owner = ''
+        if name.startswith('sbx_'):
+            parts = name[:-6].split('_', 2) if name.endswith('.slice') else name.split('_', 2)
+            owner = parts[1] if len(parts) > 1 else ''
         sandboxes.append({
             'name': name,
+            'owner': owner,
             'cpu': s.get('cpu', 0),
             'mem': s.get('mem', '0'),
             'devices': s.get('devices', []),

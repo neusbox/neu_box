@@ -166,7 +166,12 @@ def execute_in_sandbox(
             logger.warning("join_sandbox 跳过 (进程可能已退出): %s", e)
 
         # 4. 边跑边写日志：启动线程读取 stdout，写入文件（非 DB）
-        task_id = sandbox_name[4:] if sandbox_name.startswith('cmd_') else sandbox_name
+        # 沙盒命名格式: sbx_{owner}_{id}.slice
+        if sandbox_name.startswith('sbx_'):
+            parts = sandbox_name[:-6].split('_', 2)
+            task_id = parts[2] if len(parts) > 2 else sandbox_name
+        else:
+            task_id = sandbox_name
 
         stdout_lines = []
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -406,7 +411,10 @@ class TaskQueue:
         sbx = SbxManager.get_instance()
         for tid in to_kill:
             try:
-                sbx.destroy_sandbox(f"cmd_{tid}")
+                # 从 DB 查沙盒名称
+                task = self._db.get_task(tid)
+                user_id = (task.get('user_id') or 'unknown') if task else 'unknown'
+                sbx.destroy_sandbox(f"sbx_{user_id}_{tid}.slice")
             except Exception as e:
                 logger.warning('销毁沙盒 %s 失败: %s', tid, e)
             self._db.update_task_result(
@@ -465,7 +473,7 @@ class TaskQueue:
 
     def _execute_one(self, task: dict, devices: list):
         """在独立线程中执行单个任务。若执行中被取消则跳过写 DB（避免覆盖取消状态）。"""
-        sandbox_name = f"cmd_{task['task_id']}"
+        sandbox_name = f"sbx_{task['user_id']}_{task['task_id']}.slice"
         try:
             result = execute_in_sandbox(
                 command=task['command'],
@@ -565,7 +573,7 @@ class TaskQueue:
                 # ── 3. 锁外：建沙盒（锁定设备）→ 更新 DB → 启动线程 ──
                 if allocated:
                     ok = sbx.create_sandbox(
-                        f"cmd_{task['task_id']}",
+                        f"sbx_{task['user_id']}_{task['task_id']}.slice",
                         cpu=task.get('cpu', 0),
                         mem=task.get('mem', '0'),
                         devices=allocated)

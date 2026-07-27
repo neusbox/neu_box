@@ -177,6 +177,43 @@ body {
   background: rgba(0,113,227,.06);
 }
 
+/* ── User area / header buttons ─────────────────────────────── */
+
+.user-area {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: absolute;
+  top: 16px;
+  left: 16px;
+}
+
+.user-status {
+  font-size: 12px;
+  color: var(--sub);
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card-bg);
+  color: var(--text);
+  cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+}
+
+.header-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* ── Field ─────────────────────────────────────────────────── */
 
 .field {
@@ -797,6 +834,44 @@ body {
 }
 
 .modal-delete-btn:hover { background: rgba(255,59,48,.1); }
+
+/* ── Account modal sections ─────────────────────────────────── */
+
+.account-section {
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.account-section:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+
+.account-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.account-info-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 13px;
+}
+.account-label { color: var(--sub); min-width: 48px; }
+.account-value { font-weight: 500; }
+
+.account-pw-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.account-pw-fields .text-input { width: 100%; box-sizing: border-box; }
+
+.account-cred-list {
+  max-height: 200px;
+  overflow-y: auto;
+  margin-bottom: 10px;
+}
 
 @keyframes fadeIn {
   from { opacity: 0; }

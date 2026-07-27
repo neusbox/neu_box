@@ -4,6 +4,7 @@ import threading
 
 import flask
 from src_manager.nodes_pool import Nodes_Pool
+from entry_point.auth import login_required
 
 nodes_bp = flask.Blueprint('nodes', __name__)
 
@@ -34,6 +35,7 @@ def get_config_nodes():
 
 
 @nodes_bp.route('/config/add', methods=['POST'])
+@login_required
 def add_config_node():
     """向 config.json 新增一个节点。"""
     data = flask.request.get_json() or {}
@@ -67,6 +69,7 @@ def add_config_node():
 
 
 @nodes_bp.route('/config/remove', methods=['POST'])
+@login_required
 def remove_config_node():
     """从 config.json 删除一个节点（按名称匹配）。"""
     data = flask.request.get_json() or {}
