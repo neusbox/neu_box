@@ -80,16 +80,33 @@ while IFS=, read -r pci_bus mem_total mem_used gpu_util; do
     done
 done <<< "$output"
 
+# ── 按 PCI bus ID 排序建立绝对索引 ──
+# 所有 GPU 始终在 DRM 中可见（包括 ebpf 已分配的），所以按 PCI 排序的
+# 序号是永恒稳定的：即使某张卡被 ebpf 拿走，剩余卡的 index 也不会变。
+sorted_minors=()
+while IFS=: read -r _pci_bus _pci_devfn _minor; do
+    sorted_minors+=("$_minor")
+done < <(for m in "${all_minors[@]}"; do
+    echo "${minor_to_pci[$m]}:$m"
+done | sort -t: -k1,1 -k2,2n)
+
+# 建立 minor → index 映射
+declare -A minor_to_idx
+for i in "${!sorted_minors[@]}"; do
+    minor_to_idx["${sorted_minors[$i]}"]=$i
+done
+
 # ── 输出 ──
 idle=0
 busy_json="["
 first=1
-for minor in $(printf '%s\n' "${all_minors[@]}" | sort -n); do
+for minor in "${sorted_minors[@]}"; do
+    idx=${minor_to_idx[$minor]}
     if [ "${minor_busy[$minor]}" = "0" ]; then
         idle=$((idle + 1))
     else
         if [ "$first" -eq 1 ]; then first=0; else busy_json+=","; fi
-        busy_json+="$minor"
+        busy_json+="$idx"
     fi
 done
 busy_json+="]"
