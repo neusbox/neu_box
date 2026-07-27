@@ -93,8 +93,10 @@ POST /terminal/create {node_id, username, password, cpu, memory, device_num}
   │
 Reaper(每30s) → cleanup_orphaned():
   ├─ PID已死 → 销毁沙盒 + 归还端口
-  └─ PID存活但端口无ESTABLISHED连接 → SIGTERM → 销毁沙盒 + 归还端口
+  └─ PID存活但端口无ESTABLISHED连接 → SIGTERM → 销毁沙盒 + 归还端口 (仅对有端口的沙盒)
 ```
+
+沙盒统一命名为 `sbx_{owner}_{id}.slice`，由 systemd 管理 cgroup 生命周期。前端不再区分终端/挂载/命令类型，统一在终端栏显示。
 
 ### 命令模式
 
@@ -107,7 +109,7 @@ POST /command/run {node_id, user_id, command, cpu, memory, device_num}
   │
 TaskQueue 后台消费线程:
   ├─ 取队首任务
-  ├─ SbxManager.create_sandbox()       → 创建 cgroup 沙盒
+  ├─ SbxManager.create_sandbox(sbx_{user}_{task_id}.slice)  → 创建 cgroup 沙盒
   ├─ Popen('bash -i -c <cmd>', ...)    → 交互模式（自动source ~/.bashrc）
   ├─ 后台线程逐块 read() stdout        → 实时写入 {LOG_DIR}/{task_id}.log
   ├─ 进程结束                          → DB 更新状态/返回码
@@ -122,13 +124,14 @@ GET /command/result/<id>/log?raw=1  → 纯文本日志 + Content-Length 头
 将当前 shell 加入独占设备的 cgroup 沙盒，或提交一次性命令任务。Worker 通过 `/proc/<pid>/status` 校验 PID 归属，无需密码。
 
 ```bash
-# 安装 — Worker 用 sudo 启动时自动安装到 /etc/profile.d/
-source /etc/profile.d/neu-sbox.sh
+# 安装 — Worker 用 sudo 启动时自动安装到 /etc/profile.d/ 并复制到 /usr/local/bin/neu-sbox
+# source /etc/profile.d/neu-sbox.sh
 
 # ── 沙盒（终端隔离） ──
 neu-sbox acquire 1              # 申请 1 个 NPU，加入当前 shell
 neu-sbox acquire 2 4 8          # 申请 2 NPU + 4 核 CPU + 8G 内存
 neu-sbox status                 # 查看当前 shell 是否在沙盒中
+neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
 neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
 neu-sbox release <name>         # 释放指定沙盒
 # 已在沙盒中再次 acquire → 自动释放旧沙盒，覆盖为新资源
@@ -149,13 +152,15 @@ neu-sbox acquire 1
 ```
 POST /sandbox/acquire {username, pid, device_num, cpu, memory}
   → /proc/<pid>/cgroup 检测是否已在沙盒中 → 是: 先释放旧沙盒
-  → /proc/<pid>/status 校验归属 → cgroup 创建 + 设备分配 → PID 加入
+  → /proc/<pid>/status 校验归属 → 创建 sbx_{user}_{pid}.slice + 设备分配 → PID 加入
 POST /sandbox/acquire {..., command: "nvidia-smi"}   # 带命令 → 走任务队列
   → 类似 POST /command/run，提交后返回 task_id
+POST /sandbox/join {username, pid, sandbox_name}
+  → /proc/<pid>/status 校验 PID 归属 → 沙盒名 owner 段对比 → 加入目标沙盒 cgroup
 POST /sandbox/release {sandbox_name}
   → destroy_sandbox() → cgroup.freeze → cgroup.kill → 设备归还
 GET  /sandbox/list
-  → 返回活跃沙盒详情（名称、CPU、内存、设备列表、PID）
+  → 返回活跃沙盒详情（名称、owner、CPU、内存、设备列表、端口、PID）
 ```
 
 ### 沙盒销毁流程
@@ -198,5 +203,5 @@ Master 内置统一的用户登录认证。首次启动自动创建管理员账�
 | 日志查看 | XHR 全量拉取 + 进度条，自动滚底，`\r` 进度条处理 |
 | 任务重跑 | completed/failed 任务右侧 `↻` 按钮，确认后以原参数重新提交 |
 | 实验记录 | 保存时复制日志副本（>500KB 截断），展开时懒加载；`\r` 处理 |
-| 终端面板 | 终端模式中栏显示活跃终端（用户、设备卡号、资源）和命令沙盒 |
+| 终端面板 | 终端模式中栏统一显示所有活跃沙盒（owner、ID、设备卡号、资源），不再区分类型 |
 | 节点管理 | 前端 UI 增删节点，60s 自动轮询 |
