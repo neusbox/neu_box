@@ -419,9 +419,9 @@ class TaskQueue:
                 logger.warning('销毁沙盒 %s 失败: %s', tid, e)
             self._db.update_task_result(
                 tid, 'failed', -1, '', '', error='用户手动取消')
-            _remove_log_file(tid)
+            # 保留日志文件，用户再次删除时才会清理
             deleted += 1
-            logger.info('已取消运行中任务 %s', tid)
+            logger.info('已取消运行中任务 %s (日志保留)', tid)
 
         if deleted > 0:
             logger.info('批量删除 %s 个任务', deleted)
