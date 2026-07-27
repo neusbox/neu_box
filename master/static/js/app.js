@@ -74,6 +74,17 @@ const logContent        = document.getElementById('logContent');
 if (state.cmdUserId) cmdUserIdEl.value = state.cmdUserId;
 
 // ═══════════════════════════════════════════════════════════════
+// Notebook layout helpers
+// ═══════════════════════════════════════════════════════════════
+
+function clearNotebookBars() {
+  const top = document.getElementById('nbTopBar');
+  const bot = document.getElementById('nbBottomActions');
+  if (top) top.remove();
+  if (bot) bot.remove();
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Formatting helpers
 // ═══════════════════════════════════════════════════════════════
 
@@ -172,6 +183,7 @@ function switchMode(mode) {
     rightPanel.classList.add('mode-command');
     rightPanel.classList.remove('mode-terminal');
     // Reset log viewer to placeholder
+    clearNotebookBars();
     logPlaceholder.style.display = '';
     logContent.style.display = 'none';
     logContent.innerHTML = '';
@@ -185,6 +197,7 @@ function switchMode(mode) {
     rightPanel.classList.add('mode-command');
     rightPanel.classList.remove('mode-terminal');
     // Reset log viewer
+    clearNotebookBars();
     logPlaceholder.style.display = '';
     logContent.style.display = 'none';
     logContent.innerHTML = '';

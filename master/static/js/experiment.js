@@ -720,6 +720,12 @@ function exportExperimentToMd(title, tags, author, updatedAt, blocks) {
 // ═══════════════════════════════════════════════════════════════
 
 async function viewExperiment(expId) {
+  // 清除旧 notebook 栏
+  const prevTop = document.getElementById('nbTopBar');
+  const prevBot = document.getElementById('nbBottomActions');
+  if (prevTop) prevTop.remove();
+  if (prevBot) prevBot.remove();
+
   logPlaceholder.style.display = 'none';
   logContent.style.display = '';
   logContent.innerHTML = '<div style="color:#636366">加载中…</div>';
@@ -731,6 +737,11 @@ async function viewExperiment(expId) {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     exp = await resp.json();
   } catch (err) {
+    // 清除可能遗留的旧栏
+    const errTop = document.getElementById('nbTopBar');
+    const errBot = document.getElementById('nbBottomActions');
+    if (errTop) errTop.remove();
+    if (errBot) errBot.remove();
     logContent.innerHTML = `<div style="color:#ff5f57">加载失败: ${err.message}</div>`;
     return;
   }
@@ -739,63 +750,60 @@ async function viewExperiment(expId) {
   const blocks = exp.blocks || [];
   const tagsStr = (exp.tags || []).join(', ');
 
-  let html = '<div class="exp-notebook" id="notebookRoot">';
-
-  // 标题
-  html += `<input type="text" class="exp-nb-title" id="nbTitle" value="${escapeHtml(exp.title)}" placeholder="实验标题">`;
-
-  // 元信息 + 标签
-  html += '<div class="exp-detail-meta">';
-  html += `<span>创建者: ${escapeHtml(exp.created_by || '—')}</span>`;
-  html += `<span>更新: ${formatTime(exp.updated_at)}</span>`;
-  html += '</div>';
-  html += '<div class="exp-nb-field" style="margin-top:8px">';
-  html += `<input type="text" class="text-input" id="nbTags" value="${escapeHtml(tagsStr)}" placeholder="标签，逗号分隔">`;
-  html += '</div>';
-
-  // 文件夹选择
-  html += '<div class="exp-nb-field" style="margin-top:6px">';
-  html += '<label>文件夹</label>';
-  html += '<select class="text-input" id="nbFolder" style="width:100%">';
-  html += '<option value="">— 无 —</option>';
+  // ── 顶部固定栏：标题 + 元信息 + 标签 + 文件夹 + 模式切换 ──
+  let topHtml = '<div class="nb-top-bar" id="nbTopBar">';
+  topHtml += `<input type="text" class="exp-nb-title" id="nbTitle" value="${escapeHtml(exp.title)}" placeholder="实验标题">`;
+  topHtml += '<div class="exp-detail-meta">';
+  topHtml += `<span>创建者: ${escapeHtml(exp.created_by || '—')}</span>`;
+  topHtml += `<span>更新: ${formatTime(exp.updated_at)}</span>`;
+  topHtml += '</div>';
+  topHtml += '<div class="exp-nb-field" style="margin-top:8px">';
+  topHtml += `<input type="text" class="text-input" id="nbTags" value="${escapeHtml(tagsStr)}" placeholder="标签，逗号分隔">`;
+  topHtml += '</div>';
+  topHtml += '<div class="exp-nb-field" style="margin-top:6px">';
+  topHtml += '<label>文件夹</label>';
+  topHtml += '<select class="text-input" id="nbFolder" style="width:100%">';
+  topHtml += '<option value="">— 无 —</option>';
   for (const f of _folderData) {
-    html += _folderSelectOptions(f, '', exp.folder_id || '', 0);
+    topHtml += _folderSelectOptions(f, '', exp.folder_id || '', 0);
   }
-  html += '</select>';
-  html += '</div>';
+  topHtml += '</select>';
+  topHtml += '</div>';
+  topHtml += '<div class="nb-mode-bar">';
+  topHtml += '<button class="nb-mode-btn active" data-mode="preview">预览</button>';
+  topHtml += '<button class="nb-mode-btn" data-mode="edit">编辑</button>';
+  topHtml += '</div>';
+  topHtml += '</div>'; // .nb-top-bar
 
-  // ── 模式切换 ──
-  html += '<div class="nb-mode-bar">';
-  html += '<button class="nb-mode-btn active" data-mode="preview">预览</button>';
-  html += '<button class="nb-mode-btn" data-mode="edit">编辑</button>';
-  html += '</div>';
-
-  // ── 块区域 ──
-  html += '<div class="nb-blocks-area" id="nbBlocksArea">';
+  // ── 中间可滚动区域：notebook 块 ──
+  let midHtml = '<div class="exp-notebook" id="notebookRoot">';
+  midHtml += '<div class="nb-blocks-area" id="nbBlocksArea">';
   const isEdit = _notebookMode === 'edit';
   const blockFn = isEdit ? blockEditHtml : blockPreviewHtml;
   if (blocks.length === 0) {
-    if (isEdit) html += insertBarHtml(0);
-    else html += '<div style="color:var(--sub);font-size:13px;padding:8px 0;text-align:center">暂无内容，切换到编辑模式添加</div>';
+    if (isEdit) midHtml += insertBarHtml(0);
+    else midHtml += '<div style="color:var(--sub);font-size:13px;padding:8px 0;text-align:center">暂无内容，切换到编辑模式添加</div>';
   } else {
     blocks.forEach((block, i) => {
-      if (isEdit) html += insertBarHtml(i);
-      html += blockFn(block, i);
+      if (isEdit) midHtml += insertBarHtml(i);
+      midHtml += blockFn(block, i);
     });
-    if (isEdit) html += insertBarHtml(blocks.length);
+    if (isEdit) midHtml += insertBarHtml(blocks.length);
   }
-  html += '</div>';
+  midHtml += '</div>';
+  midHtml += '</div>'; // .exp-notebook
 
-  // ── 保存 / 导出 / 删除 ──
-  html += '<div class="exp-nb-actions">';
-  html += `<button class="save-exp-btn" id="nbSaveBtn" style="flex:1">💾 保存</button>`;
-  html += `<button class="save-exp-btn" id="nbExportBtn" style="flex:0">📥 导出</button>`;
-  html += `<button class="submit-btn danger" id="nbDeleteBtn">🗑 删除</button>`;
-  html += '</div>';
+  // ── 底部固定栏：操作按钮 ──
+  let botHtml = '<div class="nb-bottom-actions" id="nbBottomActions">';
+  botHtml += `<button class="save-exp-btn" id="nbSaveBtn" style="flex:1">💾 保存</button>`;
+  botHtml += `<button class="save-exp-btn" id="nbExportBtn" style="flex:0">📥 导出</button>`;
+  botHtml += `<button class="submit-btn danger" id="nbDeleteBtn">🗑 删除</button>`;
+  botHtml += '</div>'; // .nb-bottom-actions
 
-  html += '</div>'; // .exp-notebook
-
-  logContent.innerHTML = html;
+  // 插入到 log-viewer 中：top ➜ logContent(中间) ➜ bottom
+  logContent.insertAdjacentHTML('beforebegin', topHtml);
+  logContent.innerHTML = midHtml;
+  logContent.insertAdjacentHTML('afterend', botHtml);
 
   // 设置当前实验引用 + 绑定块事件
   _currentExpData = exp;
@@ -879,6 +887,11 @@ async function viewExperiment(expId) {
       const r = await fetch(`/experiments/${expId}`, { method: 'DELETE' });
       if (r.ok) {
         showToast('已删除', 'success');
+        // 清除 notebook 三栏
+        const delTop = document.getElementById('nbTopBar');
+        const delBot = document.getElementById('nbBottomActions');
+        if (delTop) delTop.remove();
+        if (delBot) delBot.remove();
         logPlaceholder.style.display = '';
         logContent.style.display = 'none';
         logContent.innerHTML = '';
