@@ -62,7 +62,7 @@ case "$cmd" in
                 -H "Content-Type: application/json" \
                 -d "{\"user_id\":\"${USER}\",\"command\":\"${command}\",\"device_num\":${device_num},\"device_ids\":${dev_ids_json},\"cpu\":${cpu},\"memory\":${memory},\"mem_unit\":\"GB\"}")
 
-            echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
+            echo "$resp" | python3 -m json.tool --no-ensure-ascii 2>/dev/null || echo "$resp"
 
             if echo "$resp" | grep -q '"task_id"'; then
                 task_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])" 2>/dev/null)
@@ -85,7 +85,7 @@ case "$cmd" in
             -H "Content-Type: application/json" \
             -d "{\"username\":\"${USER}\",\"pid\":${shell_pid},\"device_num\":${device_num},\"device_ids\":${dev_ids_json},\"cpu\":${cpu},\"memory\":${memory},\"mem_unit\":\"GB\"}")
 
-        echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
+        echo "$resp" | python3 -m json.tool --no-ensure-ascii 2>/dev/null || echo "$resp"
 
         if echo "$resp" | grep -q '"sandbox_name"'; then
             name=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['sandbox_name'])" 2>/dev/null)
@@ -105,7 +105,7 @@ case "$cmd" in
         curl -s -X POST "${WORKER_URL}/sandbox/release" \
             -H "Content-Type: application/json" \
             -d "{\"sandbox_name\":\"${sandbox_name}\"}" \
-            | python3 -m json.tool 2>/dev/null
+            | python3 -m json.tool --no-ensure-ascii 2>/dev/null
         echo ""
         echo "✓ 沙盒已释放"
         ;;
@@ -164,7 +164,7 @@ else:
         resp=$(curl -s -X POST "${WORKER_URL}/sandbox/join" \
             -H "Content-Type: application/json" \
             -d "{\"username\":\"${USER}\",\"pid\":${shell_pid},\"sandbox_name\":\"${sandbox_name}\"}")
-        echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
+        echo "$resp" | python3 -m json.tool --no-ensure-ascii 2>/dev/null || echo "$resp"
         if echo "$resp" | grep -q '"pid"'; then
             echo ""
             echo "✓ 已加入沙盒 ${sandbox_name}"
@@ -174,7 +174,7 @@ else:
     tasks|t)
         echo "[neu-sbox] 任务队列:"
         resp=$(curl -s "${WORKER_URL}/command/queue")
-        echo "$resp" | python3 -m json.tool 2>/dev/null || echo "$resp"
+        echo "$resp" | python3 -m json.tool --no-ensure-ascii 2>/dev/null || echo "$resp"
         ;;
 
     result|res|log|l)
