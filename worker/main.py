@@ -1,3 +1,8 @@
+# author:peng yutao 彭玉涛
+# date: 2026.7.27
+# TIP: This project is only used in a small group.
+
+
 import logging
 import os
 import time
