@@ -1,10 +1,4 @@
-"""Worker 节点状态上报 — 查询本机 CPU/内存/设备资源及活跃沙盒。
-设备信息由独立脚本采集并输出 JSON，实现解耦。
-"""
-
-import json
-import os
-import subprocess
+"""Worker 节点状态上报 — 查询本机 CPU/内存/设备资源及活跃沙盒。"""
 
 import psutil
 from flask import Blueprint
@@ -41,7 +35,7 @@ class Node_Manager:
         mem = psutil.virtual_memory()
         return mem.total, mem.available
 
-    # ── 设备信息（由独立脚本采集） ─────────────────────────────
+    # ── 设备信息 ───────────────────────────────────────────────
 
     def device_info(self) -> dict:
         """返回设备状态，以 device_filter (.env) 为准绳。
@@ -58,19 +52,7 @@ class Node_Manager:
         if not all_ids:
             return {'total': 0, 'idle': 0, 'dev_status': {}}
 
-        # 脚本报告的外部进程 busy
         busy = set()
-        path = os.getenv('dev_info_script_path', '')
-        if path:
-            try:
-                out = subprocess.check_output(
-                    [path], timeout=10, stderr=subprocess.DEVNULL)
-                data = json.loads(out.decode())
-                busy = set(data.get('busy_ids', []))
-            except Exception:
-                pass
-
-        # 沙盒 DB 已分配的设备也算 busy
         allocated = sbx._get_allocated_devices()
         for dev in allocated:
             try:

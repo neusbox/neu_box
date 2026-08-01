@@ -1,7 +1,7 @@
 """命令执行模块 — 在沙盒中安全执行用户提交的命令。
 
 架构:
-  TaskQueue (FIFO)  →  后台线程逐任务消费  →  execute_in_sandbox (SIGSTOP 方案)
+  TaskQueue (FIFO)  →  sandbox 设备分配  →  Host / Docker Exec
 
 API:
   POST /command/run           提交命令（异步），返回 task_id
@@ -12,6 +12,7 @@ API:
 import logging
 import os
 import pwd
+import re
 import signal
 import subprocess
 import threading
@@ -22,6 +23,18 @@ from collections import OrderedDict
 from flask import Blueprint, request
 
 from executor.sbx_manager import SbxManager
+from executor.command_docker import (
+    ExistingDockerCommandExecutor,
+    recover_orphaned_docker_task,
+)
+from executor.command_target import (
+    TARGET_DOCKER_EXISTING,
+    TARGET_HOST,
+    TargetValidationError,
+    normalize_execution_target,
+    public_execution_target,
+    public_runtime_metadata,
+)
 
 logger = logging.getLogger(__name__)
 command_bp = Blueprint('command', __name__)
@@ -71,12 +84,22 @@ def _cgroup_procs_path(sandbox_name: str) -> str:
     return f"/sys/fs/cgroup/sandbox_{sandbox_name}/cgroup.procs"
 
 
+def _normalize_device_ids(raw: list, all_devices: list[str]) -> list[str] | None:
+    by_minor = {device.split(':', 1)[1]: device for device in all_devices}
+    result = []
+    for value in raw:
+        value = str(value).strip()
+        device = value if value in all_devices else by_minor.get(value)
+        if device is None:
+            return None
+        if device not in result:
+            result.append(device)
+    return result or None
+
+
 def execute_in_sandbox(
     command: str,
     sandbox_name: str,
-    cpu: int = 0,
-    mem: str = "0",
-    devices: list = None,
     timeout: int | None = DEFAULT_TIMEOUT,
     username: str = '',
 ) -> dict:
@@ -85,29 +108,18 @@ def execute_in_sandbox(
     stderr 已在 shell 层 2>&1 合并到 stdout，保证输出按时间序排列。
 
     流程:
-      1. 建沙盒（空壳）
+      1. TaskQueue 已经选择设备并创建沙盒
       2. Popen(preexec_fn: 写 PID 到 cgroup.procs → setuid 切用户 → 返回)
       3. 更新 DB 记录（join_sandbox 做幂等确认）
-      4. 启动线程逐行读取 stdout，增量写入 DB（前端刷新可拉到部分日志）
+      4. 启动线程逐行读取 stdout，增量写入日志文件
       5. proc.wait(timeout) 等待进程结束
-      6. 清理沙盒，返回完整结果
+
+    sandbox 由 TaskQueue 在所有执行目标的统一 finally 路径中销毁。
     """
     sbx = SbxManager.get_instance()
 
-    # 1. 建沙盒（空壳，还没有进程）
-    ok = sbx.create_sandbox(sandbox_name, cpu=cpu, mem=mem,
-                            devices=devices if devices else None)
-    if not ok:
-        logger.error("沙盒 '%s' 创建失败", sandbox_name)
-        return {
-            'returncode': -1, 'stdout': '', 'stderr': f'Failed to create sandbox "{sandbox_name}"',
-            'timed_out': False, 'error': 'sandbox_create_failed',
-        }
-
-    proc = None
-    cg_procs = _cgroup_procs_path(sandbox_name)
-
-    # 2. 构建 preexec_fn：写 cgroup.procs + 切用户
+    target_uid = target_gid = None
+    target_dir = None
     if username:
         try:
             pw = pwd.getpwnam(username)
@@ -120,6 +132,11 @@ def execute_in_sandbox(
                 'timed_out': False, 'error': 'unknown_user',
             }
 
+    proc = None
+    cg_procs = _cgroup_procs_path(sandbox_name)
+
+    # 2. 构建 preexec_fn：写 cgroup.procs + 切用户
+    if username:
         def preexec():
             # 1) 写 PID 到 cgroup（仍是 root）
             with open(cg_procs, 'w') as f:
@@ -236,12 +253,31 @@ def execute_in_sandbox(
             'returncode': -1, 'stdout': '', 'stderr': f'Execution error: {e}',
             'timed_out': False, 'error': 'exception',
         }
-    finally:
-        logger.warning("清理沙盒 '%s'", sandbox_name)
-        try:
-            sbx.destroy_sandbox(sandbox_name)
-        except Exception as e:
-            logger.error("清理沙盒异常: %s", e)
+
+
+class HostCommandExecutor:
+    """保持原有 Host command 行为的 Executor 适配器。"""
+
+    def __init__(
+        self,
+        *,
+        task: dict,
+        sandbox_name: str,
+    ):
+        self.task = task
+        self.sandbox_name = sandbox_name
+
+    def run(self, timeout: int | None) -> dict:
+        return execute_in_sandbox(
+            command=self.task['command'],
+            sandbox_name=self.sandbox_name,
+            timeout=timeout,
+            username=self.task['user_id'],
+        )
+
+    def cancel(self):
+        # cgroup.kill 同时覆盖主进程及其后台子进程。
+        SbxManager.get_instance().destroy_sandbox(self.sandbox_name)
 
 
 # ==================================================================
@@ -251,32 +287,20 @@ def execute_in_sandbox(
 from executor.db import Database
 
 
-class TaskQueue:
-    """FIFO 任务队列管理器（单例）。
 
-    每个 Worker 有自己的队列，后台线程逐任务消费。
-    任务数据持久化到 SQLite，进程重启后可恢复历史记录。
-    """
+class TaskQueue:
+    """每个 Worker 一个 FIFO 命令队列。"""
 
     _instance = None
 
     def __init__(self):
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
-
-        # 等待队列: 有序字典保持 FIFO，key=task_id（内存，驱动消费线程）
         self._pending: OrderedDict[str, dict] = OrderedDict()
-        # 当前正在执行的任务（支持并发）
         self._running: dict[str, dict] = {}
-        self._device_lock = threading.Lock()  # 设备分配互斥锁
-
         self._running_flag = False
         self._worker_thread: threading.Thread | None = None
-
-        # 数据库实例
         self._db = Database.get_instance()
-
-        # 启动时恢复：标记上次异常退出的 running 任务为 failed
         self._recover_orphaned()
 
     @classmethod
@@ -285,63 +309,118 @@ class TaskQueue:
             cls._instance = cls()
         return cls._instance
 
-    # ── 启动/停止 ─────────────────────────────────────────────
+    @staticmethod
+    def _sandbox_name(task: dict) -> str:
+        return f"sbx_{task['user_id']}_{task['task_id']}.slice"
 
     def start(self):
         if self._running_flag:
             return
         self._running_flag = True
         self._worker_thread = threading.Thread(
-            target=self._consume_loop, daemon=True, name='task-queue-consumer')
+            target=self._consume_loop,
+            daemon=True,
+            name='task-queue-consumer',
+        )
         self._worker_thread.start()
         logger.info('后台消费线程已启动')
 
     def _recover_orphaned(self):
-        """启动恢复：将上次异常退出的任务复原。"""
-        all_active = self._db.get_queue_tasks()
-        for task in all_active:
+        """回收上次运行中的 sandbox/Docker Exec，并恢复排队任务。"""
+        failures = []
+        for task in self._db.get_queue_tasks():
             if task['status'] == 'running':
-                logger.warning('恢复: 标记孤儿任务 %s 为 failed', task['task_id'])
+                sandbox_name = self._sandbox_name(task)
+                recovery_task = dict(task)
+                recovery_task['sandbox_name'] = sandbox_name
+                errors = []
+                try:
+                    recover_orphaned_docker_task(recovery_task)
+                except Exception as exc:
+                    errors.append(f'Docker Exec: {exc}')
+                    logger.exception('恢复 Docker Exec %s 失败', task['task_id'])
+                try:
+                    if not SbxManager.get_instance().destroy_sandbox(
+                        sandbox_name
+                    ):
+                        errors.append('sandbox 清理失败')
+                except Exception as exc:
+                    errors.append(f'sandbox: {exc}')
+                    logger.exception('恢复 sandbox %s 失败', sandbox_name)
+                if errors:
+                    failures.append(
+                        f'{task["task_id"]}: {"；".join(errors)}'
+                    )
+                    continue
                 self._db.update_task_result(
-                    task['task_id'], 'failed', -1, '', '',
-                    error='Worker 可能在执行过程中重启')
-            elif task['status'] == 'queued':
-                # 重新加入内存队列（按原 position 排序）
-                logger.info('恢复: 重新入队 %s (原 position=%s)',
-                            task['task_id'], task.get('position'))
-                self._pending[task['task_id']] = {
-                    'task_id': task['task_id'],
-                    'user_id': task['user_id'],
-                    'command': task['command'],
-                    'cpu': task.get('cpu', 0),
-                    'mem': task.get('mem', '0'),
-                    'device_num': len(task.get('devices') or []),
-                    'devices': [],
-                    'status': 'queued',
-                    'position': 0,
-                    'created_at': task.get('created_at', time.time()),
-                    'started_at': None,
-                    'finished_at': None,
-                    'result': None,
-                }
-        # 重新排位
+                    task['task_id'],
+                    'failed',
+                    -1,
+                    '',
+                    '',
+                    error='Worker 在执行过程中重启',
+                )
+                continue
+
+            sandbox_name = self._sandbox_name(task)
+            if not SbxManager.get_instance().destroy_sandbox(sandbox_name):
+                failures.append(
+                    f'{task["task_id"]}: queued sandbox 清理失败'
+                )
+                continue
+            self._pending[task['task_id']] = {
+                'task_id': task['task_id'],
+                'user_id': task['user_id'],
+                'command': task['command'],
+                'cpu': task.get('cpu', 0),
+                'mem': task.get('mem', '0'),
+                'device_num': task.get('device_num', 0),
+                'device_ids': task.get('device_ids') or [],
+                'target': task.get('target_spec') or {
+                    'type': TARGET_HOST,
+                },
+                'devices': [],
+                'status': 'queued',
+                'position': 0,
+                'created_at': task.get('created_at', time.time()),
+                'started_at': None,
+                'finished_at': None,
+                'result': None,
+            }
+
         if self._pending:
             self._reindex()
             logger.info('恢复完成: %s 个任务重新入队', len(self._pending))
+        if failures:
+            raise RuntimeError(
+                '运行中任务尚未安全回收，拒绝 Worker 上线: '
+                + ' | '.join(failures)
+            )
 
-    # ── 提交 ──────────────────────────────────────────────────
-
-    def submit(self, user_id: str, command: str,
-               cpu: int = 0, mem: str = "0",
-               device_num: int = 0,
-               device_ids: list = None) -> str:
-        """提交任务到队列。device_ids 指定设备时优先于 device_num 自动分配。"""
+    def submit(
+        self,
+        user_id: str,
+        command: str,
+        cpu: int = 0,
+        mem: str = '0',
+        device_num: int = 0,
+        device_ids: list | None = None,
+        target: dict | None = None,
+    ) -> str:
         task_id = uuid.uuid4().hex[:12]
-
+        target = dict(target or {'type': TARGET_HOST})
+        device_ids = list(device_ids or [])
         self._db.insert_task(
-            task_id=task_id, user_id=user_id, command=command,
-            cpu=cpu, mem=mem, devices=[])
-
+            task_id=task_id,
+            user_id=user_id,
+            command=command,
+            cpu=cpu,
+            mem=mem,
+            devices=[],
+            device_num=device_num,
+            device_ids=device_ids,
+            target=target,
+        )
         task = {
             'task_id': task_id,
             'user_id': user_id,
@@ -349,8 +428,9 @@ class TaskQueue:
             'cpu': cpu,
             'mem': mem,
             'device_num': device_num,
-            'device_ids': device_ids or [],   # 用户指定的设备列表
-            'devices': [],          # 执行时才分配
+            'device_ids': device_ids,
+            'target': target,
+            'devices': [],
             'status': 'queued',
             'position': 0,
             'created_at': time.time(),
@@ -358,102 +438,87 @@ class TaskQueue:
             'finished_at': None,
             'result': None,
         }
-
         with self._lock:
             self._pending[task_id] = task
             self._reindex()
             self._cv.notify()
-
-        logger.info('任务入队: %s user=%s cmd=%s...', task_id, user_id, command[:60])
+        logger.info(
+            '任务入队: %s user=%s cmd=%s...',
+            task_id,
+            user_id,
+            command[:60],
+        )
         return task_id
 
-    # ── 查询 ──────────────────────────────────────────────────
-
     def get_queue(self) -> list[dict]:
-        """返回队列视图：运行中 → 排队中 → 最近完成/失败的任务（不含日志）。
-        从 DB 读取，保证进程重启后数据不丢。
-        """
-        active = self._db.get_queue_tasks()              # queued + running
-        recent = self._db.get_recent_tasks(limit=QUEUE_RECENT_LIMIT)  # completed + failed
-        # 去重：active 中的 task_id 优先（理论上状态不同不会重复）
-        active_ids = {t['task_id'] for t in active}
-        all_tasks = active + [t for t in recent if t['task_id'] not in active_ids]
-        return [self._format_public(t) for t in all_tasks]
+        active = self._db.get_queue_tasks()
+        recent = self._db.get_recent_tasks(limit=QUEUE_RECENT_LIMIT)
+        active_ids = {task['task_id'] for task in active}
+        tasks = active + [
+            task for task in recent
+            if task['task_id'] not in active_ids
+        ]
+        return [self._format_public(task) for task in tasks]
 
     def delete_tasks(self, task_ids: list[str]) -> int:
-        """批量删除。排队任务直接移除，运行中任务设置取消标记 + 杀沙盒。
-        I/O 在锁外执行，避免死锁。"""
-        to_kill: list[str] = []       # running → 需要杀沙盒
-        to_delete_db: list[str] = []  # 历史任务 → 直接删 DB
-
+        to_cancel = []
+        to_delete = []
         with self._lock:
-            for tid in task_ids:
-                if tid in self._pending:
-                    del self._pending[tid]
-                    to_delete_db.append(tid)
-                elif tid in self._running:
-                    self._running[tid]['_canceled'] = True
-                    del self._running[tid]
-                    to_kill.append(tid)
+            for task_id in task_ids:
+                if task_id in self._pending:
+                    del self._pending[task_id]
+                    to_delete.append(task_id)
+                elif task_id in self._running:
+                    task = self._running[task_id]
+                    task['_canceled'] = True
+                    to_cancel.append(task)
                 else:
-                    to_delete_db.append(tid)
-            if to_delete_db or tid in self._pending:  # re-check: just always reindex if any change
-                pass
+                    to_delete.append(task_id)
             self._reindex()
 
-        # 锁外：删 DB + 杀沙盒 + 清理日志文件
         deleted = 0
-        for tid in to_delete_db:
-            self._db.delete_task(tid)
-            _remove_log_file(tid)
+        for task_id in to_delete:
+            self._db.delete_task(task_id)
+            _remove_log_file(task_id)
             deleted += 1
 
         sbx = SbxManager.get_instance()
-        for tid in to_kill:
+        for task in to_cancel:
             try:
-                # 从 DB 查沙盒名称
-                task = self._db.get_task(tid)
-                user_id = (task.get('user_id') or 'unknown') if task else 'unknown'
-                sbx.destroy_sandbox(f"sbx_{user_id}_{tid}.slice")
-            except Exception as e:
-                logger.warning('销毁沙盒 %s 失败: %s', tid, e)
-            self._db.update_task_result(
-                tid, 'failed', -1, '', '', error='用户手动取消')
-            # 保留日志文件，用户再次删除时才会清理
+                task['_executor'].cancel()
+            except Exception:
+                logger.exception('取消执行器 %s 失败', task['task_id'])
+            try:
+                sbx.destroy_sandbox(self._sandbox_name(task))
+            except Exception:
+                logger.exception('销毁 sandbox %s 失败', task['task_id'])
             deleted += 1
-            logger.info('已取消运行中任务 %s (日志保留)', tid)
-
-        if deleted > 0:
-            logger.info('批量删除 %s 个任务', deleted)
         return deleted
 
     def get_result(self, task_id: str) -> dict | None:
-        """获取任务结果元数据（不含日志内容，日志走 /log 接口）。"""
         task = self._db.get_task(task_id)
         if task is None:
             return None
-
         public = self._format_public(task)
         public['result'] = {
             'returncode': task.get('returncode'),
             'timed_out': bool(task.get('timed_out')),
+            'error': task.get('error'),
         }
         return public
 
-    # ── 内部 ──────────────────────────────────────────────────
-
     def _reindex(self):
-        """更新所有 pending 任务的 position 字段（FIFO 顺序）。"""
-        task_ids = list(self._pending.keys())
-        for i, tid in enumerate(task_ids):
-            self._pending[tid]['position'] = i + 1
-        # 同步到 DB
+        task_ids = list(self._pending)
+        for position, task_id in enumerate(task_ids, start=1):
+            self._pending[task_id]['position'] = position
         if task_ids:
             self._db.update_position_batch(task_ids)
 
     @staticmethod
     def _format_public(task: dict) -> dict:
-        """返回任务的公开视图（不含日志）。"""
+        target = task.get('target')
+        if target is None:
+            target = task.get('target_spec')
         return {
             'task_id': task['task_id'],
             'user_id': task['user_id'],
@@ -462,169 +527,208 @@ class TaskQueue:
             'position': task.get('position', 0),
             'cpu': task.get('cpu', 0),
             'mem': task.get('mem', '0'),
-            'device_num': task.get('device_num', len(task.get('devices') or [])),
+            'device_num': task.get(
+                'device_num',
+                len(task.get('devices') or []),
+            ),
             'devices': task.get('devices', []),
+            'target': public_execution_target(target),
+            'runtime': public_runtime_metadata(
+                task.get('runtime_metadata')
+            ),
             'created_at': task.get('created_at'),
             'started_at': task.get('started_at'),
             'finished_at': task.get('finished_at'),
         }
 
-    # ── 消费循环 ──────────────────────────────────────────────
-
-    def _execute_one(self, task: dict, devices: list):
-        """在独立线程中执行单个任务。若执行中被取消则跳过写 DB（避免覆盖取消状态）。"""
-        sandbox_name = f"sbx_{task['user_id']}_{task['task_id']}.slice"
-        try:
-            result = execute_in_sandbox(
-                command=task['command'],
+    @staticmethod
+    def _build_executor(task: dict, sandbox_name: str, devices: list):
+        target_type = task['target'].get('type', TARGET_HOST)
+        if target_type == TARGET_HOST:
+            return HostCommandExecutor(
+                task=task,
                 sandbox_name=sandbox_name,
-                cpu=task.get('cpu', 0),
-                mem=task.get('mem', '0'),
-                devices=devices if devices else None,
-                username=task['user_id'],
             )
+        return ExistingDockerCommandExecutor(
+            task=task,
+            sandbox_name=sandbox_name,
+            devices=devices,
+            log_path=os.path.join(
+                LOG_DIR,
+                f'{task["task_id"]}.log',
+            ),
+        )
 
-            # 执行中被取消 → 不覆盖 DB
+    def _execute_one(self, task: dict):
+        sandbox_name = self._sandbox_name(task)
+        result = None
+        cleanup_ok = False
+        try:
+            result = task['_executor'].run(DEFAULT_TIMEOUT)
+            cleanup_ok = SbxManager.get_instance().destroy_sandbox(
+                sandbox_name
+            )
+            if not cleanup_ok:
+                result = {
+                    **(result or {}),
+                    'returncode': -1,
+                    'error': 'sandbox_cleanup_failed',
+                }
             if task.get('_canceled'):
-                logger.info('任务 %s 已被用户取消，跳过写 DB', task['task_id'])
-                return
+                result = {
+                    **(result or {}),
+                    'returncode': -1,
+                    'timed_out': False,
+                    'error': '用户手动取消',
+                }
 
             finished_at = time.time()
-            status = ('completed' if result.get('returncode') == 0
-                      and not result.get('timed_out') else 'failed')
-            # 日志已存入文件，DB 只保留元数据
+            status = (
+                'completed'
+                if result.get('returncode') == 0
+                and not result.get('timed_out')
+                else 'failed'
+            )
             self._db.update_task_result(
                 task_id=task['task_id'],
                 status=status,
                 returncode=result.get('returncode', -1),
-                stdout='', stderr='',
+                stdout='',
+                stderr='',
                 timed_out=result.get('timed_out', False),
                 error=result.get('error'),
                 finished_at=finished_at,
             )
             self._db.cleanup_old_tasks(keep=MAX_COMPLETED_TASKS)
-
             with self._lock:
                 task['result'] = result
                 task['finished_at'] = finished_at
                 task['status'] = status
-                if task['task_id'] in self._running:
-                    del self._running[task['task_id']]
+                self._running.pop(task['task_id'], None)
                 self._cv.notify()
-
-            logger.info('执行完成: %s status=%s returncode=%s',
-                        task['task_id'], status, result.get('returncode'))
-        except Exception as e:
-            logger.error('任务 %s 异常: %s', task['task_id'], e)
+            logger.info(
+                '执行完成: %s status=%s returncode=%s',
+                task['task_id'],
+                status,
+                result.get('returncode'),
+            )
+        except Exception as exc:
+            logger.exception('任务 %s 异常', task['task_id'])
+            self._db.update_task_result(
+                task['task_id'],
+                'failed',
+                -1,
+                '',
+                '',
+                error=(
+                    '用户手动取消'
+                    if task.get('_canceled')
+                    else f'执行器异常: {exc}'
+                ),
+            )
+        finally:
+            if not cleanup_ok:
+                try:
+                    SbxManager.get_instance().destroy_sandbox(
+                        sandbox_name
+                    )
+                except Exception:
+                    logger.exception(
+                        '任务 %s 清理 sandbox 失败',
+                        task['task_id'],
+                    )
             with self._lock:
-                if task['task_id'] in self._running:
-                    del self._running[task['task_id']]
+                self._running.pop(task['task_id'], None)
                 self._cv.notify()
 
     def _consume_loop(self):
-        """后台线程：先探测设备再取任务，避免取出又放回的死循环。
-        锁顺序：_lock → _device_lock（只在 peek 阶段，不嵌套）。"""
         sbx = SbxManager.get_instance()
         while self._running_flag:
             task = None
+            sandbox_name = ''
             try:
-                # ── 1. peek 队首，检查设备 ──
-                device_num = 0
                 with self._lock:
                     if not self._pending:
                         self._cv.wait(timeout=5)
                         continue
-                    first_tid = next(iter(self._pending))
-                    device_num = self._pending[first_tid].get('device_num', 0)
+                    task_id = next(iter(self._pending))
+                    candidate = dict(self._pending[task_id])
 
-                # 优先使用用户指定的 device_ids，其次自动分配
-                device_ids = self._pending[first_tid].get('device_ids', []) or []
-                allocated = []
-                if device_ids:
-                    with self._device_lock:
-                        free = sbx._get_free_devices()
-                        unavailable = [d for d in device_ids if d not in free]
-                        if unavailable:
-                            logger.warning('指定设备 %s 不可用，等待中...', unavailable)
-                            time.sleep(3)
-                            continue
-                        allocated = list(device_ids)
-                elif device_num > 0:
-                    with self._device_lock:
-                        free = sbx._get_free_devices()
-                        if len(free) < device_num:
-                            time.sleep(3)
-                            continue
-                        allocated = free[:device_num]
+                allocated = sbx.allocate_for_terminal(
+                    owner=candidate['user_id'],
+                    terminal_id=candidate['task_id'],
+                    cpu=candidate.get('cpu', 0),
+                    mem=candidate.get('mem', '0'),
+                    device_num=candidate.get('device_num', 0),
+                    device_ids=candidate.get('device_ids') or None,
+                )
+                if allocated is None:
+                    with self._lock:
+                        self._cv.wait(timeout=3)
+                    continue
+                sandbox_name = allocated['sandbox_name']
 
-                # ── 2. 设备满足，正式出队 ──
+                stale = False
                 with self._lock:
-                    if not self._pending:
-                        continue
-                    _, task = self._pending.popitem(last=False)
-                    task['status'] = 'running'
-                    task['started_at'] = time.time()
-                    task['devices'] = allocated
-                    self._running[task['task_id']] = task
-                    self._reindex()
-
-                logger.warning('任务 %s 分配设备: %s', task['task_id'], allocated)
-
-                # ── 3. 锁外：建沙盒（锁定设备）→ 更新 DB → 启动线程 ──
-                if allocated:
-                    ok = sbx.create_sandbox(
-                        f"sbx_{task['user_id']}_{task['task_id']}.slice",
-                        cpu=task.get('cpu', 0),
-                        mem=task.get('mem', '0'),
-                        devices=allocated)
-                    if not ok:
-                        logger.error('任务 %s 沙盒创建失败', task['task_id'])
-                        with self._lock:
-                            if task['task_id'] in self._running:
-                                del self._running[task['task_id']]
-                            self._cv.notify()
-                        continue
+                    if (
+                        task_id not in self._pending
+                        or next(iter(self._pending), None) != task_id
+                    ):
+                        stale = True
+                    else:
+                        task = self._pending.pop(task_id)
+                        task['status'] = 'running'
+                        task['started_at'] = time.time()
+                        task['devices'] = allocated['devices']
+                        task['_executor'] = self._build_executor(
+                            task,
+                            sandbox_name,
+                            task['devices'],
+                        )
+                        self._running[task_id] = task
+                        self._reindex()
+                if stale:
+                    sbx.destroy_sandbox(sandbox_name)
+                    continue
 
                 self._db.update_task_status(
-                    task['task_id'], 'running', started_at=task['started_at'],
-                    devices=allocated if allocated else None)
-
-                logger.info('开始执行: %s user=%s cmd=%s... devices=%s',
-                            task['task_id'], task['user_id'],
-                            task['command'][:60], allocated)
-                t = threading.Thread(
-                    target=self._execute_one,
-                    args=(task, allocated),
-                    daemon=True,
-                    name=f'cmd-{task["task_id"][:8]}',
+                    task_id,
+                    'running',
+                    started_at=task['started_at'],
+                    devices=task['devices'],
                 )
-                t.start()
-
-            except Exception:
-                logger.exception('消费循环异常，task=%s', task['task_id'] if task else 'None')
-                with self._lock:
-                    if task and task['task_id'] in self._running:
-                        del self._running[task['task_id']]
-                    self._cv.notify()
+                thread = threading.Thread(
+                    target=self._execute_one,
+                    args=(task,),
+                    daemon=True,
+                    name=f'cmd-{task_id[:8]}',
+                )
+                thread.start()
+            except Exception as exc:
+                logger.exception('任务消费失败')
+                if sandbox_name:
+                    try:
+                        sbx.destroy_sandbox(sandbox_name)
+                    except Exception:
+                        logger.exception('消费失败后的 sandbox 回收失败')
+                if task:
+                    self._db.update_task_result(
+                        task['task_id'],
+                        'failed',
+                        -1,
+                        '',
+                        '',
+                        error=f'sandbox 或执行器启动失败: {exc}',
+                    )
+                    with self._lock:
+                        self._running.pop(task['task_id'], None)
+                        self._cv.notify()
                 time.sleep(1)
-
-
-# ==================================================================
-# Flask 路由
-# ==================================================================
 
 @command_bp.route('/run', methods=['POST'])
 def run_command():
-    """提交命令到任务队列（异步）。
-
-    请求体 (JSON):
-        { "command": "...", "user_id": "...", "cpu": 2, "memory": 4,
-          "mem_unit": "GB", "device_num": 1 }
-
-    响应: { "task_id": "abc123", "position": 3, "message": "..." }
-    """
+    """提交 Host 或现有 Docker 容器命令。"""
     body = request.get_json(silent=True) or {}
-
     command = (body.get('command') or '').strip()
     if not command:
         return {'error': '命令不能为空'}, 400
@@ -632,64 +736,95 @@ def run_command():
     user_id = (body.get('user_id') or '').strip()
     if not user_id:
         return {'error': 'user_id 不能为空'}, 400
+    try:
+        pwd.getpwnam(user_id)
+    except KeyError:
+        return {'error': f'系统用户 {user_id} 不存在'}, 400
 
     cpu = body.get('cpu', 0)
     if not isinstance(cpu, int) or cpu < 0:
-        cpu = 0
+        return {'error': 'cpu 必须是非负整数'}, 400
 
-    mem_val = body.get('memory', 0)
-    mem_unit = body.get('mem_unit', 'GB')
-    if not isinstance(mem_val, int) or mem_val < 0:
-        mem_val = 0
-    if mem_val == 0:
-        sandbox_mem = '0'
-    elif mem_unit == 'GB':
-        sandbox_mem = f'{mem_val}G'
-    else:
-        sandbox_mem = f'{mem_val}M'
+    memory = body.get('memory', 0)
+    mem_unit = str(body.get('mem_unit', 'GB')).upper()
+    if not isinstance(memory, int) or memory < 0:
+        return {'error': 'memory 必须是非负整数'}, 400
+    if mem_unit not in {'GB', 'MB'}:
+        return {'error': 'mem_unit 必须是 GB 或 MB'}, 400
+    sandbox_mem = (
+        '0'
+        if memory == 0
+        else f'{memory}{"G" if mem_unit == "GB" else "M"}'
+    )
 
     device_num = body.get('device_num', 0)
-    device_ids = body.get('device_ids')  # 可选: ["1","3"] 或 ["235:1","235:3"]
     if not isinstance(device_num, int) or device_num < 0:
-        device_num = 0
+        return {'error': 'device_num 必须是非负整数'}, 400
 
-    # 防呆：请求数量超过系统设备总数，直接拒绝
     sbx = SbxManager.get_instance()
-    if device_num > 0:
-        total = len(sbx._discover_device_nodes())
-        if device_num > total:
-            return {'error': f'设备不足: 需要 {device_num} 个, 系统共 {total} 个'}, 400
+    all_devices = sbx._discover_device_nodes()
+    if device_num > len(all_devices):
+        return {
+            'error': (
+                f'设备不足: 需要 {device_num} 个, '
+                f'系统共 {len(all_devices)} 个'
+            ),
+        }, 400
 
-    # 归一化 device_ids
+    device_ids = body.get('device_ids')
     normalized_ids = None
-    if device_ids and isinstance(device_ids, list):
-        normalized_ids = _normalize_device_ids(device_ids, sbx._discover_device_nodes())
+    if device_ids:
+        if not isinstance(device_ids, list):
+            return {'error': 'device_ids 必须是数组'}, 400
+        normalized_ids = _normalize_device_ids(device_ids, all_devices)
+        if normalized_ids is None:
+            return {
+                'error': f'device_ids 包含不存在的设备: {device_ids}',
+            }, 400
 
-    tq = TaskQueue.get_instance()
-    task_id = tq.submit(
+    try:
+        target = normalize_execution_target(body.get('target'))
+    except TargetValidationError as exc:
+        return {'error': str(exc)}, 400
+
+    if target['type'] == TARGET_DOCKER_EXISTING:
+        if not (
+            normalized_ids
+            or device_num > 0
+        ):
+            return {
+                'error': (
+                    'docker_existing 必须通过 device_ids 或 '
+                    'device_num 申请至少一张 NPU'
+                ),
+            }, 400
+        if not re.fullmatch(sbx.device_filter or r'(?!x)x', 'davinci0'):
+            return {
+                'error': 'docker_existing 仅支持 Ascend NPU Worker',
+            }, 400
+
+    task_id = TaskQueue.get_instance().submit(
         user_id=user_id,
         command=command,
         cpu=cpu,
         mem=sandbox_mem,
-        device_num=device_num,
+        device_num=0 if normalized_ids else device_num,
         device_ids=normalized_ids,
+        target=target,
     )
-
-    # 从 DB 获取当前队列位置
-    db = Database.get_instance()
-    task = db.get_task(task_id)
+    task = Database.get_instance().get_task(task_id)
     position = task['position'] if task else 0
-
     return {
         'task_id': task_id,
         'position': position,
+        'target': public_execution_target(target),
         'message': f'任务已提交，队列位置 #{position}',
     }, 202
 
 
 @command_bp.route('/tasks/delete', methods=['POST'])
 def delete_tasks():
-    """批量删除任务。正在运行的任务不会被删除。
+    """批量删除任务；运行中任务转为异步取消并保留结果/日志。
 
     Body: { "task_ids": ["id1", "id2", ...] }
     响应: { "deleted": N }
@@ -789,23 +924,6 @@ def _parse_int(value: str | None, default: int) -> int:
         return int(value)
     except (ValueError, TypeError):
         return default
-
-
-def _normalize_device_ids(raw: list, all_devices: list[str]) -> list[str] | None:
-    """将用户指定设备 ID 归一化: 纯数字→匹配 minor 号, "m:M"→原样。"""
-    result = []
-    for d in raw:
-        d = str(d).strip()
-        if not d:
-            continue
-        if ':' in d:
-            result.append(d)
-        else:
-            for dev in all_devices:
-                if dev.endswith(f':{d}'):
-                    result.append(dev)
-                    break
-    return result if result else None
 
 
 # ── 启动 TaskQueue（在 import 时自动启动） ──

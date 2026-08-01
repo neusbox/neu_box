@@ -9,7 +9,6 @@
   - 通过 Node_Manager (status.py) 校验设备空闲数量
 """
 
-import json
 import logging
 import os
 import signal
@@ -53,7 +52,7 @@ class SbxManager:
         self.db = Database.get_instance()
 
         # 线程安全
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # 启动时恢复
         self._recover_on_startup()
@@ -120,42 +119,14 @@ class SbxManager:
         """返回所有沙盒名称列表（兼容旧 SandboxDB.list_all 接口）。"""
         return [s['name'] for s in self.db.list_sandboxes()]
 
-    def _get_external_busy_minors(self) -> set:
-        """调用 dev_info_script_path 脚本，返回外部进程占用的设备 minor 号集合。"""
-        path = os.getenv('dev_info_script_path', '')
-        if not path:
-            return set()
-        try:
-            out = subprocess.check_output(
-                [path], timeout=10, stderr=subprocess.DEVNULL)
-            data = json.loads(out.decode())
-            return set(data.get('busy_ids', []))
-        except Exception:
-            return set()
-
     def _get_free_devices(self) -> List[str]:
-        """返回当前空闲的设备节点列表，按 minor 排序。
-
-        过滤规则:
-          1. 沙盒 DB 已分配的 → 排除
-          2. 外部进程占用的（info 脚本返回的 busy_ids）→ 排除
-        """
+        """返回未分配给 sandbox 的设备节点，按 minor 排序。"""
         all_devices = set(self._discover_device_nodes())
         allocated = self._get_allocated_devices()
-        free = sorted(all_devices - allocated, key=lambda x: int(x.split(':')[1]))
-
-        busy_minors = self._get_external_busy_minors()
-        if busy_minors:
-            truly_free = []
-            for dev_id in free:
-                minor = int(dev_id.split(':')[1])
-                if minor in busy_minors:
-                    logger.warning("设备 %s 被外部进程占用，跳过", dev_id)
-                else:
-                    truly_free.append(dev_id)
-            return truly_free
-
-        return free
+        return sorted(
+            all_devices - allocated,
+            key=lambda x: int(x.split(':')[1]),
+        )
 
     # ── 启动恢复 ─────────────────────────────────────────────────
 
@@ -311,6 +282,22 @@ class SbxManager:
                               device_num: int = 0,
                               device_ids: Optional[List[str]] = None,
                               port: int = None) -> Optional[dict]:
+        with self._lock:
+            return self._allocate_sandbox(
+                owner=owner,
+                terminal_id=terminal_id,
+                cpu=cpu,
+                mem=mem,
+                device_num=device_num,
+                device_ids=device_ids,
+                port=port,
+            )
+
+    def _allocate_sandbox(self, owner: str, terminal_id: str,
+                          cpu: int = 0, mem: str = "0",
+                          device_num: int = 0,
+                          device_ids: Optional[List[str]] = None,
+                          port: int = None) -> Optional[dict]:
         """为终端/手动 acquire 分配沙盒。
 
         沙盒命名为 sbx_{owner}_{terminal_id}.slice。
@@ -402,6 +389,13 @@ class SbxManager:
 
             pids = record.get('pids', [])
             if not pids:
+                created_at = float(record.get('created_at') or 0)
+                interval = max(
+                    1,
+                    int(os.getenv('sandbox_reaper_interval', '30')),
+                )
+                if time.time() - created_at < interval:
+                    continue
                 # 没有进程记录的沙盒：检查 cgroup.procs 是否为空
                 procs_file = os.path.join(self._cg_path(name), 'cgroup.procs')
                 try:

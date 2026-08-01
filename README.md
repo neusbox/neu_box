@@ -11,9 +11,14 @@
            .env + config.json      .env
 ```
 
-**两种工作模式：**
+**WEB两种工作模式：**
 - **终端模式**：Master 转发请求到 Worker，Worker 启动 ttyd（终端 over HTTP），前端通过 iframe 嵌入。中栏显示当前节点活跃终端和沙盒列表
 - **命令模式**：Master 转发命令到 Worker，Worker 维护 FIFO 任务队列，逐任务在沙盒中执行。日志实时写入文件，前端全量拉取 + 进度条
+
+**CLI工作模式：**
+- **当前终端**：把当前 shell 加入独占设备沙盒。
+- **Host 命令**：提交一次性 Host 命令并查询结果。
+- **已有容器命令（仅 NPU Worker）**：通过 `docker_existing` 在运行中的容器内执行命令，不改变容器生命周期。
 
 ## 运行
 
@@ -22,9 +27,44 @@
 cd master
 python main.py
 
-# Worker（sudo 启动，自动安装 neu-sbox.sh 到 /etc/profile.d/）
+# Worker（sudo 启动，自动复制 neu-sbox 到 /usr/local/bin）
 cd worker
 sudo python main.py
+```
+
+## CLI用法
+
+管理当前 shell 的独占沙盒，或提交 Host、已有容器命令。Worker 通过 `/proc/<pid>/status` 校验 PID 归属，无需密码。
+
+```bash
+# 安装 — Worker 启动时自动复制到 /usr/local/bin/neu-sbox
+
+# ── 沙盒（终端隔离） ──
+neu-sbox acquire 1              # 申请 1 个 NPU，加入当前 shell
+neu-sbox acquire 2 4 8          # 申请 2 NPU + 4 核 CPU + 8G 内存
+neu-sbox acquire --devices 1,3  # 指定卡 1、3，加入当前 shell
+neu-sbox acquire --devices 1 --pid 12345  # 将指定进程加入新沙盒
+neu-sbox status                 # 查看当前 shell 是否在沙盒中
+neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
+neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
+neu-sbox release <name>         # 释放指定沙盒
+# 已在沙盒中再次 acquire 会先销毁旧沙盒，再创建新沙盒
+
+# ── 命令任务（一次性执行，类似前端命令模式） ──
+neu-sbox acquire 1 2 4 "npu-smi info"     # 1 NPU + 2 核 + 4G 执行 Host 命令
+neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
+neu-sbox tasks                              # 查看任务队列
+neu-sbox result <task_id>                   # 查看任务结果和日志
+
+# ── 已有容器命令（仅 NPU Worker） ──
+neu-sbox acquire --devices 1 --container training-01 \
+  --workdir /workspace --command "python train.py"
+# 支持 --env、--workdir、--container-user
+# 目标容器需已挂载所申请的 /dev/davinciN
+
+# ── 远程 Worker ──
+export NEU_BOX_URL=http://<worker_ip>:59075
+neu-sbox acquire 1
 ```
 
 ## 配置
@@ -70,7 +110,6 @@ sudo python main.py
 | `MAX_LOG_SIZE` | `2097152` | 单日志文件最大字节数（2MB），超出截断前半部 |
 | `LOG_DIR` | `./logs/tasks` | 任务日志文件存储目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `dev_info_script_path` | — | 设备状态采集脚本路径，返回 `{"total":N,"idle":N}` |
 | `sandbox_script_path` | — | 沙盒管理脚本路径（cgroup + eBPF） |
 
 ## 数据流
@@ -83,8 +122,9 @@ POST /terminal/create {node_id, username, password, cpu, memory, device_num}
   Master ──→ Worker /terminal/create
                │
                ├─ Port_Pool.acquire_port()         → 分配端口
-               ├─ Popen(ttyd -p <port> -q ...)      → 启动终端服务
-               ├─ SbxManager.allocate_for_terminal() → 创建 cgroup 沙盒
+               ├─ Popen(ttyd -p <port> -q ...)      → 启动终端进程
+               ├─ SbxManager.allocate_for_terminal() → 创建 sandbox
+               ├─ SbxManager.join_sandbox()          → ttyd PID 加入 cgroup
                └─ 返回 {terminal_url, sandbox_id}
   │
 浏览器 iframe.src = terminal_url  →  ttyd WebSocket
@@ -109,7 +149,7 @@ POST /command/run {node_id, user_id, command, cpu, memory, device_num}
   │
 TaskQueue 后台消费线程:
   ├─ 取队首任务
-  ├─ SbxManager.create_sandbox(sbx_{user}_{task_id}.slice)  → 创建 cgroup 沙盒
+  ├─ SbxManager.allocate_for_terminal(...)  → 分配设备并创建 sandbox
   ├─ Popen('bash -i -c <cmd>', ...)    → 交互模式（自动source ~/.bashrc）
   ├─ 后台线程逐块 read() stdout        → 实时写入 {LOG_DIR}/{task_id}.log
   ├─ 进程结束                          → DB 更新状态/返回码
@@ -121,46 +161,21 @@ GET /command/result/<id>/log?raw=1  → 纯文本日志 + Content-Length 头
 
 ### 终端沙盒模式 (`neu-sbox`)
 
-将当前 shell 加入独占设备的 cgroup 沙盒，或提交一次性命令任务。Worker 通过 `/proc/<pid>/status` 校验 PID 归属，无需密码。
-
-```bash
-# 安装 — Worker 用 sudo 启动时自动安装到 /etc/profile.d/ 并复制到 /usr/local/bin/neu-sbox
-# source /etc/profile.d/neu-sbox.sh
-
-# ── 沙盒（终端隔离） ──
-neu-sbox acquire 1              # 申请 1 个 NPU，加入当前 shell
-neu-sbox acquire 2 4 8          # 申请 2 NPU + 4 核 CPU + 8G 内存
-neu-sbox status                 # 查看当前 shell 是否在沙盒中
-neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
-neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
-neu-sbox release <name>         # 释放指定沙盒
-# 已在沙盒中再次 acquire → 自动释放旧沙盒，覆盖为新资源
-
-# ── 命令任务（一次性执行，类似前端命令模式） ──
-neu-sbox acquire 1 2 4 "nvidia-smi"       # 1 NPU + 2 核 + 4G 执行 nvidia-smi
-neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
-neu-sbox tasks                              # 查看任务队列
-neu-sbox result <task_id>                   # 查看任务结果和日志
-```
-
-```bash
-# 远程 Worker
-export NEU_BOX_URL=http://<worker_ip>:59075
-neu-sbox acquire 1
-```
-
 ```
 POST /sandbox/acquire {username, pid, device_num, cpu, memory}
-  → /proc/<pid>/cgroup 检测是否已在沙盒中 → 是: 先释放旧沙盒
+  → /proc/<pid>/cgroup 检测是否已在沙盒中 → 是: 先销毁旧 sandbox
   → /proc/<pid>/status 校验归属 → 创建 sbx_{user}_{pid}.slice + 设备分配 → PID 加入
-POST /sandbox/acquire {..., command: "nvidia-smi"}   # 带命令 → 走任务队列
-  → 类似 POST /command/run，提交后返回 task_id
 POST /sandbox/join {username, pid, sandbox_name}
-  → /proc/<pid>/status 校验 PID 归属 → 沙盒名 owner 段对比 → 加入目标沙盒 cgroup
+  → /proc/<pid>/status 校验 PID 归属 → sandbox 名称校验 owner → 加入目标 cgroup
+POST /command/run {user_id, command, device_ids/device_num, target}
+  → TaskQueue 持久化并排队 → 创建 sandbox cgroup
+  → target=host → 在 Host 执行命令
+  → target=docker_existing → 暂停 Docker Exec → host PID 移入 sandbox → 继续执行
+  → 保存日志、状态和退出码 → 销毁 sandbox
 POST /sandbox/release {sandbox_name}
   → destroy_sandbox() → cgroup.freeze → cgroup.kill → 设备归还
 GET  /sandbox/list
-  → 返回活跃沙盒详情（名称、owner、CPU、内存、设备列表、端口、PID）
+  → 返回活跃 sandbox 及其设备和进程
 ```
 
 ### 沙盒销毁流程
@@ -170,8 +185,8 @@ destroy_sandbox(name)
   └─ sandbox.sh destroy
        ├─ cgroup.freeze = 1    冻结 cgroup 内所有进程
        ├─ cgroup.kill = 1      内核全杀（无竞态）
-       ├─ 清理 BPF map 设备预留
-       └─ rmdir cgroup
+       ├─ rmdir 整棵 cgroup；失败则保留数据库记录
+       └─ 删除仍属于当前 cgroup 的 BPF 独占条目
 ```
 
 ## Master 用户系统

@@ -60,27 +60,20 @@ class Database:
     def _get_conn(self) -> sqlite3.Connection:
         """获取当前线程的数据库连接（线程本地）。"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn = sqlite3.connect(
+                self._db_path,
+                timeout=30,
+                check_same_thread=False,
+            )
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=30000")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return self._local.conn
 
     def _init_tables(self):
         conn = self._get_conn()
-        # 兼容旧表：添加 password_hash 列（如果不存在）
-        try:
-            conn.execute("ALTER TABLE tasks ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-
-        # 兼容旧表：添加 port 列（如果不存在）
-        try:
-            conn.execute("ALTER TABLE sandboxes ADD COLUMN port INTEGER")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id     TEXT PRIMARY KEY,
@@ -99,7 +92,11 @@ class Database:
                 error       TEXT,
                 created_at  REAL,
                 started_at  REAL,
-                finished_at REAL
+                finished_at REAL,
+                device_num  INTEGER NOT NULL DEFAULT 0,
+                device_ids  TEXT    NOT NULL DEFAULT '[]',
+                target_spec TEXT    NOT NULL DEFAULT '{"type":"host"}',
+                runtime_metadata TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_user   ON tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -138,15 +135,20 @@ class Database:
 
     def insert_task(self, task_id: str, user_id: str, command: str,
                     cpu: int = 0, mem: str = "0", devices: list = None,
-                    position: int = 0, password: str = ''):
+                    position: int = 0, password: str = '',
+                    device_num: int = 0, device_ids: list = None,
+                    target: dict | None = None):
         conn = self._get_conn()
         pw_hash = self._hash_password(password, task_id) if password else ''
+        target = dict(target or {'type': 'host'})
         conn.execute(
             'INSERT INTO tasks (task_id, user_id, password_hash, command, status, position, '
-            'cpu, mem, devices, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'cpu, mem, devices, created_at, device_num, device_ids, target_spec) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (task_id, user_id, pw_hash, command, 'queued', position,
-             cpu, mem, json.dumps(devices or []), time.time()))
+             cpu, mem, json.dumps(devices or []), time.time(), device_num,
+             json.dumps(device_ids or []),
+             json.dumps(target, ensure_ascii=False)))
         conn.commit()
 
     def update_task_status(self, task_id: str, status: str,
@@ -177,6 +179,15 @@ class Database:
             (status, returncode, stdout, stderr,
              1 if timed_out else 0, error,
              finished_at or time.time(), task_id))
+        conn.commit()
+
+    def update_task_runtime(self, task_id: str, metadata: dict | None):
+        """保存 Docker Exec 的运行实体，用于 Worker 重启后精确回收。"""
+        conn = self._get_conn()
+        conn.execute(
+            'UPDATE tasks SET runtime_metadata=? WHERE task_id=?',
+            (json.dumps(metadata or {}, ensure_ascii=False), task_id),
+        )
         conn.commit()
 
     def update_position_batch(self, task_ids: list[str]):
@@ -281,10 +292,17 @@ class Database:
     def _row_to_dict(row: sqlite3.Row) -> dict:
         d = dict(row)
         # 将 JSON 字符串字段解析回 Python 对象
-        for key in ('devices', 'pids'):
+        for key in ('devices', 'pids', 'device_ids'):
             if key in d and isinstance(d[key], str):
                 try:
                     d[key] = json.loads(d[key])
                 except (json.JSONDecodeError, TypeError):
                     pass
+        for key in ('target_spec', 'runtime_metadata'):
+            raw = d.get(key)
+            if isinstance(raw, str):
+                try:
+                    d[key] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    d[key] = {}
         return d

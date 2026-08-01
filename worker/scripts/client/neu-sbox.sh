@@ -8,13 +8,18 @@ WORKER_URL="${NEU_BOX_URL:-http://127.0.0.1:59075}"
 case "$cmd" in
     acquire|a)
         # 全命名参数解析
-        # neu-sbox acquire [--devices 1,3] [--device-num 2] [--cpu 4] [--mem 8] [--pid 12345] [--command "..."]
+        # neu-sbox acquire [资源选项] [--command "..."] [--container NAME]
         device_ids=""
         device_num="0"
         cpu="0"
         memory="0"
         custom_pid=""
         command=""
+        existing_container=""
+        target_workdir=""
+        target_user=""
+        target_env=()
+        args=()
         while [ $# -gt 1 ]; do
             case "$2" in
                 --devices)    device_ids="$3"; shift 2 ;;
@@ -23,6 +28,10 @@ case "$cmd" in
                 --mem)        memory="$3"; shift 2 ;;
                 --pid)        custom_pid="$3"; shift 2 ;;
                 --command)    command="$3"; shift 2 ;;
+                --container)  existing_container="$3"; shift 2 ;;
+                --workdir)    target_workdir="$3"; shift 2 ;;
+                --container-user) target_user="$3"; shift 2 ;;
+                --env)        target_env+=("$3"); shift 2 ;;
                 *)
                     args+=("$2"); shift
                     ;;
@@ -53,14 +62,64 @@ case "$cmd" in
 
         # 如果提供了命令参数，走任务提交路径
         if [ -n "$command" ]; then
+            if [ -z "$existing_container" ] \
+                    && { [ -n "$target_workdir" ] \
+                        || [ -n "$target_user" ] \
+                        || [ "${#target_env[@]}" -gt 0 ]; }; then
+                echo "--workdir/--container-user/--env 必须配合 --container" >&2
+                exit 2
+            fi
+
+            request_json=$(python3 - \
+                "$USER" "$command" "$device_ids" "$device_num" \
+                "$cpu" "$memory" "$existing_container" \
+                "$target_workdir" "$target_user" "${target_env[@]}" <<'PY'
+import json
+import sys
+
+(
+    username, command, devices, device_num, cpu, memory,
+    container, workdir, container_user,
+) = sys.argv[1:10]
+env = {}
+for item in sys.argv[10:]:
+    if '=' not in item:
+        raise SystemExit(f'--env 必须是 KEY=VALUE: {item}')
+    key, value = item.split('=', 1)
+    env[key] = value
+
+device_ids = [item.strip() for item in devices.split(',') if item.strip()]
+payload = {
+    'user_id': username,
+    'command': command,
+    'device_num': 0 if device_ids else int(device_num),
+    'device_ids': device_ids or None,
+    'cpu': int(cpu),
+    'memory': int(memory),
+    'mem_unit': 'GB',
+}
+if container:
+    payload['target'] = {
+        'type': 'docker_existing',
+        'container': container,
+        'workdir': workdir or None,
+        'user': container_user or None,
+        'env': env,
+    }
+print(json.dumps(payload, ensure_ascii=False))
+PY
+            ) || exit 2
+
             echo "[neu-sbox] 提交任务: device=${device_num} cpu=${cpu} mem=${memory}G"
             [ -n "$device_ids" ] && echo "[neu-sbox] 指定设备: ${device_ids}"
             echo "[neu-sbox] 命令: ${command}"
             echo "[neu-sbox] user=${USER}"
+            [ -n "$existing_container" ] \
+                && echo "[neu-sbox] 现有 Docker container=${existing_container}"
 
-            resp=$(curl -s -X POST "${WORKER_URL}/command/run" \
+            resp=$(curl -sS -X POST "${WORKER_URL}/command/run" \
                 -H "Content-Type: application/json" \
-                -d "{\"user_id\":\"${USER}\",\"command\":\"${command}\",\"device_num\":${device_num},\"device_ids\":${dev_ids_json},\"cpu\":${cpu},\"memory\":${memory},\"mem_unit\":\"GB\"}")
+                --data-binary "$request_json")
 
             echo "$resp" | python3 -m json.tool --no-ensure-ascii 2>/dev/null || echo "$resp"
 
@@ -72,6 +131,14 @@ case "$cmd" in
                 echo "  查看日志: neu-sbox result ${task_id}"
             fi
             exit 0
+        fi
+
+        if [ -n "$existing_container" ] \
+                || [ -n "$target_workdir" ] \
+                || [ -n "$target_user" ] \
+                || [ "${#target_env[@]}" -gt 0 ]; then
+            echo "Docker 目标参数必须配合 --command" >&2
+            exit 2
         fi
 
         # 沙盒模式：--pid 指定进程，否则用当前 shell
@@ -264,6 +331,10 @@ print(line)
         echo "    --mem 8          内存 GB (0=不限)"
         echo "    --pid 12345      为指定 PID 分配沙盒 (默认当前 shell)"
         echo "    --command \"...\"  提交命令任务 (不指定则为沙盒模式)"
+        echo "    --container NAME  在现有 running 容器中执行命令"
+        echo "    --workdir PATH    容器内工作目录"
+        echo "    --container-user U 容器内用户"
+        echo "    --env K=V         容器环境变量，可重复"
         echo ""
         echo "  release <sandbox_name>                   释放沙盒"
         echo "  list                                     列出我的沙盒（含资源详情）"
@@ -277,6 +348,7 @@ print(line)
         echo "  neu-sbox acquire --devices 1,3 --cpu 4 --mem 8      # 卡1,3 + 4核 + 8G"
         echo "  neu-sbox acquire --devices 1 --pid 12345            # 为 PID 12345 分配卡 1"
         echo "  neu-sbox acquire --devices 1 --cpu 4 --command \"npu-smi info\"  # 提交任务"
+        echo "  neu-sbox acquire --devices 1 --container training-01 --command \"python train.py\""
         echo "  neu-sbox list                            # 列出沙盒（显示设备/资源）"
         echo "  neu-sbox tasks                           # 查看队列"
         echo "  neu-sbox join sbx_pengyt_67890.slice      # 将当前 shell 加入已有沙盒"
@@ -285,18 +357,5 @@ print(line)
         echo ""
         echo "已在沙盒中再次 acquire → 自动释放旧沙盒，覆盖为新资源"
         echo "远程 Worker: export NEU_BOX_URL=http://<worker_ip>:59075"
-        echo ""
-        echo "Docker 中使用沙盒:"
-        echo "  沙盒的 eBPF 设备过滤只作用于沙盒 cgroup，Docker 容器默认使用自己的"
-        echo "  cgroup，需要用 --cgroup-parent 让容器直接跑在沙盒 cgroup 下:"
-        echo ""
-        echo "    # 1. 创建沙盒"
-        echo "    neu-sbox acquire --devices 6,7"
-        echo "    # 2. 记下 sandbox_name（如 term_pengyt_12345.slice）"
-        echo "    # 3. Docker 挂在沙盒 cgroup 下运行"
-        echo "    docker run --rm --cgroup-parent sandbox_term_pengyt_12345.slice -it IMAGE bash"
-        echo ""
-        echo "  容器内所有进程自动归属沙盒 cgroup，无需 --device 参数。"
-        echo "  --pid 将 bash PID 加入沙盒仅影响 bash 自身，不影响 Docker 容器。"
         ;;
 esac
