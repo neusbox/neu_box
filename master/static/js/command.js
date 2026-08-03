@@ -6,6 +6,24 @@
 // 缓存命令全文（避免 data-* 属性对长命令的截断）
 const _taskMeta = {};
 
+// ── 任务标注（localStorage 持久化） ──
+const MARK_KEY = 'neu_box_marked_tasks';
+let _markedTasks = new Set();
+try {
+  const saved = JSON.parse(localStorage.getItem(MARK_KEY) || '[]');
+  _markedTasks = new Set(saved);
+} catch {}
+
+function _isMarked(taskId) { return _markedTasks.has(taskId); }
+
+function _toggleMark(taskId) {
+  if (_markedTasks.has(taskId)) _markedTasks.delete(taskId);
+  else _markedTasks.add(taskId);
+  try { localStorage.setItem(MARK_KEY, JSON.stringify([..._markedTasks])); } catch {}
+  // 重新渲染当前列表
+  if (_lastQueueData) renderQueue(_lastQueueData);
+}
+
 function renderQueue(data) {
   const queue = data.queue || [];
   const filterUser = (queueUserFilter.value || '').trim().toLowerCase();
@@ -43,8 +61,10 @@ function renderQueue(data) {
       };
     }
 
+    const marked = _isMarked(task.task_id);
+
     return `
-      <div class="queue-item ${isRunning ? 'running' : ''} ${clickable ? 'clickable' : ''}"
+      <div class="queue-item ${isRunning ? 'running' : ''} ${clickable ? 'clickable' : ''} ${marked ? 'marked' : ''}"
            data-task-id="${task.task_id}"
            title="${isDone ? '点击查看日志' : (isRunning ? '点击查看实时日志' : '')}">
         <input type="checkbox" class="queue-check" data-task-id="${task.task_id}" title="选择">
@@ -52,6 +72,8 @@ function renderQueue(data) {
         <span class="queue-user" title="${escapeHtml(task.user_id)}">${escapeHtml(task.user_id)}</span>
         <span class="queue-cmd" title="${escapeHtml(task.command)}">${escapeHtml(task.command)}</span>
         <span class="queue-status ${task.status}">${statusLabel(task.status)}</span>
+        <button class="queue-mark-btn ${marked ? 'active' : ''}" title="${marked ? '取消标注' : '标注此任务'}"
+                data-task-id="${task.task_id}">${marked ? '★' : '☆'}</button>
         ${isDone ? `<button class="queue-rerun-btn" title="重新执行此命令" data-task-id="${task.task_id}">↻</button>` : ''}
       </div>`;
   }).join('');
@@ -61,6 +83,7 @@ function renderQueue(data) {
     item.addEventListener('click', (e) => {
       if (e.target.classList.contains('queue-check')) return;
       if (e.target.classList.contains('queue-rerun-btn')) return;
+      if (e.target.classList.contains('queue-mark-btn')) return;
       queueList.querySelectorAll('.queue-item.active').forEach(el => el.classList.remove('active'));
       item.classList.add('active');
       const taskId = item.dataset.taskId;
@@ -74,6 +97,14 @@ function renderQueue(data) {
       e.stopPropagation();
       const taskId = btn.dataset.taskId;
       rerunTask(taskId);
+    });
+  });
+
+  // Bind mark buttons
+  queueList.querySelectorAll('.queue-mark-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _toggleMark(btn.dataset.taskId);
     });
   });
 
