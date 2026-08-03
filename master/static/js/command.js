@@ -523,3 +523,59 @@ async function submitCommand() {
     submitBtn.textContent = '提交命令';
   }
 }
+
+
+// ── 批量执行：每行一个任务，资源统一 ──
+const batchBtn = document.getElementById('batchBtn');
+
+batchBtn.addEventListener('click', async () => {
+  const userId = cmdUserIdEl.value.trim();
+  if (!userId) { showToast('请输入用户标识', 'error'); return; }
+
+  // 按行拆分（不走 \ 续行拼接，每行独立任务）
+  const lines = cmdInputEl.value.trim()
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (lines.length < 2) {
+    showToast('批量执行至少需要 2 行命令', 'error');
+    return;
+  }
+
+  if (!confirm(`将提交 ${lines.length} 个任务（资源统一为 CPU=${state.cpu}, 内存=${state.memory}${state.memUnit}, 设备=${state.device_num}）\n\n是否继续？`)) return;
+
+  batchBtn.disabled = true;
+  batchBtn.textContent = `提交中 0/${lines.length}…`;
+  resultDiv.style.display = 'none';
+
+  let ok = 0, fail = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const body = {
+      node_id:    state.selectedNodeId,
+      user_id:    userId,
+      command:    lines[i],
+      cpu:        state.cpu,
+      memory:     state.memory,
+      mem_unit:   state.memUnit,
+      device_num: state.device_ids.length > 0 ? 0 : state.device_num,
+      device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
+    };
+    try {
+      const resp = await fetch('/command/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (resp.ok) ok++; else fail++;
+    } catch {
+      fail++;
+    }
+    batchBtn.textContent = `提交中 ${i + 1}/${lines.length}…`;
+  }
+
+  batchBtn.disabled = false;
+  batchBtn.textContent = '批量执行（每行一个任务）';
+  showToast(`批量提交完成: 成功 ${ok} 个, 失败 ${fail} 个`, fail > 0 ? 'error' : 'success');
+  cmdInputEl.value = '';
+  fetchQueue();
+  updateSubmitBtn();
+});

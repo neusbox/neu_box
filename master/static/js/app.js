@@ -438,6 +438,18 @@ function updateSubmitBtn() {
   } else {
     submitBtn.disabled = !(cmdUserIdEl.value.trim() && cmdInputEl.value.trim());
   }
+
+  // 批量按钮：仅命令模式且至少 2 行命令时可用
+  const batchBtn = document.getElementById('batchBtn');
+  if (batchBtn) {
+    if (state.mode !== 'command') {
+      batchBtn.style.display = 'none';
+    } else {
+      batchBtn.style.display = '';
+      const lines = cmdInputEl.value.trim().split('\n').map(s => s.trim()).filter(Boolean);
+      batchBtn.disabled = !(hasNode && online && lines.length >= 2);
+    }
+  }
 }
 
 // Listen to input changes
