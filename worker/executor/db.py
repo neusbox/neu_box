@@ -73,13 +73,19 @@ class Database:
         try:
             conn.execute("ALTER TABLE tasks ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
         except sqlite3.OperationalError:
-            pass  # 列已存在
+            pass
+
+        # 兼容旧表：添加 est_time 列（预估耗时，分钟）
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN est_time INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
         # 兼容旧表：添加 port 列（如果不存在）
         try:
             conn.execute("ALTER TABLE sandboxes ADD COLUMN port INTEGER")
         except sqlite3.OperationalError:
-            pass  # 列已存在
+            pass
 
         conn.executescript('''
             CREATE TABLE IF NOT EXISTS tasks (
@@ -138,15 +144,16 @@ class Database:
 
     def insert_task(self, task_id: str, user_id: str, command: str,
                     cpu: int = 0, mem: str = "0", devices: list = None,
-                    position: int = 0, password: str = ''):
+                    position: int = 0, password: str = '',
+                    est_time: int = 0):
         conn = self._get_conn()
         pw_hash = self._hash_password(password, task_id) if password else ''
         conn.execute(
             'INSERT INTO tasks (task_id, user_id, password_hash, command, status, position, '
-            'cpu, mem, devices, created_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'cpu, mem, devices, created_at, est_time) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (task_id, user_id, pw_hash, command, 'queued', position,
-             cpu, mem, json.dumps(devices or []), time.time()))
+             cpu, mem, json.dumps(devices or []), time.time(), est_time))
         conn.commit()
 
     def update_task_status(self, task_id: str, status: str,

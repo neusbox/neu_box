@@ -58,10 +58,18 @@ function renderQueue(data) {
         cpu: task.cpu || 0,
         mem: task.mem || '0',
         device_num: task.device_num || 0,
+        est_time: task.est_time || 0,
       };
     }
 
     const marked = _isMarked(task.task_id);
+    let etaStr = '';
+    if (task.status === 'queued' && task.eta != null) {
+      const mins = task.eta;
+      etaStr = mins >= 60
+        ? `⏳ ~${Math.floor(mins / 60)}h${mins % 60 > 0 ? (mins % 60) + 'm' : ''}`
+        : (mins > 0 ? `⏳ ~${mins}min` : '⏳ 即将执行');
+    }
 
     return `
       <div class="queue-item ${isRunning ? 'running' : ''} ${clickable ? 'clickable' : ''} ${marked ? 'marked' : ''}"
@@ -71,6 +79,7 @@ function renderQueue(data) {
         <span class="queue-pos">${posText}</span>
         <span class="queue-user" title="${escapeHtml(task.user_id)}">${escapeHtml(task.user_id)}</span>
         <span class="queue-cmd" title="${escapeHtml(task.command)}">${escapeHtml(task.command)}</span>
+        ${etaStr ? `<span class="queue-eta">${etaStr}</span>` : ''}
         <span class="queue-status ${task.status}">${statusLabel(task.status)}</span>
         <button class="queue-mark-btn ${marked ? 'active' : ''}" title="${marked ? '取消标注' : '标注此任务'}"
                 data-task-id="${task.task_id}">${marked ? '★' : '☆'}</button>
@@ -332,6 +341,9 @@ function _renderMeta(task) {
   }
   m += `<br>`;
   m += `<strong>创建时间:</strong> ${formatTime(task.created_at)}<br>`;
+  if (task.est_time > 0) {
+    m += `<strong>预估耗时:</strong> ${task.est_time} 分钟<br>`;
+  }
   m += `<strong>状态:</strong> ${statusLabel(task.status)}`;
   if (task.result) {
     m += ` | <strong>返回码:</strong> ${task.result.returncode}`;
@@ -482,6 +494,8 @@ async function submitCommand() {
   submitBtn.textContent = '提交中…';
   resultDiv.style.display = 'none';
 
+  const estTime = parseInt(cmdEstTimeEl.value, 10) || 0;
+
   const body = {
     node_id:    state.selectedNodeId,
     user_id:    userId,
@@ -491,6 +505,7 @@ async function submitCommand() {
     mem_unit:   state.memUnit,
     device_num: state.device_ids.length > 0 ? 0 : state.device_num,
     device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
+    est_time:   estTime,
   };
 
   try {
@@ -557,6 +572,7 @@ batchBtn.addEventListener('click', async () => {
       mem_unit:   state.memUnit,
       device_num: state.device_ids.length > 0 ? 0 : state.device_num,
       device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
+      est_time:   parseInt(cmdEstTimeEl.value, 10) || 0,
     };
     try {
       const resp = await fetch('/command/run', {

@@ -334,13 +334,14 @@ class TaskQueue:
     def submit(self, user_id: str, command: str,
                cpu: int = 0, mem: str = "0",
                device_num: int = 0,
-               device_ids: list = None) -> str:
+               device_ids: list = None,
+               est_time: int = 0) -> str:
         """提交任务到队列。device_ids 指定设备时优先于 device_num 自动分配。"""
         task_id = uuid.uuid4().hex[:12]
 
         self._db.insert_task(
             task_id=task_id, user_id=user_id, command=command,
-            cpu=cpu, mem=mem, devices=[])
+            cpu=cpu, mem=mem, devices=[], est_time=est_time)
 
         task = {
             'task_id': task_id,
@@ -371,14 +372,24 @@ class TaskQueue:
 
     def get_queue(self) -> list[dict]:
         """返回队列视图：运行中 → 排队中 → 最近完成/失败的任务（不含日志）。
-        从 DB 读取，保证进程重启后数据不丢。
+        计算每个排队任务的预估等待时间（前面排队任务 est_time 之和）。
         """
         active = self._db.get_queue_tasks()              # queued + running
-        recent = self._db.get_recent_tasks(limit=QUEUE_RECENT_LIMIT)  # completed + failed
-        # 去重：active 中的 task_id 优先（理论上状态不同不会重复）
+        recent = self._db.get_recent_tasks(limit=QUEUE_RECENT_LIMIT)
+
+        # 计算每个排队任务的 eta：前面所有排队任务的 est_time 累加
+        queued_tasks = [t for t in active if t['status'] == 'queued']
+        queued_tasks.sort(key=lambda t: t.get('position', 0))
+        eta_sum = 0
+        eta_map = {}
+        for t in queued_tasks:
+            eta_map[t['task_id']] = eta_sum
+            eta_sum += t.get('est_time', 0) or 0
+
         active_ids = {t['task_id'] for t in active}
         all_tasks = active + [t for t in recent if t['task_id'] not in active_ids]
-        return [self._format_public(t) for t in all_tasks]
+        return [self._format_public(t, eta=eta_map.get(t['task_id']))
+                for t in all_tasks]
 
     def delete_tasks(self, task_ids: list[str]) -> int:
         """批量删除。排队任务直接移除，运行中任务设置取消标记 + 杀沙盒。
@@ -452,7 +463,7 @@ class TaskQueue:
             self._db.update_position_batch(task_ids)
 
     @staticmethod
-    def _format_public(task: dict) -> dict:
+    def _format_public(task: dict, eta: int = None) -> dict:
         """返回任务的公开视图（不含日志）。"""
         return {
             'task_id': task['task_id'],
@@ -461,6 +472,8 @@ class TaskQueue:
             'status': task['status'],
             'position': task.get('position', 0),
             'cpu': task.get('cpu', 0),
+            'est_time': task.get('est_time', 0) or 0,
+            'eta': eta,  # 预估等待时间（分钟），仅 queued 任务有值
             'mem': task.get('mem', '0'),
             'device_num': task.get('device_num', len(task.get('devices') or [])),
             'devices': task.get('devices', []),
@@ -665,6 +678,10 @@ def run_command():
     if device_ids and isinstance(device_ids, list):
         normalized_ids = _normalize_device_ids(device_ids, sbx._discover_device_nodes())
 
+    est_time = body.get('est_time', 0)
+    if not isinstance(est_time, int) or est_time < 0:
+        est_time = 0
+
     tq = TaskQueue.get_instance()
     task_id = tq.submit(
         user_id=user_id,
@@ -673,6 +690,7 @@ def run_command():
         mem=sandbox_mem,
         device_num=device_num,
         device_ids=normalized_ids,
+        est_time=est_time,
     )
 
     # 从 DB 获取当前队列位置

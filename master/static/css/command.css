@@ -143,6 +143,15 @@
 .queue-status.completed { color: #30d158; background: rgba(48,209,88,.1); }
 .queue-status.failed   { color: var(--danger); background: rgba(255,59,48,.1); }
 
+/* ── ETA ──────────────────────────────────────────────────── */
+
+.queue-eta {
+  font-size: 10px;
+  color: var(--nb-sub);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ── Queue re-run button ──────────────────────────────────── */
 
 .queue-rerun-btn {

@@ -735,6 +735,19 @@ body {
   overflow: hidden;
 }
 
+/* 通知弹窗：大尺寸，不覆盖整个窗口 */
+.notice-card {
+  width: min(1200px, 94vw);
+  max-height: 92vh;
+  overflow-y: auto;
+}
+
+.notice-card img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+
 .modal-header {
   display: flex;
   align-items: center;

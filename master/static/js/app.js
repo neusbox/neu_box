@@ -42,6 +42,7 @@ const passwordInput     = document.getElementById('passwordInput');
 // Command fields
 const cmdUserIdEl       = document.getElementById('cmdUserId');
 const cmdInputEl        = document.getElementById('cmdInput');
+const cmdEstTimeEl      = document.getElementById('cmdEstTime');
 
 // Queue
 const queueList         = document.getElementById('queueList');
@@ -1139,7 +1140,7 @@ window.fetch = function(...args) {
     if (resp.ok) {
       const text = await resp.text();
       if (text.trim()) {
-        document.getElementById('noticeModalBody').textContent = text;
+        document.getElementById('noticeModalBody').innerHTML = marked.parse(text);
         noticeVisible = true;
       }
     }

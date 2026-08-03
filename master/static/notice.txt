@@ -1,12 +1,11 @@
-欢迎使用 neu_box！
+# 欢迎使用 neu_box（alpha 0.1）
 
-用户名：admin
-密码：231415926@qq.com
+> *用户名：admin*
 
-Ascend910B3节点此时卡0故障，不会被分配
+> *密码：231415926@qq.com*
 
-- 左栏选择节点后提交命令
-- 中栏选择节点后申请与查看终端与沙盒
-- 右栏查看实验日志
++ 使用说明
+
+![使用说明](/static/uploads/explanation.png)
 
 如有问题请联系管理员 彭玉涛：YutaoPeng@foxmail.com。

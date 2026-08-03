@@ -111,6 +111,10 @@
           <label>命令 <span class="unit">每行一条，自动 && 拼接</span></label>
           <textarea class="text-input cmd-textarea" id="cmdInput" placeholder="nvidia-smi&#10;echo hello" autocomplete="off" rows="4"></textarea>
         </div>
+        <div class="field">
+          <label>预估耗时 <span class="unit">分钟，可选</span></label>
+          <input type="number" class="text-input" id="cmdEstTime" placeholder="例如 120" min="0" value="" autocomplete="off" style="text-align:center">
+        </div>
       </div>
 
       <!-- 提交按钮 -->
@@ -237,12 +241,12 @@
 
 <!-- ═══ 通知弹窗 ═══ -->
 <div class="modal-overlay" id="noticeModal" style="display:none;z-index:3000">
-  <div class="modal-card" style="max-width:480px">
+  <div class="modal-card notice-card">
     <div class="modal-header">
       <span>📢 通知</span>
       <button class="modal-close" id="noticeModalClose" title="关闭">×</button>
     </div>
-    <div class="modal-body" id="noticeModalBody" style="white-space:pre-wrap;line-height:1.7;font-size:13px">
+    <div class="modal-body" id="noticeModalBody" style="line-height:1.7;font-size:13px">
       加载中…
     </div>
   </div>
