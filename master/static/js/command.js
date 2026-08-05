@@ -458,6 +458,11 @@ async function viewTaskLog(taskId) {
 
     if (task.status === 'completed' || task.status === 'failed') {
       logActions.style.display = '';
+      document.getElementById('saveExpBtn').style.display = '';
+    } else {
+      // 运行中任务也显示导出按钮
+      logActions.style.display = '';
+      document.getElementById('saveExpBtn').style.display = 'none';
     }
 
   } catch (err) {
@@ -466,6 +471,22 @@ async function viewTaskLog(taskId) {
   }
 }
 
+
+// ── 导出日志 ──
+document.getElementById('exportLogBtn').addEventListener('click', () => {
+  if (!_currentTaskData) return;
+  const el = logContent.querySelector('.log-stdout');
+  const text = el ? el.textContent : (logContent.textContent || '');
+  const ts = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+  const filename = `${_currentTaskData.task_id}_${ts}.log`;
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('日志已导出', 'success');
+});
 
 async function submitCommand() {
   const userId = cmdUserIdEl.value.trim();
