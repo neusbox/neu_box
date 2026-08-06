@@ -143,6 +143,15 @@
 .queue-status.completed { color: #30d158; background: rgba(48,209,88,.1); }
 .queue-status.failed   { color: var(--danger); background: rgba(255,59,48,.1); }
 
+/* ── ETA ──────────────────────────────────────────────────── */
+
+.queue-eta {
+  font-size: 10px;
+  color: var(--nb-sub);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ── Queue re-run button ──────────────────────────────────── */
 
 .queue-rerun-btn {
@@ -167,6 +176,49 @@
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);
+}
+
+/* ── Queue mark button & marked state ──────────────────────── */
+
+.queue-mark-btn {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--card-bg);
+  color: var(--sub);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s, color .15s;
+  margin-left: 2px;
+}
+
+.queue-mark-btn:hover {
+  background: #ffd60a;
+  color: #fff;
+  border-color: #ffd60a;
+}
+
+.queue-mark-btn.active {
+  background: #ffd60a;
+  color: #fff;
+  border-color: #ffd60a;
+}
+
+.queue-item.marked {
+  border-color: rgba(255,214,10,.45);
+  background: rgba(255,214,10,.08);
+}
+
+.queue-item.marked:hover,
+.queue-item.marked.active {
+  border-color: rgba(255,214,10,.7);
+  background: rgba(255,214,10,.14);
 }
 
 

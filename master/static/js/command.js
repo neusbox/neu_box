@@ -6,6 +6,24 @@
 // 缓存命令全文（避免 data-* 属性对长命令的截断）
 const _taskMeta = {};
 
+// ── 任务标注（localStorage 持久化） ──
+const MARK_KEY = 'neu_box_marked_tasks';
+let _markedTasks = new Set();
+try {
+  const saved = JSON.parse(localStorage.getItem(MARK_KEY) || '[]');
+  _markedTasks = new Set(saved);
+} catch {}
+
+function _isMarked(taskId) { return _markedTasks.has(taskId); }
+
+function _toggleMark(taskId) {
+  if (_markedTasks.has(taskId)) _markedTasks.delete(taskId);
+  else _markedTasks.add(taskId);
+  try { localStorage.setItem(MARK_KEY, JSON.stringify([..._markedTasks])); } catch {}
+  // 重新渲染当前列表
+  if (_lastQueueData) renderQueue(_lastQueueData);
+}
+
 function renderQueue(data) {
   const queue = data.queue || [];
   const filterUser = (queueUserFilter.value || '').trim().toLowerCase();
@@ -40,18 +58,31 @@ function renderQueue(data) {
         cpu: task.cpu || 0,
         mem: task.mem || '0',
         device_num: task.device_num || 0,
+        est_time: task.est_time || 0,
       };
     }
 
+    const marked = _isMarked(task.task_id);
+    let etaStr = '';
+    if (task.status === 'queued' && task.eta != null) {
+      const mins = task.eta;
+      etaStr = mins >= 60
+        ? `⏳ ~${Math.floor(mins / 60)}h${mins % 60 > 0 ? (mins % 60) + 'm' : ''}`
+        : (mins > 0 ? `⏳ ~${mins}min` : '⏳ 即将执行');
+    }
+
     return `
-      <div class="queue-item ${isRunning ? 'running' : ''} ${clickable ? 'clickable' : ''}"
+      <div class="queue-item ${isRunning ? 'running' : ''} ${clickable ? 'clickable' : ''} ${marked ? 'marked' : ''}"
            data-task-id="${task.task_id}"
            title="${isDone ? '点击查看日志' : (isRunning ? '点击查看实时日志' : '')}">
         <input type="checkbox" class="queue-check" data-task-id="${task.task_id}" title="选择">
         <span class="queue-pos">${posText}</span>
         <span class="queue-user" title="${escapeHtml(task.user_id)}">${escapeHtml(task.user_id)}</span>
         <span class="queue-cmd" title="${escapeHtml(task.command)}">${escapeHtml(task.command)}</span>
+        ${etaStr ? `<span class="queue-eta">${etaStr}</span>` : ''}
         <span class="queue-status ${task.status}">${statusLabel(task.status)}</span>
+        <button class="queue-mark-btn ${marked ? 'active' : ''}" title="${marked ? '取消标注' : '标注此任务'}"
+                data-task-id="${task.task_id}">${marked ? '★' : '☆'}</button>
         ${isDone ? `<button class="queue-rerun-btn" title="重新执行此命令" data-task-id="${task.task_id}">↻</button>` : ''}
       </div>`;
   }).join('');
@@ -61,6 +92,7 @@ function renderQueue(data) {
     item.addEventListener('click', (e) => {
       if (e.target.classList.contains('queue-check')) return;
       if (e.target.classList.contains('queue-rerun-btn')) return;
+      if (e.target.classList.contains('queue-mark-btn')) return;
       queueList.querySelectorAll('.queue-item.active').forEach(el => el.classList.remove('active'));
       item.classList.add('active');
       const taskId = item.dataset.taskId;
@@ -74,6 +106,14 @@ function renderQueue(data) {
       e.stopPropagation();
       const taskId = btn.dataset.taskId;
       rerunTask(taskId);
+    });
+  });
+
+  // Bind mark buttons
+  queueList.querySelectorAll('.queue-mark-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _toggleMark(btn.dataset.taskId);
     });
   });
 
@@ -301,6 +341,9 @@ function _renderMeta(task) {
   }
   m += `<br>`;
   m += `<strong>创建时间:</strong> ${formatTime(task.created_at)}<br>`;
+  if (task.est_time > 0) {
+    m += `<strong>预估耗时:</strong> ${task.est_time} 分钟<br>`;
+  }
   m += `<strong>状态:</strong> ${statusLabel(task.status)}`;
   if (task.result) {
     m += ` | <strong>返回码:</strong> ${task.result.returncode}`;
@@ -415,6 +458,11 @@ async function viewTaskLog(taskId) {
 
     if (task.status === 'completed' || task.status === 'failed') {
       logActions.style.display = '';
+      document.getElementById('saveExpBtn').style.display = '';
+    } else {
+      // 运行中任务也显示导出按钮
+      logActions.style.display = '';
+      document.getElementById('saveExpBtn').style.display = 'none';
     }
 
   } catch (err) {
@@ -423,6 +471,22 @@ async function viewTaskLog(taskId) {
   }
 }
 
+
+// ── 导出日志 ──
+document.getElementById('exportLogBtn').addEventListener('click', () => {
+  if (!_currentTaskData) return;
+  const el = logContent.querySelector('.log-stdout');
+  const text = el ? el.textContent : (logContent.textContent || '');
+  const ts = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+  const filename = `${_currentTaskData.task_id}_${ts}.log`;
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('日志已导出', 'success');
+});
 
 async function submitCommand() {
   const userId = cmdUserIdEl.value.trim();
@@ -451,6 +515,8 @@ async function submitCommand() {
   submitBtn.textContent = '提交中…';
   resultDiv.style.display = 'none';
 
+  const estTime = parseInt(cmdEstTimeEl.value, 10) || 0;
+
   const body = {
     node_id:    state.selectedNodeId,
     user_id:    userId,
@@ -460,6 +526,7 @@ async function submitCommand() {
     mem_unit:   state.memUnit,
     device_num: state.device_ids.length > 0 ? 0 : state.device_num,
     device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
+    est_time:   estTime,
   };
 
   try {
@@ -492,3 +559,60 @@ async function submitCommand() {
     submitBtn.textContent = '提交命令';
   }
 }
+
+
+// ── 批量执行：每行一个任务，资源统一 ──
+const batchBtn = document.getElementById('batchBtn');
+
+batchBtn.addEventListener('click', async () => {
+  const userId = cmdUserIdEl.value.trim();
+  if (!userId) { showToast('请输入用户标识', 'error'); return; }
+
+  // 按行拆分（不走 \ 续行拼接，每行独立任务）
+  const lines = cmdInputEl.value.trim()
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (lines.length < 2) {
+    showToast('批量执行至少需要 2 行命令', 'error');
+    return;
+  }
+
+  if (!confirm(`将提交 ${lines.length} 个任务（资源统一为 CPU=${state.cpu}, 内存=${state.memory}${state.memUnit}, 设备=${state.device_num}）\n\n是否继续？`)) return;
+
+  batchBtn.disabled = true;
+  batchBtn.textContent = `提交中 0/${lines.length}…`;
+  resultDiv.style.display = 'none';
+
+  let ok = 0, fail = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const body = {
+      node_id:    state.selectedNodeId,
+      user_id:    userId,
+      command:    lines[i],
+      cpu:        state.cpu,
+      memory:     state.memory,
+      mem_unit:   state.memUnit,
+      device_num: state.device_ids.length > 0 ? 0 : state.device_num,
+      device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
+      est_time:   parseInt(cmdEstTimeEl.value, 10) || 0,
+    };
+    try {
+      const resp = await fetch('/command/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (resp.ok) ok++; else fail++;
+    } catch {
+      fail++;
+    }
+    batchBtn.textContent = `提交中 ${i + 1}/${lines.length}…`;
+  }
+
+  batchBtn.disabled = false;
+  batchBtn.textContent = '批量执行（每行一个任务）';
+  showToast(`批量提交完成: 成功 ${ok} 个, 失败 ${fail} 个`, fail > 0 ? 'error' : 'success');
+  cmdInputEl.value = '';
+  fetchQueue();
+  updateSubmitBtn();
+});

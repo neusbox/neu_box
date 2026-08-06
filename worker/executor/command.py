@@ -379,6 +379,7 @@ class TaskQueue:
                 'target': task.get('target_spec') or {
                     'type': TARGET_HOST,
                 },
+                'est_time': task.get('est_time', 0),
                 'devices': [],
                 'status': 'queued',
                 'position': 0,
@@ -406,7 +407,9 @@ class TaskQueue:
         device_num: int = 0,
         device_ids: list | None = None,
         target: dict | None = None,
+        est_time: int = 0,
     ) -> str:
+        """提交任务到队列。device_ids 指定设备时优先于 device_num 自动分配。"""
         task_id = uuid.uuid4().hex[:12]
         target = dict(target or {'type': TARGET_HOST})
         device_ids = list(device_ids or [])
@@ -420,6 +423,7 @@ class TaskQueue:
             device_num=device_num,
             device_ids=device_ids,
             target=target,
+            est_time=est_time,
         )
         task = {
             'task_id': task_id,
@@ -430,6 +434,7 @@ class TaskQueue:
             'device_num': device_num,
             'device_ids': device_ids,
             'target': target,
+            'est_time': est_time,
             'devices': [],
             'status': 'queued',
             'position': 0,
@@ -451,14 +456,25 @@ class TaskQueue:
         return task_id
 
     def get_queue(self) -> list[dict]:
-        active = self._db.get_queue_tasks()
+        """返回队列视图：运行中 → 排队中 → 最近完成/失败的任务（不含日志）。
+        计算每个排队任务的预估等待时间（前面排队任务 est_time 之和）。
+        """
+        active = self._db.get_queue_tasks()              # queued + running
         recent = self._db.get_recent_tasks(limit=QUEUE_RECENT_LIMIT)
-        active_ids = {task['task_id'] for task in active}
-        tasks = active + [
-            task for task in recent
-            if task['task_id'] not in active_ids
-        ]
-        return [self._format_public(task) for task in tasks]
+
+        # 计算每个排队任务的 eta：前面所有排队任务的 est_time 累加
+        queued_tasks = [t for t in active if t['status'] == 'queued']
+        queued_tasks.sort(key=lambda t: t.get('position', 0))
+        eta_sum = 0
+        eta_map = {}
+        for t in queued_tasks:
+            eta_map[t['task_id']] = eta_sum
+            eta_sum += t.get('est_time', 0) or 0
+
+        active_ids = {t['task_id'] for t in active}
+        all_tasks = active + [t for t in recent if t['task_id'] not in active_ids]
+        return [self._format_public(t, eta=eta_map.get(t['task_id']))
+                for t in all_tasks]
 
     def delete_tasks(self, task_ids: list[str]) -> int:
         to_cancel = []
@@ -515,7 +531,8 @@ class TaskQueue:
             self._db.update_position_batch(task_ids)
 
     @staticmethod
-    def _format_public(task: dict) -> dict:
+    def _format_public(task: dict, eta: int = None) -> dict:
+        """返回任务的公开视图（不含日志）。"""
         target = task.get('target')
         if target is None:
             target = task.get('target_spec')
@@ -526,6 +543,8 @@ class TaskQueue:
             'status': task['status'],
             'position': task.get('position', 0),
             'cpu': task.get('cpu', 0),
+            'est_time': task.get('est_time', 0) or 0,
+            'eta': eta,  # 预估等待时间（分钟），仅 queued 任务有值
             'mem': task.get('mem', '0'),
             'device_num': task.get(
                 'device_num',
@@ -803,6 +822,10 @@ def run_command():
                 'error': 'docker_existing 仅支持 Ascend NPU Worker',
             }, 400
 
+    est_time = body.get('est_time', 0)
+    if not isinstance(est_time, int) or est_time < 0:
+        est_time = 0
+
     task_id = TaskQueue.get_instance().submit(
         user_id=user_id,
         command=command,
@@ -811,6 +834,7 @@ def run_command():
         device_num=0 if normalized_ids else device_num,
         device_ids=normalized_ids,
         target=target,
+        est_time=est_time,
     )
     task = Database.get_instance().get_task(task_id)
     position = task['position'] if task else 0

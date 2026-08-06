@@ -42,6 +42,7 @@ const passwordInput     = document.getElementById('passwordInput');
 // Command fields
 const cmdUserIdEl       = document.getElementById('cmdUserId');
 const cmdInputEl        = document.getElementById('cmdInput');
+const cmdEstTimeEl      = document.getElementById('cmdEstTime');
 
 // Queue
 const queueList         = document.getElementById('queueList');
@@ -437,6 +438,18 @@ function updateSubmitBtn() {
     submitBtn.disabled = !(usernameInput.value.trim() && passwordInput.value);
   } else {
     submitBtn.disabled = !(cmdUserIdEl.value.trim() && cmdInputEl.value.trim());
+  }
+
+  // 批量按钮：仅命令模式且至少 2 行命令时可用
+  const batchBtn = document.getElementById('batchBtn');
+  if (batchBtn) {
+    if (state.mode !== 'command') {
+      batchBtn.style.display = 'none';
+    } else {
+      batchBtn.style.display = '';
+      const lines = cmdInputEl.value.trim().split('\n').map(s => s.trim()).filter(Boolean);
+      batchBtn.disabled = !(hasNode && online && lines.length >= 2);
+    }
   }
 }
 
@@ -1127,7 +1140,7 @@ window.fetch = function(...args) {
     if (resp.ok) {
       const text = await resp.text();
       if (text.trim()) {
-        document.getElementById('noticeModalBody').textContent = text;
+        document.getElementById('noticeModalBody').innerHTML = marked.parse(text);
         noticeVisible = true;
       }
     }

@@ -95,6 +95,7 @@ class Database:
                 finished_at REAL,
                 device_num  INTEGER NOT NULL DEFAULT 0,
                 device_ids  TEXT    NOT NULL DEFAULT '[]',
+                est_time    INTEGER DEFAULT 0,
                 target_spec TEXT    NOT NULL DEFAULT '{"type":"host"}',
                 runtime_metadata TEXT NOT NULL DEFAULT '{}'
             );
@@ -113,6 +114,23 @@ class Database:
                 port        INTEGER
             );
         ''')
+        migrations = (
+            ('tasks', "password_hash TEXT NOT NULL DEFAULT ''"),
+            ('tasks', 'est_time INTEGER DEFAULT 0'),
+            ('tasks', 'device_num INTEGER NOT NULL DEFAULT 0'),
+            ('tasks', "device_ids TEXT NOT NULL DEFAULT '[]'"),
+            (
+                'tasks',
+                "target_spec TEXT NOT NULL DEFAULT '{\"type\":\"host\"}'",
+            ),
+            ('tasks', "runtime_metadata TEXT NOT NULL DEFAULT '{}'"),
+            ('sandboxes', 'port INTEGER'),
+        )
+        for table, column in migrations:
+            try:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
     # ═══════════════════════════════════════════════════════════
@@ -137,18 +155,19 @@ class Database:
                     cpu: int = 0, mem: str = "0", devices: list = None,
                     position: int = 0, password: str = '',
                     device_num: int = 0, device_ids: list = None,
-                    target: dict | None = None):
+                    target: dict | None = None, est_time: int = 0):
         conn = self._get_conn()
         pw_hash = self._hash_password(password, task_id) if password else ''
         target = dict(target or {'type': 'host'})
         conn.execute(
             'INSERT INTO tasks (task_id, user_id, password_hash, command, status, position, '
-            'cpu, mem, devices, created_at, device_num, device_ids, target_spec) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'cpu, mem, devices, created_at, device_num, device_ids, '
+            'target_spec, est_time) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (task_id, user_id, pw_hash, command, 'queued', position,
              cpu, mem, json.dumps(devices or []), time.time(), device_num,
              json.dumps(device_ids or []),
-             json.dumps(target, ensure_ascii=False)))
+             json.dumps(target, ensure_ascii=False), est_time))
         conn.commit()
 
     def update_task_status(self, task_id: str, status: str,
