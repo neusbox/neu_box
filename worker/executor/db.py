@@ -27,7 +27,6 @@
     db.list_sandboxes()            → list[dict]
 """
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -60,14 +59,9 @@ class Database:
     def _get_conn(self) -> sqlite3.Connection:
         """获取当前线程的数据库连接（线程本地）。"""
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(
-                self._db_path,
-                timeout=30,
-                check_same_thread=False,
-            )
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=30000")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return self._local.conn
@@ -78,7 +72,6 @@ class Database:
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id     TEXT PRIMARY KEY,
                 user_id     TEXT    NOT NULL,
-                password_hash TEXT  NOT NULL DEFAULT '',
                 command     TEXT    NOT NULL,
                 status      TEXT    NOT NULL DEFAULT 'queued',
                 position    INTEGER DEFAULT 0,
@@ -96,8 +89,7 @@ class Database:
                 device_num  INTEGER NOT NULL DEFAULT 0,
                 device_ids  TEXT    NOT NULL DEFAULT '[]',
                 est_time    INTEGER DEFAULT 0,
-                target_spec TEXT    NOT NULL DEFAULT '{"type":"host"}',
-                runtime_metadata TEXT NOT NULL DEFAULT '{}'
+                target_spec TEXT    NOT NULL DEFAULT '{"type":"host"}'
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_user   ON tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -110,27 +102,9 @@ class Database:
                 devices     TEXT    DEFAULT '[]',
                 cgroup_path TEXT,
                 created_at  REAL,
-                pids        TEXT    DEFAULT '[]',
-                port        INTEGER
+                pids        TEXT    DEFAULT '[]'
             );
         ''')
-        migrations = (
-            ('tasks', "password_hash TEXT NOT NULL DEFAULT ''"),
-            ('tasks', 'est_time INTEGER DEFAULT 0'),
-            ('tasks', 'device_num INTEGER NOT NULL DEFAULT 0'),
-            ('tasks', "device_ids TEXT NOT NULL DEFAULT '[]'"),
-            (
-                'tasks',
-                "target_spec TEXT NOT NULL DEFAULT '{\"type\":\"host\"}'",
-            ),
-            ('tasks', "runtime_metadata TEXT NOT NULL DEFAULT '{}'"),
-            ('sandboxes', 'port INTEGER'),
-        )
-        for table, column in migrations:
-            try:
-                conn.execute(f'ALTER TABLE {table} ADD COLUMN {column}')
-            except sqlite3.OperationalError:
-                pass
         conn.commit()
 
     # ═══════════════════════════════════════════════════════════
@@ -139,32 +113,19 @@ class Database:
 
     # ── 写入 ──────────────────────────────────────────────────
 
-    @staticmethod
-    def _hash_password(password: str, task_id: str) -> str:
-        return hashlib.sha256(f'{password}:{task_id}'.encode()).hexdigest()
-
-    def verify_task_password(self, task_id: str, password: str) -> bool:
-        """验证任务密码是否正确。"""
-        task = self.get_task(task_id)
-        if not task:
-            return False
-        expected = self._hash_password(password, task_id)
-        return expected == (task.get('password_hash') or '')
-
     def insert_task(self, task_id: str, user_id: str, command: str,
                     cpu: int = 0, mem: str = "0", devices: list = None,
-                    position: int = 0, password: str = '',
+                    position: int = 0,
                     device_num: int = 0, device_ids: list = None,
                     target: dict | None = None, est_time: int = 0):
         conn = self._get_conn()
-        pw_hash = self._hash_password(password, task_id) if password else ''
         target = dict(target or {'type': 'host'})
         conn.execute(
-            'INSERT INTO tasks (task_id, user_id, password_hash, command, status, position, '
+            'INSERT INTO tasks (task_id, user_id, command, status, position, '
             'cpu, mem, devices, created_at, device_num, device_ids, '
             'target_spec, est_time) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (task_id, user_id, pw_hash, command, 'queued', position,
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (task_id, user_id, command, 'queued', position,
              cpu, mem, json.dumps(devices or []), time.time(), device_num,
              json.dumps(device_ids or []),
              json.dumps(target, ensure_ascii=False), est_time))
@@ -198,15 +159,6 @@ class Database:
             (status, returncode, stdout, stderr,
              1 if timed_out else 0, error,
              finished_at or time.time(), task_id))
-        conn.commit()
-
-    def update_task_runtime(self, task_id: str, metadata: dict | None):
-        """保存 Docker Exec 的运行实体，用于 Worker 重启后精确回收。"""
-        conn = self._get_conn()
-        conn.execute(
-            'UPDATE tasks SET runtime_metadata=? WHERE task_id=?',
-            (json.dumps(metadata or {}, ensure_ascii=False), task_id),
-        )
         conn.commit()
 
     def update_position_batch(self, task_ids: list[str]):
@@ -270,14 +222,14 @@ class Database:
 
     def insert_sandbox(self, name: str, cpu: int = 0, mem: str = "0",
                        devices: list = None, cgroup_path: str = "",
-                       pids: list = None, port: int = None):
+                       pids: list = None):
         conn = self._get_conn()
         conn.execute(
             'INSERT OR REPLACE INTO sandboxes '
-            '(name, cpu, mem, devices, cgroup_path, created_at, pids, port) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            '(name, cpu, mem, devices, cgroup_path, created_at, pids) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
             (name, cpu, mem, json.dumps(devices or []), cgroup_path,
-             time.time(), json.dumps(pids or []), port))
+             time.time(), json.dumps(pids or [])))
         conn.commit()
 
     def update_sandbox_pids(self, name: str, pids: list):
@@ -317,11 +269,10 @@ class Database:
                     d[key] = json.loads(d[key])
                 except (json.JSONDecodeError, TypeError):
                     pass
-        for key in ('target_spec', 'runtime_metadata'):
-            raw = d.get(key)
-            if isinstance(raw, str):
-                try:
-                    d[key] = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    d[key] = {}
+        raw = d.get('target_spec')
+        if isinstance(raw, str):
+            try:
+                d['target_spec'] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                d['target_spec'] = {}
         return d

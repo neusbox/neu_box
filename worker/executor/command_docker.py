@@ -6,15 +6,12 @@ PID 加入任务 sandbox，再发送 SIGCONT；容器生命周期仍由 Docker �
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
 import signal
-import stat
 import threading
 import time
 
-from executor.db import Database
 from executor.sbx_manager import SbxManager
 
 
@@ -99,30 +96,6 @@ def _same_container_namespaces(exec_pid: int, init_pid: int) -> bool:
             return False
     return True
 
-
-
-def _container_visible_devices(init_pid: int) -> set[str]:
-    """读取容器 mount namespace 中实际可见的 davinci major:minor。"""
-    result = set()
-    root = f'/proc/{init_pid}/root'
-    for path in glob.glob(f'{root}/dev/davinci*'):
-        try:
-            info = os.stat(path)
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISCHR(info.st_mode):
-            continue
-        result.add(f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}')
-    return result
-
-
-def _container_identity(container) -> tuple[int, str]:
-    """返回运行中容器的不可变执行身份（init PID + StartedAt）。"""
-    container.reload()
-    state = container.attrs.get('State') or {}
-    return int(state.get('Pid') or 0), str(state.get('StartedAt') or '')
-
-
 def _is_container_cgroup(pid: int, init_pid: int) -> bool:
     """PID 是否仍位于目标容器 cgroup（允许其任意后代 cgroup）。"""
     init_cgroup = _read_unified_cgroup(init_pid).rstrip('/')
@@ -131,113 +104,6 @@ def _is_container_cgroup(pid: int, init_pid: int) -> bool:
         pid_cgroup == init_cgroup
         or pid_cgroup.startswith(f'{init_cgroup}/')
     )
-
-
-def _safe_kill_existing_exec(client, task: dict) -> bool:
-    """恢复时只终止已证明属于原目标容器的那条 Docker exec。
-
-    这覆盖 Worker 崩溃于 ``SIGSTOP`` 和 ``join_sandbox`` 之间的窗口。已经
-    迁入任务 cgroup 的进程仍会由后续 ``destroy_sandbox`` 的 cgroup.kill
-    回收；这里的 SIGKILL 是幂等的。
-    """
-    metadata = task.get('runtime_metadata') or {}
-    container_id = str(metadata.get('container_id') or '')
-    if not container_id:
-        return True
-
-    docker = _load_docker()
-    try:
-        container = client.containers.get(container_id)
-    except docker.errors.NotFound:
-        return True
-    if container.id != container_id:
-        raise DockerExecutorError(
-            '孤儿任务记录的容器完整 ID 不匹配',
-            'docker_recovery_identity_mismatch',
-        )
-
-    init_pid, started_at = _container_identity(container)
-    recorded_init = int(metadata.get('container_init_pid') or 0)
-    recorded_started = str(metadata.get('container_started_at') or '')
-    if (
-        init_pid <= 0
-        or init_pid != recorded_init
-        or started_at != recorded_started
-    ):
-        # 原容器已经停止或重启时，原 exec 必然不再存活。绝不对新一轮
-        # container init 所属进程做恢复操作。
-        logger.warning(
-            '孤儿任务 %s 的目标容器已停止或重启，跳过 PID 信号',
-            task.get('task_id'),
-        )
-        return True
-
-    exec_id = str(metadata.get('exec_id') or '')
-    if not exec_id:
-        # PID 本身不是稳定身份。没有 Docker exec ID 时不能对数据库里的
-        # 数字 PID 发任何信号；该阶段还没有启动 exec，可直接继续回收
-        # 空 task cgroup。
-        return True
-    try:
-        inspect = client.api.exec_inspect(exec_id)
-    except docker.errors.NotFound:
-        return True
-    inspected_container = str(inspect.get('ContainerID') or '')
-    if inspected_container and inspected_container != container_id:
-        raise DockerExecutorError(
-            '孤儿 Docker exec 的 ContainerID 不匹配',
-            'docker_recovery_exec_mismatch',
-        )
-    if not inspect.get('Running'):
-        return True
-
-    pid = int(inspect.get('Pid') or 0)
-    recorded_pid = int(metadata.get('runtime_pid') or 0)
-    if recorded_pid and pid != recorded_pid:
-        raise DockerExecutorError(
-            f'孤儿 Docker exec PID 已变化: db={recorded_pid} api={pid}',
-            'docker_recovery_pid_mismatch',
-        )
-    if pid <= 0 or not os.path.exists(f'/proc/{pid}'):
-        return True
-    if not _same_container_namespaces(pid, init_pid):
-        raise DockerExecutorError(
-            f'拒绝终止孤儿 PID {pid}：namespace 不属于原容器',
-            'docker_recovery_namespace_mismatch',
-        )
-
-    sandbox_name = str(
-        metadata.get('sandbox_name')
-        or task.get('sandbox_name')
-        or ''
-    )
-    pid_cgroup = _read_unified_cgroup(pid)
-    in_task_cgroup = bool(
-        sandbox_name
-        and pid_cgroup == _expected_cgroup(sandbox_name)
-    )
-    if not in_task_cgroup and not _is_container_cgroup(pid, init_pid):
-        raise DockerExecutorError(
-            f'拒绝终止孤儿 PID {pid}：cgroup 不属于原容器或任务',
-            'docker_recovery_cgroup_mismatch',
-        )
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    return True
-
-def recover_orphaned_docker_task(task: dict) -> bool:
-    """回收 Worker 上次崩溃遗留的 Docker Exec。"""
-    target = task.get('target_spec') or {}
-    if target.get('type') != 'docker_existing':
-        return True
-
-    client = _docker_client()
-    try:
-        return _safe_kill_existing_exec(client, task)
-    finally:
-        client.close()
 
 
 class _TaskLog:
@@ -257,6 +123,8 @@ class _TaskLog:
             with open(self.path, 'a', encoding='utf-8') as stream:
                 stream.write(text)
                 stream.flush()
+
+
 def _result(
     returncode: int = -1,
     stdout: str = '',
@@ -271,6 +139,7 @@ def _result(
         'timed_out': timed_out,
         'error': error,
     }
+
 
 class ExistingDockerCommandExecutor:
     """在现有容器中执行一次受 task cgroup 约束的命令。"""
@@ -292,7 +161,6 @@ class ExistingDockerCommandExecutor:
             or {'type': 'host'}
         )
         self.log = _TaskLog(log_path)
-        self.db = Database.get_instance()
         self.sbx = SbxManager.get_instance()
         self._cancel_event = threading.Event()
         self._runtime_lock = threading.Lock()
@@ -305,9 +173,6 @@ class ExistingDockerCommandExecutor:
     def _set_runtime_pid(self, pid: int):
         with self._runtime_lock:
             self._runtime_pid = int(pid or 0)
-
-    def _runtime_snapshot(self, **values):
-        self.db.update_task_runtime(self.task['task_id'], values)
 
     def cancel(self):
         """只按当前 ExecInspect 身份终止本次 exec，避免旧 PID 复用误杀。"""
@@ -383,7 +248,9 @@ class ExistingDockerCommandExecutor:
                 '无法取得目标容器 init host PID',
                 'docker_container_pid_invalid',
             )
-        visible = _container_visible_devices(init_pid)
+        visible = set(self.sbx._discover_device_nodes(
+            f'/proc/{init_pid}/root/dev'
+        ))
         missing = sorted(set(self.devices) - visible)
         if missing:
             raise DockerExecutorError(
@@ -521,15 +388,6 @@ class ExistingDockerCommandExecutor:
             self._container_id = container.id
             init_pid, started_at = self._validate_container(container)
             self._container_init_pid = init_pid
-            self._runtime_snapshot(
-                target_type='docker_existing',
-                container_id=container.id,
-                container_name=container.name,
-                container_init_pid=init_pid,
-                container_started_at=started_at,
-                sandbox_name=self.sandbox_name,
-                phase='container_verified',
-            )
 
             exec_kwargs = {
                 'container': container.id,
@@ -552,16 +410,6 @@ class ExistingDockerCommandExecutor:
 
             created = self._client.api.exec_create(**exec_kwargs)
             self._exec_id = created['Id']
-            self._runtime_snapshot(
-                target_type='docker_existing',
-                container_id=container.id,
-                container_name=container.name,
-                container_init_pid=init_pid,
-                container_started_at=started_at,
-                exec_id=self._exec_id,
-                sandbox_name=self.sandbox_name,
-                phase='exec_created',
-            )
 
             def consume_output():
                 try:
@@ -592,38 +440,12 @@ class ExistingDockerCommandExecutor:
             stream_thread.start()
 
             pid = self._wait_stopped_pid(self._exec_id)
-            # 先持久化 stopped PID，再做后续核验。这样即使 Worker 恰好在
-            # join 前崩溃，启动恢复仍能从 ExecInspect + namespace/cgroup
-            # 双重身份核验后，只杀掉这一条 exec。
-            self._runtime_snapshot(
-                target_type='docker_existing',
-                container_id=container.id,
-                container_name=container.name,
-                container_init_pid=init_pid,
-                container_started_at=started_at,
-                exec_id=self._exec_id,
-                runtime_pid=pid,
-                sandbox_name=self.sandbox_name,
-                phase='stopped_before_join',
-            )
             self._assert_container_unchanged(
                 container, init_pid, started_at,
             )
             self._assert_exec_unchanged(pid)
             self._verify_exec_pid(pid, init_pid)
             self._join_and_continue(pid)
-            self._runtime_snapshot(
-                target_type='docker_existing',
-                container_id=container.id,
-                container_name=container.name,
-                container_init_pid=init_pid,
-                container_started_at=started_at,
-                exec_id=self._exec_id,
-                runtime_pid=pid,
-                sandbox_name=self.sandbox_name,
-                cgroup=_expected_cgroup(self.sandbox_name),
-                phase='running_in_sandbox',
-            )
 
             deadline = time.monotonic() + timeout if timeout else None
             while True:

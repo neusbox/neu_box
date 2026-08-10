@@ -53,8 +53,11 @@ class Node_Manager:
             return {'total': 0, 'idle': 0, 'dev_status': {}}
 
         busy = set()
-        allocated = sbx._get_allocated_devices()
-        for dev in allocated:
+        unavailable = (
+            sbx._get_allocated_devices()
+            | sbx._get_external_busy_devices()
+        )
+        for dev in unavailable:
             try:
                 busy.add(int(dev.split(':')[1]))
             except (ValueError, IndexError):

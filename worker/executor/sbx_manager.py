@@ -4,21 +4,19 @@
 设备分配模型:
   - 从 .env 读取 device_filter 正则匹配 /dev 下的设备名
   - 自动发现匹配的设备节点（如 nvidia0→195:0, nvidia1→195:1, ...）
-  - 通过 DB 追踪每个沙盒已占用的设备，空闲设备 = 全部 - 已分配
-  - 终端申请时按 device_num 从空闲池中分配
-  - 通过 Node_Manager (status.py) 校验设备空闲数量
+  - 通过 DB 追踪每个沙盒已占用的设备
+  - 扫描 /proc/*/fd，排除已被沙盒外进程打开的设备
+  - 命令任务或 CLI acquire 按 device_num 从空闲池中分配
 """
 
+import json
 import logging
 import os
-import signal
 import stat
 import subprocess
 import threading
 import time
 from typing import Optional, List
-
-import psutil
 
 from executor.db import Database
 
@@ -74,8 +72,8 @@ class SbxManager:
     def _cg_path(name: str) -> str:
         return f"/sys/fs/cgroup/sandbox_{name}"
 
-    def _discover_device_nodes(self) -> List[str]:
-        """扫描 /dev 目录，用 device_filter 正则匹配设备。
+    def _discover_device_nodes(self, root: str = '/dev') -> List[str]:
+        """扫描设备目录，用 device_filter 正则匹配设备。
 
         .env 配置示例:
           device_filter=nvidia[0-9]+     # 只匹配 nvidia0, nvidia1, ...
@@ -91,8 +89,8 @@ class SbxManager:
 
         devices = []
         try:
-            for entry in os.listdir('/dev'):
-                path = os.path.join('/dev', entry)
+            for entry in os.listdir(root):
+                path = os.path.join(root, entry)
                 try:
                     if not _regex.fullmatch(entry):
                         continue
@@ -115,6 +113,98 @@ class SbxManager:
                 allocated.add(dev)
         return allocated
 
+    def get_open_device_users(self) -> dict[str, set[int]]:
+        """返回通过 FD 打开受管设备的进程，格式为 {major:minor: {pid}}。
+
+        直接检查设备 FD，不依赖厂商命令行工具，可同时覆盖 GPU/NPU。
+        进程退出和 FD 关闭会与扫描并发，ENOENT 等瞬态错误按已消失处理。
+        """
+        managed = set(self._discover_device_nodes())
+        users = {device: set() for device in managed}
+        if not managed:
+            return users
+
+        try:
+            proc_entries = os.scandir('/proc')
+        except OSError as exc:
+            logger.error('无法扫描 /proc，按全部设备忙碌处理: %s', exc)
+            for pids in users.values():
+                pids.add(0)
+            return users
+
+        incomplete = False
+        with proc_entries:
+            for entry in proc_entries:
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                fd_dir = f'/proc/{entry.name}/fd'
+                try:
+                    fds = os.scandir(fd_dir)
+                except PermissionError:
+                    incomplete = True
+                    continue
+                except (FileNotFoundError, OSError):
+                    continue
+                with fds:
+                    for fd in fds:
+                        try:
+                            info = fd.stat(follow_symlinks=True)
+                        except PermissionError:
+                            incomplete = True
+                            continue
+                        except (FileNotFoundError, OSError):
+                            continue
+                        if not stat.S_ISCHR(info.st_mode):
+                            continue
+                        device = (
+                            f'{os.major(info.st_rdev)}:'
+                            f'{os.minor(info.st_rdev)}'
+                        )
+                        if device in users:
+                            users[device].add(pid)
+        if incomplete:
+            logger.error('部分 /proc FD 无权读取，按全部设备忙碌处理')
+            for pids in users.values():
+                pids.add(0)
+        return users
+
+    def _get_open_devices(self) -> set[str]:
+        return {
+            device for device, pids in self.get_open_device_users().items()
+            if pids
+        }
+
+    def _get_external_busy_devices(self) -> set[str]:
+        """返回沙盒外已占用的设备。
+
+        NVIDIA 的 Xorg/监控进程会长期打开所有 ``/dev/nvidiaN``，不能把
+        任意 GPU FD 都视为计算占用。配置 ``dev_info_script_path`` 时使用
+        GPU 状态脚本；其他节点继续使用通用 FD 扫描。脚本异常时失败关闭。
+        """
+        managed = set(self._discover_device_nodes())
+        path = os.getenv('dev_info_script_path', '').strip()
+        if not path:
+            return self._get_open_devices()
+        try:
+            output = subprocess.check_output(
+                [path], timeout=10, stderr=subprocess.DEVNULL,
+            )
+            data = json.loads(output.decode())
+            raw_busy = data['busy_ids']
+            if not isinstance(raw_busy, list):
+                raise ValueError('busy_ids 不是数组')
+            if int(data.get('total', -1)) < len(managed):
+                raise ValueError('设备状态脚本返回的物理设备数不足')
+            busy_minors = {int(value) for value in raw_busy}
+        except Exception as exc:
+            logger.error('设备状态脚本失败，按全部设备忙碌处理: %s', exc)
+            return managed
+        return {
+            device for device in managed
+            if int(device.split(':', 1)[1]) in busy_minors
+        }
+
     def _list_sandbox_names(self) -> List[str]:
         """返回所有沙盒名称列表（兼容旧 SandboxDB.list_all 接口）。"""
         return [s['name'] for s in self.db.list_sandboxes()]
@@ -123,8 +213,9 @@ class SbxManager:
         """返回未分配给 sandbox 的设备节点，按 minor 排序。"""
         all_devices = set(self._discover_device_nodes())
         allocated = self._get_allocated_devices()
+        external_busy = self._get_external_busy_devices()
         return sorted(
-            all_devices - allocated,
+            all_devices - allocated - external_busy,
             key=lambda x: int(x.split(':')[1]),
         )
 
@@ -139,27 +230,10 @@ class SbxManager:
             else:
                 logger.info("恢复: 沙盒 '%s' 仍存活", name)
 
-    # ── 设备空闲校验 ─────────────────────────────────────────────
-
-    def _validate_idle_count(self, needed: int) -> bool:
-        """通过 Node_Manager 校验设备空闲数量是否足够。"""
-        from executor.status import Node_Manager
-        nm = Node_Manager.get_instance()
-        status = nm.collect_status()
-        idle = status.get('idle_devices', 0)
-
-        if idle < needed:
-            logger.warning("设备不足: 需要 %s 个, 系统空闲 %s 个", needed, idle)
-            return False
-
-        logger.debug("设备校验通过: 需要 %s 个, 系统空闲 %s 个", needed, idle)
-        return True
-
     # ── 核心操作 ─────────────────────────────────────────────────
 
     def create_sandbox(self, name: str, cpu: int = 0, mem: str = "0",
-                       devices: Optional[List[str]] = None,
-                       port: int = None) -> bool:
+                       devices: Optional[List[str]] = None) -> bool:
         """创建沙盒。
 
         Args:
@@ -195,7 +269,7 @@ class SbxManager:
                 name=name, cpu=cpu, mem=mem,
                 devices=devices or [],
                 cgroup_path=self._cg_path(name),
-                pids=[], port=port)
+                pids=[])
             logger.warning("✓ 沙盒 '%s' 创建成功", name)
             return True
 
@@ -275,110 +349,90 @@ class SbxManager:
         names = [n for n in result.stdout.strip().split('\n') if n and n != '(无)']
         return names
 
-    # ── 终端专用 ─────────────────────────────────────────────────
+    # ── 沙盒分配 ─────────────────────────────────────────────────
 
-    def allocate_for_terminal(self, owner: str, terminal_id: str,
-                              cpu: int = 0, mem: str = "0",
-                              device_num: int = 0,
-                              device_ids: Optional[List[str]] = None,
-                              port: int = None) -> Optional[dict]:
-        with self._lock:
-            return self._allocate_sandbox(
-                owner=owner,
-                terminal_id=terminal_id,
-                cpu=cpu,
-                mem=mem,
-                device_num=device_num,
-                device_ids=device_ids,
-                port=port,
-            )
+    def allocate_sandbox(self, owner: str, sandbox_id: str,
+                         cpu: int = 0, mem: str = "0",
+                         device_num: int = 0,
+                         device_ids: Optional[List[str]] = None) -> Optional[dict]:
+        """为命令任务或手动 acquire 分配沙盒。
 
-    def _allocate_sandbox(self, owner: str, terminal_id: str,
-                          cpu: int = 0, mem: str = "0",
-                          device_num: int = 0,
-                          device_ids: Optional[List[str]] = None,
-                          port: int = None) -> Optional[dict]:
-        """为终端/手动 acquire 分配沙盒。
-
-        沙盒命名为 sbx_{owner}_{terminal_id}.slice。
+        沙盒命名为 sbx_{owner}_{sandbox_id}.slice。
 
         Args:
             owner:       沙盒所有者（系统用户名）
-            terminal_id: 终端唯一标识（ttyd 的 PID 或 acquire 的 pid）
+            sandbox_id:  沙盒唯一标识（命令任务 ID 或 acquire 的 PID）
             device_num:  要分配的设备数量 (0=不分配，device_ids 为空时自动选取)
             device_ids:  用户指定的设备号列表 (如 ["235:1","235:3"])，优先于 device_num
-            cpu/mem/port: 同 create_sandbox
+            cpu/mem: 同 create_sandbox
 
         Returns:
             成功返回 {'sandbox_name': str, 'devices': [str]}，失败返回 None。
         """
-        sandbox_name = f"sbx_{owner}_{terminal_id}.slice"
+        with self._lock:
+            sandbox_name = f"sbx_{owner}_{sandbox_id}.slice"
+            open_users_before = (
+                self.get_open_device_users()
+                if device_ids or device_num > 0
+                else {}
+            )
 
-        devices = []
-        if device_ids:
-            # 用户指定设备：校验是否全部空闲
-            free = self._get_free_devices()
-            for d in device_ids:
-                if d not in free:
-                    logger.warning("指定设备 %s 不可用 (已被占用或不存在)", d)
+            devices = []
+            if device_ids:
+                # 用户指定设备：校验是否全部空闲
+                free = self._get_free_devices()
+                for d in device_ids:
+                    if d not in free:
+                        logger.warning("指定设备 %s 不可用 (已被占用或不存在)", d)
+                        return None
+                devices = list(device_ids)
+                logger.warning("使用指定设备: %s", devices)
+            elif device_num > 0:
+                # 自动分配：从空闲池选取 device_num 个
+                free = self._get_free_devices()
+                if len(free) < device_num:
+                    logger.warning("设备不足: 需要 %s 个, DB 空闲 %s 个", device_num, len(free))
                     return None
-            devices = list(device_ids)
-            logger.warning("使用指定设备: %s", devices)
-        elif device_num > 0:
-            # 自动分配：从空闲池选取 device_num 个
-            if not self._validate_idle_count(device_num):
+
+                devices = free[:device_num]
+                logger.warning("自动分配设备: %s (从空闲池 %s 选取)", devices, free)
+
+            success = self.create_sandbox(
+                sandbox_name,
+                cpu=cpu,
+                mem=mem,
+                devices=devices if devices else None,
+            )
+            if not success:
                 return None
 
-            free = self._get_free_devices()
-            if len(free) < device_num:
-                logger.warning("设备不足: 需要 %s 个, DB 空闲 %s 个", device_num, len(free))
-                return None
+            # create 与后续 join 之间仍可能有外部进程抢先打开设备。比较
+            # 分配前后新增的 FD 使用者，避免 NVIDIA 的 Xorg 等长期句柄
+            # 被误判，同时仍能发现新进程抢卡。
+            if devices:
+                open_users_after = self.get_open_device_users()
+                raced = {
+                    device for device in devices
+                    if (
+                        open_users_after.get(device, set())
+                        - open_users_before.get(device, set())
+                    )
+                }
+                if raced:
+                    logger.warning('设备在分配期间被外部进程打开: %s', sorted(raced))
+                    self.destroy_sandbox(sandbox_name)
+                    return None
 
-            devices = free[:device_num]
-            logger.warning("自动分配设备: %s (从空闲池 %s 选取)", devices, free)
-
-        success = self.create_sandbox(
-            sandbox_name,
-            cpu=cpu,
-            mem=mem,
-            devices=devices if devices else None,
-            port=port,
-        )
-        if not success:
-            return None
-
-        return {'sandbox_name': sandbox_name, 'devices': devices}
+            return {'sandbox_name': sandbox_name, 'devices': devices}
 
     # ── 孤儿清理 ─────────────────────────────────────────────────
 
-    @staticmethod
-    def _get_active_ports() -> set:
-        """扫描系统所有 ESTABLISHED 状态的 TCP 端口，返回活跃端口集合。
-
-        一次扫描，供后续多个沙盒复用，避免重复调用 psutil.net_connections()。
-        """
-        active = set()
-        try:
-            for conn in psutil.net_connections(kind='tcp'):
-                if conn.laddr and conn.status == 'ESTABLISHED':
-                    active.add(conn.laddr.port)
-        except Exception:
-            pass
-        return active
-
     def cleanup_orphaned(self) -> int:
-        """清理所有进程已退出的沙盒，释放设备资源。
-        对于有端口的沙盒，增加终端超时未连接检查：若进程存活但端口无
-        ESTABLISHED 连接且超过 terminal_idle_timeout 秒，则强制杀进程并清理。
+        """清理进程已退出的沙盒，释放设备资源。
 
         Returns:
             清理的沙盒数量。
         """
-        from executor.port_pool import Port_Pool_Manager
-
-        logger.debug("正在扫描活跃端口...")
-        active_ports = self._get_active_ports()  # 一次扫描，所有 term_* 沙盒复用
-        logger.debug("扫描完成，活跃端口: %s", active_ports)
         cleaned = 0
         sandbox_names = self._list_sandbox_names()
         logger.debug("共 %s 个沙盒待检查", len(sandbox_names))
@@ -403,16 +457,10 @@ class SbxManager:
                         content = f.read().strip()
                     if not content:
                         logger.warning("清理空沙盒 '%s' (无进程)", name)
-                        port = record.get('port')
-                        if port:
-                            Port_Pool_Manager.get_Port_Pool_Manager().release_port(port)
                         self.destroy_sandbox(name)
                         cleaned += 1
                 except (OSError, IOError):
                     # cgroup 目录可能已不存在
-                    port = record.get('port')
-                    if port:
-                        Port_Pool_Manager.get_Port_Pool_Manager().release_port(port)
                     self.db.delete_sandbox(name)
                     cleaned += 1
                 continue
@@ -442,31 +490,8 @@ class SbxManager:
                     continue
 
                 logger.warning("清理孤儿沙盒 '%s' (所有 PID 已退出)", name)
-                port = record.get('port')
-                if port:
-                    Port_Pool_Manager.get_Port_Pool_Manager().release_port(port)
                 self.destroy_sandbox(name)
                 cleaned += 1
-            elif record.get('port'):
-                # 终端沙盒（有端口）：进程还活着但端口无 ESTABLISHED 连接 → 无人使用，直接清理
-                port = record.get('port')
-                if port and port not in active_ports:
-                    logger.warning("终端沙盒 '%s' 端口 %s 无活跃连接，清理", name, port)
-                    for pid in pids:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                        except OSError:
-                            pass
-                    # 等待进程优雅退出
-                    time.sleep(0.3)
-                    for pid in pids:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except OSError:
-                            pass
-                    Port_Pool_Manager.get_Port_Pool_Manager().release_port(port)
-                    self.destroy_sandbox(name)
-                    cleaned += 1
 
         # 补充：文件系统孤儿扫描（cgroup 目录存在但 DB 无记录）
         db_names = set(self._list_sandbox_names())

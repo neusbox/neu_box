@@ -5,7 +5,7 @@
   - @login_required 装饰器拦截未登录请求
 
 节点凭据:
-  - 每个用户可为不同节点保存 username/password
+  - 每个用户可为不同节点保存命令任务 username
   - 前端选中节点时自动填入已存凭据
 """
 
@@ -141,8 +141,7 @@ def change_password():
 def list_credentials():
     """获取当前用户所有已存节点凭据。
 
-    返回: { "credentials": [{"node_name":"...","username":"...","password":"..."}, ...] }
-    密码以明文返回（供前端自动填入），不设脱敏。
+    返回: { "credentials": [{"node_name":"...","username":"..."}, ...] }
     """
     user_id = session['user_id']
     creds = db.get_credentials(user_id)
@@ -154,12 +153,11 @@ def list_credentials():
 def save_credential():
     """保存或更新一条节点凭据。
 
-    请求体: { "node_name": "...", "username": "...", "password": "..." }
+    请求体: { "node_name": "...", "username": "..." }
     """
     data = request.get_json(silent=True) or {}
     node_name = (data.get('node_name') or '').strip()
     username = (data.get('username') or '').strip()
-    password = data.get('password') or ''
 
     errors = []
     if not node_name:
@@ -170,7 +168,7 @@ def save_credential():
         return {'error': '; '.join(errors)}, 400
 
     user_id = session['user_id']
-    db.save_credential(user_id, node_name, username, password)
+    db.save_credential(user_id, node_name, username)
     logger.info('用户 %s 保存节点凭据: %s → %s', user_id, node_name, username)
     return {'message': f'节点 "{node_name}" 凭据已保存'}, 200
 

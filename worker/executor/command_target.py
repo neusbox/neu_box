@@ -115,12 +115,3 @@ def public_execution_target(target: dict | None) -> dict:
     if result['type'] == TARGET_DOCKER_EXISTING:
         result['container'] = target.get('container', '')
     return result
-
-
-def public_runtime_metadata(metadata: dict | None) -> dict:
-    metadata = metadata or {}
-    return {
-        key: metadata[key]
-        for key in ('target_type', 'container_name', 'phase')
-        if metadata.get(key) not in (None, '')
-    }

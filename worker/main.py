@@ -66,7 +66,6 @@ _root_logger.addHandler(_console_handler)
 # 用 logger 而非 print，确保写入日志文件
 logging.getLogger('worker').info('Worker 启动，日志级别=%s，日志文件=%s', _raw_level, _log_file)
 
-from executor.terminal import terminal_bp
 from executor.status import status_bp
 from executor.command import command_bp
 from executor.sandbox_api import sandbox_bp
@@ -74,7 +73,6 @@ from executor.sbx_manager import SbxManager
 
 app = flask.Flask(__name__)
 
-app.register_blueprint(terminal_bp, url_prefix='/terminal')
 app.register_blueprint(command_bp, url_prefix='/command')
 app.register_blueprint(sandbox_bp, url_prefix='/sandbox')
 # /status 直接挂载到根路径，方便 master 查询

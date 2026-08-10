@@ -268,21 +268,20 @@
 
 /* ── Log viewer (command mode) ──────────────────────────────── */
 
+.panel-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  align-self: stretch;
+}
+
 .log-viewer {
   flex: 1;
   display: flex;
   flex-direction: column;
   background: var(--nb-bg);
   overflow: hidden;
-}
-
-.panel-right.mode-terminal .log-viewer { display: none; }
-.panel-right.mode-command .log-viewer { display: flex; }
-
-.panel-right.mode-command .terminal-header,
-.panel-right.mode-command .terminal-placeholder,
-.panel-right.mode-command .terminal-iframe {
-  display: none;
 }
 
 .log-placeholder {

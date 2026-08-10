@@ -249,7 +249,7 @@ class Nodes_Pool:
 
         Args:
             node_id:  目标节点 UUID
-            endpoint: Worker 上的路径，如 '/terminal/create', '/command/run'
+            endpoint: Worker 上的路径，如 '/command/run'
             req:      JSON 请求体
             timeout:  HTTP 超时秒数
 
@@ -300,9 +300,3 @@ class Nodes_Pool:
             return resp
         except requests.RequestException as e:
             raise ValueError(f'无法连接节点 {node_id}: {e}')
-
-    # ── 向指定节点转发终端创建请求（兼容旧接口）────────────────
-
-    def req_node(self, node_id: str, req: dict) -> dict:
-        """向 worker 发送终端创建请求"""
-        return self.forward_to_node(node_id, '/terminal/create', req)

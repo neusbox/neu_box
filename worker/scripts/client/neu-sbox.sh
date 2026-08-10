@@ -201,9 +201,8 @@ else:
         if cpu: res_parts.append(f'CPU={cpu}')
         if mem and mem != '0': res_parts.append(f'mem={mem}')
         res_str = ' '.join(res_parts) if res_parts else '资源不限'
-        port_str = f' 端口={s[\"port\"]}' if s.get('port') else ''
         print(f'  {name}')
-        print(f'    用户: {owner}  |  设备: {dev_str}  |  {res_str}{port_str}')
+        print(f'    用户: {owner}  |  设备: {dev_str}  |  {res_str}')
 " 2>/dev/null || curl -s "${WORKER_URL}/sandbox/list?username=${USER}"
         ;;
 

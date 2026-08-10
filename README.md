@@ -3,22 +3,20 @@
 ## 架构
 
 ```
-浏览器 ──→ Master (Flask) ──→ Worker (Flask) ──→ ttyd / bash
+浏览器 ──→ Master (Flask) ──→ Worker (Flask) ──→ Host / 已有 Docker 容器
               │                      │
               │ 节点发现/请求转发      │ cgroup v2 + eBPF 沙盒
-              │ 每60s轮询节点状态      │ 端口池管理
-              │                      │ 终端 / 命令队列 / 日志文件
+              │ 每60s轮询节点状态      │ 命令队列 / 日志文件
            .env + config.json      .env
 ```
 
-**WEB两种工作模式：**
-- **终端模式**：Master 转发请求到 Worker，Worker 启动 ttyd（终端 over HTTP），前端通过 iframe 嵌入。中栏显示当前节点活跃终端和沙盒列表
-- **命令模式**：Master 转发命令到 Worker，Worker 维护 FIFO 任务队列，逐任务在沙盒中执行。日志实时写入文件，前端全量拉取 + 进度条
+**WEB工作模式：**
+- **命令模式**：Master 转发命令到 Worker，Worker 维护 FIFO 任务队列，在沙盒中执行 Host 或已有 Docker 容器命令。日志实时写入文件，前端全量拉取 + 进度条
 
 **CLI工作模式：**
 - **当前终端**：把当前 shell 加入独占设备沙盒。
 - **Host 命令**：提交一次性 Host 命令并查询结果。
-- **已有容器命令（仅 NPU Worker）**：通过 `docker_existing` 在运行中的容器内执行命令，不改变容器生命周期。
+- **已有容器命令**：通过 `docker_existing` 在运行中的容器内执行命令，不改变容器生命周期。
 
 ## 运行
 
@@ -56,11 +54,11 @@ neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
 neu-sbox tasks                              # 查看任务队列
 neu-sbox result <task_id>                   # 查看任务结果和日志
 
-# ── 已有容器命令（仅 NPU Worker） ──
+# ── 已有容器命令 ──
 neu-sbox acquire --devices 1 --container training-01 \
   --workdir /workspace --command "python train.py"
 # 支持 --env、--workdir、--container-user
-# 目标容器需已挂载所申请的 /dev/davinciN
+# 目标容器需已挂载所申请的 /dev/davinciN 或 /dev/nvidiaN
 
 # ── 远程 Worker ──
 export NEU_BOX_URL=http://<worker_ip>:59075
@@ -98,9 +96,6 @@ neu-sbox acquire 1
 |---|---|---|
 | `port` | `59075` | Worker 监听端口 |
 | `listen` | `0.0.0.0` | Worker 监听地址 |
-| `HOST_IP` | (自动检测) | Worker 对外 IP，终端 URL 中返回 |
-| `port_pool_start` | `59081` | ttyd 端口池起始 |
-| `port_pool_end` | `59100` | ttyd 端口池结束 |
 | `cgroup_version` | `2` | cgroup 版本（1 或 2） |
 | `device_filter` | — | 设备名正则过滤，如 `davinci[0-9]+`（NPU）或 `nvidia[0-9]+`（GPU） |
 | `db_dir` | `./db` | SQLite 数据库目录 |
@@ -114,34 +109,10 @@ neu-sbox acquire 1
 
 ## 数据流
 
-### 终端模式
+### Web 命令模式
 
 ```
-POST /terminal/create {node_id, username, password, cpu, memory, device_num}
-  │
-  Master ──→ Worker /terminal/create
-               │
-               ├─ Port_Pool.acquire_port()         → 分配端口
-               ├─ Popen(ttyd -p <port> -q ...)      → 启动终端进程
-               ├─ SbxManager.allocate_for_terminal() → 创建 sandbox
-               ├─ SbxManager.join_sandbox()          → ttyd PID 加入 cgroup
-               └─ 返回 {terminal_url, sandbox_id}
-  │
-浏览器 iframe.src = terminal_url  →  ttyd WebSocket
-  │
-用户关闭标签页 → ttyd -q 自动退出
-  │
-Reaper(每30s) → cleanup_orphaned():
-  ├─ PID已死 → 销毁沙盒 + 归还端口
-  └─ PID存活但端口无ESTABLISHED连接 → SIGTERM → 销毁沙盒 + 归还端口 (仅对有端口的沙盒)
-```
-
-沙盒统一命名为 `sbx_{owner}_{id}.slice`，由 systemd 管理 cgroup 生命周期。前端不再区分终端/挂载/命令类型，统一在终端栏显示。
-
-### 命令模式
-
-```
-POST /command/run {node_id, user_id, command, cpu, memory, device_num}
+POST /command/run {node_id, user_id, command, cpu, memory, device_num, target}
   │
   Master ──→ Worker /command/run
                │
@@ -149,8 +120,9 @@ POST /command/run {node_id, user_id, command, cpu, memory, device_num}
   │
 TaskQueue 后台消费线程:
   ├─ 取队首任务
-  ├─ SbxManager.allocate_for_terminal(...)  → 分配设备并创建 sandbox
-  ├─ Popen('bash -i -c <cmd>', ...)    → 交互模式（自动source ~/.bashrc）
+  ├─ SbxManager.allocate_sandbox(...)  → 分配设备并创建 sandbox
+  ├─ host → Popen('bash -i -c <cmd>', ...) → 交互模式（自动source ~/.bashrc）
+  ├─ docker_existing → 暂停 Docker Exec → host PID 加入 cgroup → 继续执行
   ├─ 后台线程逐块 read() stdout        → 实时写入 {LOG_DIR}/{task_id}.log
   ├─ 进程结束                          → DB 更新状态/返回码
   └─ SbxManager.destroy_sandbox()      → cgroup.freeze → cgroup.kill → 销毁
@@ -193,11 +165,10 @@ destroy_sandbox(name)
 
 Master 内置统一的用户登录认证。首次启动自动创建管理员账号（默认 `admin`/`admin`，通过 `ADMIN_USER` / `ADMIN_PASS` 环境变量修改）。
 
-- 登录后可配置每个节点的凭据（节点名 → 用户名 + 密码），操作时自动填入，无需反复输入
-- 未登录无法调用任何写操作 API（终端创建、命令提交、实验管理、节点增删等）
+- 登录后可为每个节点保存命令任务用户名，选中节点时自动填入
+- 未登录无法调用任何写操作 API（命令提交、实验管理、节点增删等）
 - 节点状态查询等只读接口保持公开，前端无需登录即可看到节点列表
 - `neu-sbox` CLI 直连 Worker，完全不受 Master 认证影响
-- Worker 侧零改动
 
 ## 公网暴露安全注意事项
 
@@ -216,7 +187,7 @@ Master 内置统一的用户登录认证。首次启动自动创建管理员账�
 | 功能 | 说明 |
 |------|------|
 | 日志查看 | XHR 全量拉取 + 进度条，自动滚底，`\r` 进度条处理 |
-| 任务重跑 | completed/failed 任务右侧 `↻` 按钮，确认后以原参数重新提交 |
+| 任务重跑 | Host 任务右侧 `↻` 按钮，确认后以原参数重新提交 |
+| 执行目标 | 支持 Host 和已有 Docker 容器 |
 | 实验记录 | 保存时复制日志副本（>500KB 截断），展开时懒加载；`\r` 处理 |
-| 终端面板 | 终端模式中栏统一显示所有活跃沙盒（owner、ID、设备卡号、资源），不再区分类型 |
 | 节点管理 | 前端 UI 增删节点，60s 自动轮询 |

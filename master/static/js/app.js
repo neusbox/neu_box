@@ -32,17 +32,18 @@ const refreshBtn        = document.getElementById('refreshBtn');
 
 // Mode toggle
 const modeToggle        = document.getElementById('modeToggle');
-const terminalFields    = document.getElementById('terminalFields');
 const commandFields     = document.getElementById('commandFields');
-
-// Terminal fields
-const usernameInput     = document.getElementById('usernameInput');
-const passwordInput     = document.getElementById('passwordInput');
 
 // Command fields
 const cmdUserIdEl       = document.getElementById('cmdUserId');
 const cmdInputEl        = document.getElementById('cmdInput');
 const cmdEstTimeEl      = document.getElementById('cmdEstTime');
+const cmdTargetTypeEl   = document.getElementById('cmdTargetType');
+const dockerTargetFields = document.getElementById('dockerTargetFields');
+const cmdContainerEl    = document.getElementById('cmdContainer');
+const cmdWorkdirEl      = document.getElementById('cmdWorkdir');
+const cmdContainerUserEl = document.getElementById('cmdContainerUser');
+const cmdEnvEl          = document.getElementById('cmdEnv');
 
 // Queue
 const queueList         = document.getElementById('queueList');
@@ -61,13 +62,6 @@ let _currentTaskData = null;
 let _currentExpData = null;
 
 // Right panel
-const rightPanel        = document.getElementById('rightPanel');
-const terminalHeader    = document.getElementById('terminalHeader');
-const terminalPlaceholder = document.getElementById('terminalPlaceholder');
-const terminalIframe    = document.getElementById('terminalIframe');
-const terminalUrlEl     = document.getElementById('terminalUrl');
-const terminalClose     = document.getElementById('terminalClose');
-const logViewer         = document.getElementById('logViewer');
 const logPlaceholder    = document.getElementById('logPlaceholder');
 const logContent        = document.getElementById('logContent');
 
@@ -154,27 +148,10 @@ function switchMode(mode) {
     b.classList.toggle('active', b.dataset.mode === mode);
   });
 
-  if (mode === 'terminal') {
-    terminalFields.style.display = '';
-    commandFields.style.display = 'none';
-    queuePanel.style.display = '';
-    experimentPanel.style.display = 'none';
-    submitBtn.style.display = '';
-    submitBtn.textContent = '申请终端';
-    rightPanel.classList.add('mode-terminal');
-    rightPanel.classList.remove('mode-command');
-    // 终端模式中栏显示活跃终端 & 沙盒
-    document.querySelector('#queuePanel .section-label').textContent = '活跃终端 / 沙盒';
-    document.getElementById('queueSelectAll').style.display = 'none';
-    queueBatchBar.style.display = 'none';
-    if (queueUserFilter) queueUserFilter.parentElement.style.display = 'none';
-    fetchSandboxes();
-    autoFillCredentials();
-  } else if (mode === 'command') {
+  if (mode === 'command') {
     document.querySelector('#queuePanel .section-label').textContent = '任务队列';
     document.getElementById('queueSelectAll').style.display = '';
     if (queueUserFilter) queueUserFilter.parentElement.style.display = '';
-    terminalFields.style.display = 'none';
     commandFields.style.display = '';
     // fetchQueue 在 command.js 中，此时可能尚未加载，延迟调用
     if (typeof fetchQueue === 'function') fetchQueue();
@@ -182,8 +159,6 @@ function switchMode(mode) {
     experimentPanel.style.display = 'none';
     submitBtn.style.display = '';
     submitBtn.textContent = '提交命令';
-    rightPanel.classList.add('mode-command');
-    rightPanel.classList.remove('mode-terminal');
     // Reset log viewer to placeholder
     clearNotebookBars();
     logPlaceholder.style.display = '';
@@ -191,13 +166,10 @@ function switchMode(mode) {
     logContent.innerHTML = '';
     logActions.style.display = 'none';
   } else if (mode === 'experiment') {
-    terminalFields.style.display = 'none';
     commandFields.style.display = 'none';
     queuePanel.style.display = 'none';
     experimentPanel.style.display = '';
     submitBtn.style.display = 'none';
-    rightPanel.classList.add('mode-command');
-    rightPanel.classList.remove('mode-terminal');
     // Reset log viewer
     clearNotebookBars();
     logPlaceholder.style.display = '';
@@ -218,9 +190,6 @@ modeToggle.addEventListener('click', (e) => {
   if (!btn) return;
   switchMode(btn.dataset.mode);
 });
-
-// Init mode classes
-rightPanel.classList.add('mode-command');
 
 // ═══════════════════════════════════════════════════════════════
 // Node rendering
@@ -339,17 +308,13 @@ function selectNode(nodeId, nodes) {
   state.selectedNodeId = nodeId;
   state.device_ids = [];  // 切节点清空已选卡
   // 清除手动标记，允许新节点自动填入
-  delete usernameInput.dataset.manual;
-  delete passwordInput.dataset.manual;
   delete cmdUserIdEl.dataset.manual;
   renderNodeCards(nodes);
   updateSubmitBtn();
   // 渲染设备选择框
   const node = nodes.find(n => n.node_id === nodeId);
   renderDevicePicker(node ? node.dev_status : {});
-  // 根据当前模式刷新中栏
-  if (state.mode === 'terminal') fetchSandboxes();
-  else fetchQueue();
+  fetchQueue();
   // 自动填入凭据
   autoFillCredentials();
 }
@@ -389,10 +354,8 @@ async function fetchNodes() {
 
     renderNodeCards(nodes);
     updateSubmitBtn();
-    // 根据当前模式刷新中栏
     if (state.selectedNodeId) {
-      if (state.mode === 'terminal') fetchSandboxes();
-      else fetchQueue();
+      fetchQueue();
     }
 
   } catch (err) {
@@ -434,11 +397,9 @@ function updateSubmitBtn() {
     return;
   }
 
-  if (state.mode === 'terminal') {
-    submitBtn.disabled = !(usernameInput.value.trim() && passwordInput.value);
-  } else {
-    submitBtn.disabled = !(cmdUserIdEl.value.trim() && cmdInputEl.value.trim());
-  }
+  const targetReady = cmdTargetTypeEl.value !== 'docker_existing'
+    || !!cmdContainerEl.value.trim();
+  submitBtn.disabled = !(cmdUserIdEl.value.trim() && cmdInputEl.value.trim() && targetReady);
 
   // 批量按钮：仅命令模式且至少 2 行命令时可用
   const batchBtn = document.getElementById('batchBtn');
@@ -448,20 +409,23 @@ function updateSubmitBtn() {
     } else {
       batchBtn.style.display = '';
       const lines = cmdInputEl.value.trim().split('\n').map(s => s.trim()).filter(Boolean);
-      batchBtn.disabled = !(hasNode && online && lines.length >= 2);
+      batchBtn.disabled = !(hasNode && online && lines.length >= 2 && targetReady);
     }
   }
 }
 
 // Listen to input changes
-usernameInput.addEventListener('input', updateSubmitBtn);
-passwordInput.addEventListener('input', updateSubmitBtn);
 cmdUserIdEl.addEventListener('input', () => {
   state.cmdUserId = cmdUserIdEl.value.trim();
   localStorage.setItem('neu_box_cmd_user', state.cmdUserId);
   updateSubmitBtn();
 });
 cmdInputEl.addEventListener('input', updateSubmitBtn);
+cmdTargetTypeEl.addEventListener('change', () => {
+  dockerTargetFields.style.display = cmdTargetTypeEl.value === 'docker_existing' ? '' : 'none';
+  updateSubmitBtn();
+});
+cmdContainerEl.addEventListener('input', updateSubmitBtn);
 
 // ═══════════════════════════════════════════════════════════════
 // Stepper events
@@ -583,11 +547,7 @@ form.addEventListener('submit', async (e) => {
     return;
   }
 
-  if (state.mode === 'terminal') {
-    await submitTerminal();
-  } else {
-    await submitCommand();
-  }
+  await submitCommand();
 });
 // ═══════════════════════════════════════════════════════════════
 // Node management modal
@@ -760,13 +720,12 @@ const userStatus       = document.getElementById('userStatus');
 const accountModal     = document.getElementById('accountModal');
 const credNodeName     = document.getElementById('credNodeName');
 const credUsername     = document.getElementById('credUsername');
-const credPassword     = document.getElementById('credPassword');
 const credSaveBtn      = document.getElementById('credSaveBtn');
 const credNodeList     = document.getElementById('credNodeList');
 const credentialList   = document.getElementById('credentialList');
 
 let _currentUser = null;
-let _credentials = {};  // { nodeName: { username, password } }
+let _credentials = {};  // { nodeName: { username } }
 
 // ── 登录 ──────────────────────────────────────────────────────
 
@@ -976,7 +935,7 @@ async function fetchCredentials() {
     const data = await resp.json();
     _credentials = {};
     for (const c of (data.credentials || [])) {
-      _credentials[c.node_name] = { username: c.username, password: c.password || '' };
+      _credentials[c.node_name] = { username: c.username };
     }
     // 如果已选节点，自动填入
     autoFillCredentials();
@@ -1020,7 +979,6 @@ async function fetchNodesForCredentialDatalist() {
 credSaveBtn.addEventListener('click', async () => {
   const nodeName = credNodeName.value.trim();
   const username = credUsername.value.trim();
-  const password = credPassword.value;
   if (!nodeName) { showToast('请输入节点名称', 'error'); return; }
   if (!username) { showToast('请输入用户名', 'error'); return; }
 
@@ -1030,15 +988,14 @@ credSaveBtn.addEventListener('click', async () => {
     const resp = await fetch('/auth/credentials', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ node_name: nodeName, username, password }),
+      body: JSON.stringify({ node_name: nodeName, username }),
     });
     const data = await resp.json();
     if (resp.ok) {
-      _credentials[nodeName] = { username, password };
+      _credentials[nodeName] = { username };
       renderCredentialList();
       credNodeName.value = '';
       credUsername.value = '';
-      credPassword.value = '';
       showToast(data.message, 'success');
       autoFillCredentials();
     } else {
@@ -1089,14 +1046,6 @@ function autoFillCredentials() {
   const cred = _credentials[nodeName];
   if (!cred) return;
 
-  // 终端字段
-  if (cred.username && !usernameInput.dataset.manual) {
-    usernameInput.value = cred.username;
-  }
-  if (cred.password && !passwordInput.dataset.manual) {
-    passwordInput.value = cred.password;
-  }
-  // 命令字段
   if (cred.username && !cmdUserIdEl.dataset.manual) {
     cmdUserIdEl.value = cred.username;
     state.cmdUserId = cred.username;
@@ -1106,12 +1055,6 @@ function autoFillCredentials() {
 }
 
 // 用户手动修改时标记，避免覆盖
-usernameInput.addEventListener('input', () => {
-  usernameInput.dataset.manual = '1';
-});
-passwordInput.addEventListener('input', () => {
-  passwordInput.dataset.manual = '1';
-});
 cmdUserIdEl.addEventListener('input', () => {
   cmdUserIdEl.dataset.manual = '1';
 });

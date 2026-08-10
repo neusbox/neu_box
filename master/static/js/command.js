@@ -48,6 +48,7 @@ function renderQueue(data) {
     const isRunning = task.status === 'running';
     const posText = isRunning ? '▶' : (task.position || '?');
     const isDone = task.status === 'completed' || task.status === 'failed';
+    const canRerun = isDone && task.target?.type === 'host';
     const clickable = isDone || isRunning;
 
     // 缓存命令全文（避免 DOM 属性截断）
@@ -83,7 +84,7 @@ function renderQueue(data) {
         <span class="queue-status ${task.status}">${statusLabel(task.status)}</span>
         <button class="queue-mark-btn ${marked ? 'active' : ''}" title="${marked ? '取消标注' : '标注此任务'}"
                 data-task-id="${task.task_id}">${marked ? '★' : '☆'}</button>
-        ${isDone ? `<button class="queue-rerun-btn" title="重新执行此命令" data-task-id="${task.task_id}">↻</button>` : ''}
+        ${canRerun ? `<button class="queue-rerun-btn" title="重新执行此命令" data-task-id="${task.task_id}">↻</button>` : ''}
       </div>`;
   }).join('');
 
@@ -303,19 +304,39 @@ async function fetchQueue() {
   }
 }
 
-// Manual refresh — 根据模式调不同接口
+// Manual refresh
 queueRefreshBtn.addEventListener('click', () => {
   queueRefreshBtn.classList.add('spinning');
-  const fn = state.mode === 'terminal' ? fetchSandboxes : fetchQueue;
-  fn().finally(() => queueRefreshBtn.classList.remove('spinning'));
+  fetchQueue().finally(() => queueRefreshBtn.classList.remove('spinning'));
 });
 
 // Also refresh when switching nodes (handled in selectNode)
 
-// User filter — 本地筛选（仅命令模式）
+// User filter — 本地筛选
 queueUserFilter.addEventListener('input', () => {
-  if (state.mode === 'command' && _lastQueueData) renderQueue(_lastQueueData);
+  if (_lastQueueData) renderQueue(_lastQueueData);
 });
+
+function buildExecutionTarget() {
+  if (cmdTargetTypeEl.value !== 'docker_existing') return { type: 'host' };
+  const container = cmdContainerEl.value.trim();
+  if (!container) throw new Error('请输入已有 Docker 容器名称或 ID');
+  const env = {};
+  for (const rawLine of cmdEnvEl.value.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const split = line.indexOf('=');
+    if (split <= 0) throw new Error(`环境变量格式错误: ${line}`);
+    env[line.slice(0, split).trim()] = line.slice(split + 1);
+  }
+  return {
+    type: 'docker_existing',
+    container,
+    workdir: cmdWorkdirEl.value.trim(),
+    user: cmdContainerUserEl.value.trim(),
+    env,
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Log viewer — 全量加载 + 进度条
@@ -401,10 +422,6 @@ async function viewTaskLog(taskId) {
       } : null,
     };
 
-    if (task.permission_denied) {
-      logContent.innerHTML = '<div style="color:#ff5f57;font-size:16px;text-align:center;padding:40px">🔒 无权限<br><span style="font-size:13px;color:#8e8e93">密码不正确</span></div>';
-      return;
-    }
     if (task.error) {
       logContent.innerHTML = `<div style="color:#ff5f57">错误: ${escapeHtml(task.error)}</div>`;
       return;
@@ -511,11 +528,19 @@ async function submitCommand() {
   if (!userId)   { showToast('请输入用户标识', 'error'); return; }
   if (!command)  { showToast('请输入命令', 'error'); return; }
 
+  const estTime = parseInt(cmdEstTimeEl.value, 10) || 0;
+
+  let target;
+  try {
+    target = buildExecutionTarget();
+  } catch (err) {
+    showToast(err.message, 'error');
+    return;
+  }
+
   submitBtn.disabled = true;
   submitBtn.textContent = '提交中…';
   resultDiv.style.display = 'none';
-
-  const estTime = parseInt(cmdEstTimeEl.value, 10) || 0;
 
   const body = {
     node_id:    state.selectedNodeId,
@@ -527,6 +552,7 @@ async function submitCommand() {
     device_num: state.device_ids.length > 0 ? 0 : state.device_num,
     device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
     est_time:   estTime,
+    target,
   };
 
   try {
@@ -576,6 +602,14 @@ batchBtn.addEventListener('click', async () => {
     return;
   }
 
+  let target;
+  try {
+    target = buildExecutionTarget();
+  } catch (err) {
+    showToast(err.message, 'error');
+    return;
+  }
+
   if (!confirm(`将提交 ${lines.length} 个任务（资源统一为 CPU=${state.cpu}, 内存=${state.memory}${state.memUnit}, 设备=${state.device_num}）\n\n是否继续？`)) return;
 
   batchBtn.disabled = true;
@@ -594,6 +628,7 @@ batchBtn.addEventListener('click', async () => {
       device_num: state.device_ids.length > 0 ? 0 : state.device_num,
       device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
       est_time:   parseInt(cmdEstTimeEl.value, 10) || 0,
+      target,
     };
     try {
       const resp = await fetch('/command/run', {

@@ -32,13 +32,13 @@ def run():
     req = {
         'command': command,
         'user_id': user_id,
-        'password': data.get('password', ''),
         'cpu': data.get('cpu', 0),
         'memory': data.get('memory', 0),
         'mem_unit': data.get('mem_unit', 'GB'),
         'device_num': data.get('device_num', 0),
         'device_ids': data.get('device_ids'),
         'est_time': data.get('est_time', 0),
+        'target': data.get('target'),
     }
 
     try:

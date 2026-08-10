@@ -12,7 +12,6 @@ API:
 import logging
 import os
 import pwd
-import re
 import signal
 import subprocess
 import threading
@@ -23,17 +22,13 @@ from collections import OrderedDict
 from flask import Blueprint, request
 
 from executor.sbx_manager import SbxManager
-from executor.command_docker import (
-    ExistingDockerCommandExecutor,
-    recover_orphaned_docker_task,
-)
+from executor.command_docker import ExistingDockerCommandExecutor
 from executor.command_target import (
     TARGET_DOCKER_EXISTING,
     TARGET_HOST,
     TargetValidationError,
     normalize_execution_target,
     public_execution_target,
-    public_runtime_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -326,77 +321,42 @@ class TaskQueue:
         logger.info('后台消费线程已启动')
 
     def _recover_orphaned(self):
-        """回收上次运行中的 sandbox/Docker Exec，并恢复排队任务。"""
-        failures = []
-        for task in self._db.get_queue_tasks():
+        """启动恢复：将上次异常退出的任务复原。"""
+        all_active = self._db.get_queue_tasks()
+        for task in all_active:
             if task['status'] == 'running':
-                sandbox_name = self._sandbox_name(task)
-                recovery_task = dict(task)
-                recovery_task['sandbox_name'] = sandbox_name
-                errors = []
-                try:
-                    recover_orphaned_docker_task(recovery_task)
-                except Exception as exc:
-                    errors.append(f'Docker Exec: {exc}')
-                    logger.exception('恢复 Docker Exec %s 失败', task['task_id'])
-                try:
-                    if not SbxManager.get_instance().destroy_sandbox(
-                        sandbox_name
-                    ):
-                        errors.append('sandbox 清理失败')
-                except Exception as exc:
-                    errors.append(f'sandbox: {exc}')
-                    logger.exception('恢复 sandbox %s 失败', sandbox_name)
-                if errors:
-                    failures.append(
-                        f'{task["task_id"]}: {"；".join(errors)}'
-                    )
-                    continue
+                logger.warning('恢复: 标记孤儿任务 %s 为 failed', task['task_id'])
                 self._db.update_task_result(
-                    task['task_id'],
-                    'failed',
-                    -1,
-                    '',
-                    '',
-                    error='Worker 在执行过程中重启',
-                )
-                continue
-
-            sandbox_name = self._sandbox_name(task)
-            if not SbxManager.get_instance().destroy_sandbox(sandbox_name):
-                failures.append(
-                    f'{task["task_id"]}: queued sandbox 清理失败'
-                )
-                continue
-            self._pending[task['task_id']] = {
-                'task_id': task['task_id'],
-                'user_id': task['user_id'],
-                'command': task['command'],
-                'cpu': task.get('cpu', 0),
-                'mem': task.get('mem', '0'),
-                'device_num': task.get('device_num', 0),
-                'device_ids': task.get('device_ids') or [],
-                'target': task.get('target_spec') or {
-                    'type': TARGET_HOST,
-                },
-                'est_time': task.get('est_time', 0),
-                'devices': [],
-                'status': 'queued',
-                'position': 0,
-                'created_at': task.get('created_at', time.time()),
-                'started_at': None,
-                'finished_at': None,
-                'result': None,
-            }
-
+                    task['task_id'], 'failed', -1, '', '',
+                    error='Worker 可能在执行过程中重启')
+            elif task['status'] == 'queued':
+                # 重新加入内存队列（按原 position 排序）
+                logger.info('恢复: 重新入队 %s (原 position=%s)',
+                            task['task_id'], task.get('position'))
+                self._pending[task['task_id']] = {
+                    'task_id': task['task_id'],
+                    'user_id': task['user_id'],
+                    'command': task['command'],
+                    'cpu': task.get('cpu', 0),
+                    'mem': task.get('mem', '0'),
+                    'device_num': task.get('device_num', 0),
+                    'device_ids': task.get('device_ids') or [],
+                    'target': task.get('target_spec') or {
+                        'type': TARGET_HOST,
+                    },
+                    'est_time': task.get('est_time', 0),
+                    'devices': [],
+                    'status': 'queued',
+                    'position': 0,
+                    'created_at': task.get('created_at', time.time()),
+                    'started_at': None,
+                    'finished_at': None,
+                    'result': None,
+                }
+        # 重新排位
         if self._pending:
             self._reindex()
             logger.info('恢复完成: %s 个任务重新入队', len(self._pending))
-        if failures:
-            raise RuntimeError(
-                '运行中任务尚未安全回收，拒绝 Worker 上线: '
-                + ' | '.join(failures)
-            )
 
     def submit(
         self,
@@ -552,9 +512,6 @@ class TaskQueue:
             ),
             'devices': task.get('devices', []),
             'target': public_execution_target(target),
-            'runtime': public_runtime_metadata(
-                task.get('runtime_metadata')
-            ),
             'created_at': task.get('created_at'),
             'started_at': task.get('started_at'),
             'finished_at': task.get('finished_at'),
@@ -673,9 +630,9 @@ class TaskQueue:
                     task_id = next(iter(self._pending))
                     candidate = dict(self._pending[task_id])
 
-                allocated = sbx.allocate_for_terminal(
+                allocated = sbx.allocate_sandbox(
                     owner=candidate['user_id'],
-                    terminal_id=candidate['task_id'],
+                    sandbox_id=candidate['task_id'],
                     cpu=candidate.get('cpu', 0),
                     mem=candidate.get('mem', '0'),
                     device_num=candidate.get('device_num', 0),
@@ -814,12 +771,8 @@ def run_command():
             return {
                 'error': (
                     'docker_existing 必须通过 device_ids 或 '
-                    'device_num 申请至少一张 NPU'
+                    'device_num 申请至少一张设备'
                 ),
-            }, 400
-        if not re.fullmatch(sbx.device_filter or r'(?!x)x', 'davinci0'):
-            return {
-                'error': 'docker_existing 仅支持 Ascend NPU Worker',
             }, 400
 
     est_time = body.get('est_time', 0)

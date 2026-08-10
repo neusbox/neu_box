@@ -3,9 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>neu_box — 终端沙盒</title>
+<title>neu_box — 命令沙盒</title>
 <link rel="stylesheet" href="/static/css/style.css">
-<link rel="stylesheet" href="/static/css/terminal.css">
 <link rel="stylesheet" href="/static/css/command.css">
 <link rel="stylesheet" href="/static/css/experiment.css">
 <!-- <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script> -->
@@ -28,7 +27,6 @@
       <!-- 模式切换 -->
       <div class="mode-toggle" id="modeToggle">
         <button type="button" data-mode="command" class="active">任务</button>
-        <button type="button" data-mode="terminal">终端</button>
         <button type="button" data-mode="experiment">实验</button>
       </div>
     </div>
@@ -89,18 +87,6 @@
         <div class="device-picker" id="devicePicker"></div>
       </div>
 
-      <!-- ── 终端模式字段 ── -->
-      <div id="terminalFields" style="display:none">
-        <div class="field">
-          <label>用户名 <span class="unit">必填</span></label>
-          <input type="text" class="text-input" id="usernameInput" placeholder="输入系统用户名" autocomplete="off">
-        </div>
-        <div class="field">
-          <label>密码 <span class="unit">必填</span></label>
-          <input type="password" class="text-input" id="passwordInput" placeholder="输入终端登录密码" autocomplete="off">
-        </div>
-      </div>
-
       <!-- ── 命令模式字段 ── -->
       <div id="commandFields">
         <div class="field">
@@ -110,6 +96,31 @@
         <div class="field">
           <label>命令 <span class="unit">每行一条，自动 && 拼接</span></label>
           <textarea class="text-input cmd-textarea" id="cmdInput" placeholder="nvidia-smi&#10;echo hello" autocomplete="off" rows="4"></textarea>
+        </div>
+        <div class="field">
+          <label>执行目标</label>
+          <select class="text-input" id="cmdTargetType">
+            <option value="host">Host</option>
+            <option value="docker_existing">已有 Docker 容器</option>
+          </select>
+        </div>
+        <div id="dockerTargetFields" style="display:none">
+          <div class="field">
+            <label>容器 <span class="unit">名称或 ID，必填</span></label>
+            <input type="text" class="text-input" id="cmdContainer" placeholder="training-01" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>容器工作目录 <span class="unit">可选，绝对路径</span></label>
+            <input type="text" class="text-input" id="cmdWorkdir" placeholder="/workspace" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>容器用户 <span class="unit">可选</span></label>
+            <input type="text" class="text-input" id="cmdContainerUser" placeholder="root 或 1000:1000" autocomplete="off">
+          </div>
+          <div class="field">
+            <label>环境变量 <span class="unit">可选，每行 KEY=VALUE</span></label>
+            <textarea class="text-input cmd-textarea" id="cmdEnv" placeholder="MODEL=resnet50" rows="3"></textarea>
+          </div>
         </div>
         <div class="field">
           <label>预估耗时 <span class="unit">分钟，可选</span></label>
@@ -172,28 +183,9 @@
     </div>
   </div>
 
-  <!-- ═══ 右栏：终端 / 日志查看 ═══ -->
+  <!-- ═══ 右栏：日志查看 ═══ -->
   <div class="panel panel-right" id="rightPanel">
-    <!-- 终端头 -->
-    <div class="terminal-header" id="terminalHeader">
-      <span class="terminal-dot dot-red"></span>
-      <span class="terminal-dot dot-yellow"></span>
-      <span class="terminal-dot dot-green"></span>
-      <span class="terminal-url" id="terminalUrl"></span>
-      <button class="terminal-close" id="terminalClose" title="关闭终端">×</button>
-    </div>
-
-    <!-- 终端占位 -->
-    <div class="terminal-placeholder" id="terminalPlaceholder">
-      <div class="placeholder-icon">⌨</div>
-      <p>选择一个节点并申请终端沙盒以开始</p>
-    </div>
-
-    <!-- 终端 iframe -->
-    <iframe class="terminal-iframe" id="terminalIframe" src=""
-            sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
-
-    <!-- 日志查看器（任务模式） -->
+    <!-- 日志查看器 -->
     <div class="log-viewer" id="logViewer">
       <div class="log-placeholder" id="logPlaceholder">
         <div class="placeholder-icon">📋</div>
@@ -344,7 +336,7 @@
       <!-- 节点凭据 -->
       <div class="account-section">
         <div class="account-section-title">🔗 节点凭据</div>
-        <div style="font-size:11px;color:var(--sub);margin-bottom:8px">为每个节点配置用户名和密码，操作时自动填入。</div>
+        <div style="font-size:11px;color:var(--sub);margin-bottom:8px">为每个节点配置命令任务用户名，选择节点时自动填入。</div>
         <div id="credentialList" class="account-cred-list">
           <div style="color:var(--sub);font-size:13px;text-align:center;padding:12px">加载中…</div>
         </div>
@@ -352,7 +344,6 @@
           <input type="text" class="text-input" id="credNodeName" placeholder="节点名称" style="flex:1;min-width:100px" list="credNodeList">
           <datalist id="credNodeList"></datalist>
           <input type="text" class="text-input" id="credUsername" placeholder="用户名" style="flex:1;min-width:100px" autocomplete="off">
-          <input type="password" class="text-input" id="credPassword" placeholder="密码 (终端用)" style="flex:1;min-width:100px" autocomplete="off">
           <button class="modal-add-btn" id="credSaveBtn">保存</button>
         </div>
       </div>
@@ -393,7 +384,6 @@
 </div>
 
 <script src="/static/js/app.js"></script>
-<script src="/static/js/terminal.js"></script>
 <script src="/static/js/command.js"></script>
 <script src="/static/js/experiment.js"></script>
 <script src="/static/js/marked.min.js"></script>

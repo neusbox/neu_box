@@ -47,7 +47,6 @@ _root_logger.addHandler(_console_handler)
 logging.getLogger('master').info('Master 启动，日志级别=%s，日志文件=%s', _raw_level, _log_file)
 
 
-from entry_point.terminal import terminal_bp
 from entry_point.command import command_bp
 from entry_point.nodes import nodes_bp
 from entry_point.experiment import experiment_bp
@@ -70,7 +69,6 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 app.register_blueprint(auth_bp, url_prefix='/auth')
-app.register_blueprint(terminal_bp, url_prefix='/terminal')
 app.register_blueprint(command_bp, url_prefix='/command')
 app.register_blueprint(nodes_bp, url_prefix='/nodes')
 app.register_blueprint(experiment_bp, url_prefix='/experiments')

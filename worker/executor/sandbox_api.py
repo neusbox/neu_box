@@ -122,9 +122,9 @@ def acquire():
 
     # 创建沙盒并分配设备
     sbx = SbxManager.get_instance()
-    result = sbx.allocate_for_terminal(
+    result = sbx.allocate_sandbox(
         owner=username,
-        terminal_id=str(pid),
+        sandbox_id=str(pid),
         cpu=cpu,
         mem=sandbox_mem,
         device_num=device_num if not normalized_ids else 0,
@@ -237,7 +237,7 @@ def list_sandboxes():
 
     Query: ?username=pengyt  可选，过滤指定用户
 
-    响应: { sandboxes: [{ name, owner, cpu, mem, devices, port, created_at, pids }] }
+    响应: { sandboxes: [{ name, owner, cpu, mem, devices, created_at, pids }] }
     """
     username = (request.args.get('username') or '').strip()
     db = Database.get_instance()
@@ -259,7 +259,6 @@ def list_sandboxes():
             'cpu': s.get('cpu', 0),
             'mem': s.get('mem', '0'),
             'devices': s.get('devices', []),
-            'port': s.get('port'),
             'created_at': s.get('created_at'),
             'pids': s.get('pids', []),
         })

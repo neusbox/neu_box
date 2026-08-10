@@ -75,7 +75,6 @@ class Database:
                 user_id       TEXT    NOT NULL,
                 node_name     TEXT    NOT NULL,
                 username      TEXT    NOT NULL,
-                password      TEXT    NOT NULL DEFAULT '',
                 created_at    REAL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 UNIQUE(user_id, node_name)
@@ -438,7 +437,7 @@ class Database:
     # ═══════════════════════════════════════════════════════════
 
     def save_credential(self, user_id: str, node_name: str,
-                        username: str, password: str) -> bool:
+                        username: str) -> bool:
         """保存或更新用户对某节点的凭据。"""
         with self._conn() as conn:
             now = time.time()
@@ -447,14 +446,14 @@ class Database:
                 (user_id, node_name)).fetchone()
             if existing:
                 conn.execute(
-                    'UPDATE user_credentials SET username=?, password=?, created_at=? WHERE id=?',
-                    (username, password, now, existing['id']))
+                    'UPDATE user_credentials SET username=?, created_at=? WHERE id=?',
+                    (username, now, existing['id']))
             else:
                 cid = uuid.uuid4().hex[:12]
                 conn.execute(
-                    'INSERT INTO user_credentials (id, user_id, node_name, username, password, created_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?)',
-                    (cid, user_id, node_name, username, password, now))
+                    'INSERT INTO user_credentials (id, user_id, node_name, username, created_at) '
+                    'VALUES (?, ?, ?, ?, ?)',
+                    (cid, user_id, node_name, username, now))
             conn.commit()
             return True
 
@@ -462,7 +461,7 @@ class Database:
         """获取用户所有已存节点凭据。"""
         with self._conn() as conn:
             rows = conn.execute(
-                'SELECT node_name, username, password, created_at '
+                'SELECT node_name, username, created_at '
                 'FROM user_credentials WHERE user_id=? ORDER BY node_name',
                 (user_id,)).fetchall()
             return [dict(r) for r in rows]

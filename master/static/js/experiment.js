@@ -589,10 +589,6 @@ function showTaskPicker(pos, expData) {
         resultEl.innerHTML = `<span style="color:#ff5f57">HTTP ${r.status}</span>`;
         return;
       }
-      if (task.permission_denied) {
-        resultEl.innerHTML = '<span style="color:#ff5f57">密码错误，无权限查看该任务</span>';
-        return;
-      }
       if (task.error) {
         resultEl.innerHTML = `<span style="color:#ff5f57">${escapeHtml(task.error)}</span>`;
         return;
