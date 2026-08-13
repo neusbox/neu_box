@@ -1,11 +1,21 @@
 # Tests
 
-测试针对已部署的 neu_box Master 发起真实 HTTP 请求。所有测试均通过 `common.py` 共享模块调用 API。
+`tests/unit/` 是不接触生产服务的默认测试；`tests/test_*.py` 是针对已部署 Master/Worker 的真实 HTTP 与硬件集成测试。
 
-## 运行
+## 单元与发布流程测试
 
 ```bash
-# 全部测试（逐个文件手动跑）
+UV_CACHE_DIR=/tmp/neu-box-uv-cache uv run --frozen pytest -q
+```
+
+它覆盖数据库迁移、应用工厂、发布包校验，以及无特权目录中的安装、升级、失败恢复和数据库回滚。`pyproject.toml` 将 pytest 默认范围限制在 `tests/unit/`，避免开发时意外向生产节点提交任务。
+
+## 已部署环境集成测试
+
+这些脚本会访问真实节点、创建实验记录或提交任务，必须在维护窗口中明确执行：
+
+```bash
+# 逐个文件手动运行
 python3 tests/test_nodes.py
 python3 tests/test_queue.py
 python3 tests/test_command.py

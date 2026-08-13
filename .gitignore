@@ -1,10 +1,13 @@
-*.o
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+*.o
 *.db
 .venv/
+build/
+dist/
 .env
 worker/db/
 master/db/
@@ -14,3 +17,4 @@ master/static/uploads/*
 *.pytest_cache/
 nohup.out
 config.json
+tmp/
