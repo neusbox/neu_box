@@ -48,9 +48,14 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _run(command: list[str], *, env: dict[str, str] | None = None) -> None:
+def _run(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path = ROOT,
+) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True, env=env)
+    subprocess.run(command, cwd=cwd, check=True, env=env)
 
 
 def _copy_tree(source: Path, destination: Path) -> None:
@@ -75,6 +80,11 @@ def main() -> int:
     pyi_work = work_root / "pyinstaller-work"
     generated = work_root / "generated"
     generated.mkdir(parents=True, exist_ok=True)
+    go = shutil.which("go")
+    if not go:
+        raise SystemExit(
+            "missing Go toolchain: install Go to build the static neu-sbox client"
+        )
     bpf_object = generated / "device_block.o"
     _run([
         "clang", "-O2", "-g", "-target", "bpf", "-c",
@@ -90,6 +100,29 @@ def main() -> int:
         ),
         "-o", str(bpf_object),
     ])
+
+    go_client = generated / "neu-sbox"
+    go_environment = os.environ.copy()
+    go_environment.update({
+        "CGO_ENABLED": "0",
+        "GOOS": "linux",
+        "GOARCH": architecture,
+        "GOTOOLCHAIN": "local",
+        "GOCACHE": str(work_root / "go-cache"),
+        "GOMODCACHE": str(work_root / "go-mod-cache"),
+    })
+    _run([
+        go,
+        "build",
+        "-trimpath",
+        "-buildvcs=false",
+        "-tags=netgo,osusergo",
+        "-ldflags",
+        f"-s -w -X main.version={version}",
+        "-o",
+        str(go_client),
+        ".",
+    ], env=go_environment, cwd=ROOT / "client" / "neu-sbox")
     if not args.skip_pyinstaller:
         shutil.rmtree(pyi_dist, ignore_errors=True)
         shutil.rmtree(pyi_work, ignore_errors=True)
@@ -130,6 +163,12 @@ def main() -> int:
             ROOT / "src" / "neu_box" / "worker" / "resources",
             staging / "share" / "neu-box",
         )
+        client_destination = (
+            staging / "share" / "neu-box" / "client" / "neu-sbox"
+        )
+        client_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(go_client, client_destination)
+        os.chmod(client_destination, 0o755)
         bpf_source = staging / "share" / "neu-box" / "sandbox" / "v2" / "device_block.bpf.c"
         bpf_object = bpf_source.with_suffix("").with_suffix(".o")
         shutil.copy2(generated / "device_block.o", bpf_object)

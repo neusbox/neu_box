@@ -232,6 +232,58 @@ class SbxManager:
             logger.warning("✓ PID %s 已加入沙盒 '%s'", pid, name)
             return True
 
+    def move_pid_to_cgroup(self, pid: int, cgroup_path: str) -> bool:
+        """将 PID 迁移到一个已存在的 cgroup v2 路径并核验结果。"""
+        if not isinstance(pid, int) or pid <= 0:
+            logger.error('迁移 cgroup 失败: PID 必须为正整数 (%r)', pid)
+            return False
+
+        normalized = os.path.normpath(
+            '/' + str(cgroup_path or '').lstrip('/'),
+        )
+        cgroup_root = '/sys/fs/cgroup'
+        target_dir = os.path.abspath(os.path.join(
+            cgroup_root, normalized.lstrip('/'),
+        ))
+        try:
+            if os.path.commonpath((cgroup_root, target_dir)) != cgroup_root:
+                logger.error('拒绝无效 cgroup 路径: %s', cgroup_path)
+                return False
+        except ValueError:
+            logger.error('拒绝无效 cgroup 路径: %s', cgroup_path)
+            return False
+
+        procs_path = os.path.join(target_dir, 'cgroup.procs')
+        try:
+            with open(procs_path, 'w', encoding='utf-8') as stream:
+                stream.write(str(pid))
+
+            actual = ''
+            with open(f'/proc/{pid}/cgroup', encoding='utf-8') as stream:
+                for line in stream:
+                    hierarchy, _controllers, path = line.rstrip('\n').split(
+                        ':', 2,
+                    )
+                    if hierarchy == '0':
+                        actual = path.rstrip('/') or '/'
+                        break
+            expected = normalized.rstrip('/') or '/'
+            if actual != expected:
+                logger.error(
+                    'PID %s cgroup 迁移核验失败: expected=%s actual=%s',
+                    pid, expected, actual,
+                )
+                return False
+        except (OSError, ValueError) as exc:
+            logger.error(
+                '将 PID %s 迁移到 cgroup %s 失败: %s',
+                pid, normalized, exc,
+            )
+            return False
+
+        logger.warning('✓ PID %s 已迁移到 cgroup %s', pid, normalized)
+        return True
+
     def destroy_sandbox(self, name: str) -> bool:
         """销毁沙盒，清理 cgroup 和 eBPF 预留，释放设备。
 

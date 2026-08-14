@@ -11,6 +11,7 @@ import os
 import signal
 import threading
 import time
+from dataclasses import dataclass
 
 from neu_box.worker.executor.sbx_manager import SbxManager
 
@@ -96,6 +97,7 @@ def _same_container_namespaces(exec_pid: int, init_pid: int) -> bool:
             return False
     return True
 
+
 def _is_container_cgroup(pid: int, init_pid: int) -> bool:
     """PID 是否仍位于目标容器 cgroup（允许其任意后代 cgroup）。"""
     init_cgroup = _read_unified_cgroup(init_pid).rstrip('/')
@@ -104,6 +106,208 @@ def _is_container_cgroup(pid: int, init_pid: int) -> bool:
         pid_cgroup == init_cgroup
         or pid_cgroup.startswith(f'{init_cgroup}/')
     )
+
+
+def _process_start_time(pid: int) -> int:
+    """读取 /proc/<pid>/stat 的 starttime，用于防止 PID 复用。"""
+    try:
+        with open(f'/proc/{pid}/stat', encoding='utf-8') as stream:
+            raw = stream.read().strip()
+        # comm 字段允许包含空格和括号；最后一个 ')' 之后从字段 3 开始。
+        fields = raw.rsplit(')', 1)[1].split()
+        return int(fields[19])
+    except (FileNotFoundError, IndexError, ValueError, OSError) as exc:
+        raise DockerExecutorError(
+            f'无法读取 PID {pid} 的启动时间',
+            'docker_container_pid_invalid',
+        ) from exc
+
+
+def _namespace_pids(pid: int) -> tuple[int, ...]:
+    """返回 host / 中间层 / 当前 PID namespace 中的 PID 序列。"""
+    try:
+        with open(f'/proc/{pid}/status', encoding='utf-8') as stream:
+            for line in stream:
+                if line.startswith('NSpid:'):
+                    return tuple(int(value) for value in line.split()[1:])
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise DockerExecutorError(
+            f'无法读取 PID {pid} 的 namespace PID',
+            'docker_container_pid_invalid',
+        ) from exc
+    raise DockerExecutorError(
+        f'PID {pid} 的 status 中没有 NSpid',
+        'docker_container_pid_mapping_unavailable',
+    )
+
+
+@dataclass(frozen=True)
+class ContainerProcess:
+    """容器内 PID 映射到宿主机后的稳定身份。"""
+
+    container_ref: str
+    container_id: str
+    container_started_at: str
+    container_pid: int
+    host_pid: int
+    host_start_time: int
+    init_host_pid: int
+    init_start_time: int
+    container_cgroup: str
+
+
+def verify_container_process(process: ContainerProcess) -> None:
+    """重新核验映射结果，避免迁移前 PID 或容器 init 被替换。"""
+    if _process_start_time(process.host_pid) != process.host_start_time:
+        raise DockerExecutorError(
+            f'容器 PID {process.container_pid} 的宿主机进程已变化',
+            'docker_container_pid_changed',
+        )
+    if _process_start_time(process.init_host_pid) != process.init_start_time:
+        raise DockerExecutorError(
+            f'容器 {process.container_ref} 已重启或 init 进程已变化',
+            'docker_container_changed',
+        )
+    if not _same_container_namespaces(
+        process.host_pid, process.init_host_pid,
+    ):
+        raise DockerExecutorError(
+            f'PID {process.host_pid} 已不属于容器 '
+            f'{process.container_ref} 的 namespace',
+            'docker_container_pid_namespace_mismatch',
+        )
+    namespace_pids = _namespace_pids(process.host_pid)
+    if not namespace_pids or namespace_pids[-1] != process.container_pid:
+        raise DockerExecutorError(
+            f'容器 PID {process.container_pid} 的映射已变化',
+            'docker_container_pid_changed',
+        )
+
+
+def resolve_container_pid(
+    container_ref: str,
+    container_pid: int,
+) -> ContainerProcess:
+    """将容器 PID namespace 中的 PID 唯一映射为宿主机 PID。"""
+    container_ref = str(container_ref or '').strip()
+    if not container_ref:
+        raise DockerExecutorError(
+            'container 不能为空',
+            'docker_container_required',
+        )
+    if not isinstance(container_pid, int) or container_pid <= 0:
+        raise DockerExecutorError(
+            '容器 pid 必须为正整数',
+            'docker_container_pid_invalid',
+        )
+
+    client = _docker_client()
+    try:
+        docker = _load_docker()
+        try:
+            container = client.containers.get(container_ref)
+        except docker.errors.NotFound as exc:
+            raise DockerExecutorError(
+                f'目标容器不存在: {container_ref}',
+                'docker_container_not_found',
+            ) from exc
+        except Exception as exc:
+            raise DockerExecutorError(
+                f'读取目标容器失败: {exc}',
+                'docker_container_inspect_failed',
+            ) from exc
+
+        try:
+            container.reload()
+            state = container.attrs.get('State') or {}
+            if not state.get('Running') or state.get('Paused'):
+                raise DockerExecutorError(
+                    '目标容器必须处于 running 且未 paused',
+                    'docker_container_not_running',
+                )
+            init_pid = int(state.get('Pid') or 0)
+            if init_pid <= 0 or not os.path.exists(f'/proc/{init_pid}'):
+                raise DockerExecutorError(
+                    '无法取得目标容器 init host PID',
+                    'docker_container_pid_invalid',
+                )
+
+            started_at = str(state.get('StartedAt') or '')
+            container_id = str(container.id)
+            init_start_time = _process_start_time(init_pid)
+            pid_namespace = _namespace_inode(init_pid, 'pid')
+            container_cgroup = _read_unified_cgroup(init_pid).rstrip('/') or '/'
+
+            matches: list[int] = []
+            with os.scandir('/proc') as entries:
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    host_pid = int(entry.name)
+                    try:
+                        if _namespace_inode(host_pid, 'pid') != pid_namespace:
+                            continue
+                        namespace_pids = _namespace_pids(host_pid)
+                        if (
+                            not namespace_pids
+                            or namespace_pids[-1] != container_pid
+                        ):
+                            continue
+                        if not _same_container_namespaces(host_pid, init_pid):
+                            continue
+                        matches.append(host_pid)
+                    except DockerExecutorError:
+                        continue
+                    except (FileNotFoundError, ProcessLookupError, OSError):
+                        continue
+
+            if len(matches) != 1:
+                raise DockerExecutorError(
+                    f'容器 {container_ref} 中 PID {container_pid} '
+                    f'映射到 {len(matches)} 个宿主机进程',
+                    'docker_container_pid_mapping_failed',
+                )
+
+            process = ContainerProcess(
+                container_ref=container_ref,
+                container_id=container_id,
+                container_started_at=started_at,
+                container_pid=container_pid,
+                host_pid=matches[0],
+                host_start_time=_process_start_time(matches[0]),
+                init_host_pid=init_pid,
+                init_start_time=init_start_time,
+                container_cgroup=container_cgroup,
+            )
+
+            # 扫描 /proc 期间容器可能重启；返回前再次检查 Docker 身份。
+            container.reload()
+            current_state = container.attrs.get('State') or {}
+            if (
+                str(container.id) != container_id
+                or not current_state.get('Running')
+                or current_state.get('Paused')
+                or int(current_state.get('Pid') or 0) != init_pid
+                or str(current_state.get('StartedAt') or '') != started_at
+            ):
+                raise DockerExecutorError(
+                    f'容器 {container_ref} 在 PID 映射期间发生变化',
+                    'docker_container_changed',
+                )
+            verify_container_process(process)
+            return process
+        except DockerExecutorError:
+            raise
+        except Exception as exc:
+            raise DockerExecutorError(
+                f'映射容器 PID 失败: {exc}',
+                'docker_container_pid_mapping_failed',
+            ) from exc
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.exception('关闭 Docker client 失败')
 
 
 class _TaskLog:

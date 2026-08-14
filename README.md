@@ -23,11 +23,12 @@
 
 ## 打包、部署与运行
 
-项目发布为三个自包含 Linux 程序：
+项目发布为四个自包含 Linux 程序：
 
 - `neu-box-master`：Master 服务与 Master 数据库管理命令；
 - `neu-box-worker`：Worker 服务与 Worker 数据库管理命令；
-- `neu-box-install`：安装、升级、备份、迁移、健康检查和回滚入口。
+- `neu-box-install`：安装、升级、备份、迁移、健康检查和回滚入口；
+- `neu-sbox`：可挂载进容器的静态 Go 客户端。
 
 Master 和 Worker 发布程序包含 Python 解释器及 Python 依赖，目标机器不需要安装 Python、pip 或 uv。Worker 仍依赖宿主机的 cgroup v2、systemd、Bash、`bpftool`、`busctl` 和设备驱动；Docker 执行目标还需要 Docker daemon。
 
@@ -38,20 +39,25 @@ UV_CACHE_DIR=/tmp/neu-box-uv-cache \
 UV_CACHE_DIR=/tmp/neu-box-uv-cache \
   uv run --frozen pytest -q
 
+# 测试无运行时依赖的 Go 客户端
+(cd client/neu-sbox && go test ./...)
+
 # 构建当前机器架构的发布包
 UV_CACHE_DIR=/tmp/neu-box-uv-cache \
   uv run --frozen --all-extras --group build \
   python deploy/build_release.py
 ```
 
-构建机需要 clang 来预编译 eBPF 对象。PyInstaller 不支持直接跨架构构建，amd64 和 arm64 应分别在对应架构、且不新于目标机 glibc 的 Linux 环境中构建。
+构建机需要 clang 来预编译 eBPF 对象，并需要 Go 来构建
+`CGO_ENABLED=0` 的静态客户端。PyInstaller 不支持直接跨架构构建，amd64
+和 arm64 应分别在对应架构、且不新于目标机 glibc 的 Linux 环境中构建。
 
 ```bash
 # 校验并解压；版本和架构以实际产物为准
 cd dist
-sha256sum -c neu-box-0.1.0-linux-arm64.tar.gz.sha256
-tar -xzf neu-box-0.1.0-linux-arm64.tar.gz
-cd neu-box-0.1.0-linux-arm64
+sha256sum -c neu-box-0.1.1-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.1.1-linux-arm64.tar.gz
+cd neu-box-0.1.1-linux-arm64
 
 # 计算节点安装 Worker；默认安装后立即启动
 sudo ./neu-box-install install --role worker
@@ -78,7 +84,7 @@ sudo neu-box-install status
 sudo neu-box-install rollback
 ```
 
-安装器会校验发布包、备份 SQLite、在数据库副本上试跑迁移、切换版本、启动服务并检查 `/healthz`。当前 `neu-sbox` 客户端随 Worker 安装，仍需要 Bash、curl 和 Python 3。
+安装器会校验发布包、备份 SQLite、在数据库副本上试跑迁移、切换版本、启动服务并检查 `/healthz`。`neu-sbox` 随 Worker 安装，是不依赖 Bash、curl、Python 或目标容器 glibc 的静态二进制。
 
 | 路径 | 内容 |
 |---|---|
@@ -114,7 +120,7 @@ sudo neu-box-install rollback
 
 ## CLI用法
 
-管理当前 shell 的独占沙盒，或提交 Host、已有容器命令。Worker 通过 `/proc/<pid>/status` 校验 PID 归属，无需密码。
+管理当前 shell 的独占沙盒，或提交 Host、已有容器命令。Host 终端通过 `/proc/<pid>/status` 校验 PID 归属；容器终端通过 Docker 身份、PID namespace 和 `NSpid` 映射到宿主机进程。
 
 ```bash
 # neu-box-install 安装 Worker 时创建 /usr/local/bin/neu-sbox
@@ -128,7 +134,7 @@ neu-sbox status                 # 查看当前 shell 是否在沙盒中
 neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
 neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
 neu-sbox release <name>         # 释放指定沙盒
-# 已在沙盒中再次 acquire 会先销毁旧沙盒，再创建新沙盒
+# Host 终端重复 acquire 会覆盖旧沙盒；容器终端需先 release
 
 # ── 命令任务（一次性执行，类似前端命令模式） ──
 neu-sbox acquire 1 2 4 "npu-smi info"     # 1 NPU + 2 核 + 4G 执行 Host 命令
@@ -141,6 +147,25 @@ neu-sbox acquire --devices 1 --container training-01 \
   --workdir /workspace --command "python train.py"
 # 支持 --env、--workdir、--container-user
 # 目标容器需已挂载所申请的 /dev/davinciN 或 /dev/nvidiaN
+
+# ── 已有容器中的交互终端 ──
+# 在 Host 创建容器；保留原有镜像和设备挂载参数
+docker run --name training-01 \
+  --add-host host.docker.internal:host-gateway \
+  -e NEU_BOX_URL=http://host.docker.internal:59075 \
+  -e NEU_BOX_CONTAINER=training-01 \
+  -e NEU_BOX_USER="$(id -un)" \
+  -v "$(readlink -f /usr/local/bin/neu-sbox):/usr/local/bin/neu-sbox:ro" \
+  YOUR_IMAGE bash
+
+# 在容器交互 shell 中
+neu-sbox acquire --device-num 1
+neu-sbox status
+neu-sbox release <name>
+
+# 未设置 NEU_BOX_CONTAINER 时，也可在 acquire 时显式指定；客户端会为
+# 随后的 release 在 /tmp 记录该 sandbox 对应的容器名
+neu-sbox acquire --container training-01 --device-num 1
 
 # ── 远程 Worker ──
 export NEU_BOX_URL=http://<worker_ip>:59075
@@ -237,9 +262,11 @@ GET /command/result/<id>/log?raw=1  → 纯文本日志 + Content-Length 头
 ### 终端沙盒模式 (`neu-sbox`)
 
 ```
-POST /sandbox/acquire {username, pid, device_num, cpu, memory}
-  → /proc/<pid>/cgroup 检测是否已在沙盒中 → 是: 先销毁旧 sandbox
-  → /proc/<pid>/status 校验归属 → 创建 sbx_{user}_{pid}.slice + 设备分配 → PID 加入
+POST /sandbox/acquire {username, pid, device_num, cpu, memory [, container]}
+  ├─ Host → /proc/<pid>/status 校验归属 → host PID 加入 sandbox
+  └─ container=<name> → Docker + NSpid 映射 host PID
+       → 校验 namespace、原 Docker cgroup 和设备节点
+       → SIGSTOP shell → host PID 加入 sandbox → 核验 → SIGCONT
 POST /sandbox/join {username, pid, sandbox_name}
   → /proc/<pid>/status 校验 PID 归属 → sandbox 名称校验 owner → 加入目标 cgroup
 POST /command/run {user_id, command, device_ids/device_num, target}
@@ -247,11 +274,15 @@ POST /command/run {user_id, command, device_ids/device_num, target}
   → target=host → 在 Host 执行命令
   → target=docker_existing → 暂停 Docker Exec → host PID 移入 sandbox → 继续执行
   → 保存日志、状态和退出码 → 销毁 sandbox
-POST /sandbox/release {sandbox_name}
-  → destroy_sandbox() → cgroup.freeze → cgroup.kill → 设备归还
+POST /sandbox/release {sandbox_name [, container, pid, client_pid]}
+  ├─ Host → 直接 destroy_sandbox()
+  └─ container → shell 和 HTTP 客户端迁回原 Docker cgroup
+       → destroy_sandbox() 清理其余子进程 → 设备归还
 GET  /sandbox/list
   → 返回活跃 sandbox 及其设备和进程
 ```
+
+容器不需要 `--pid=host` 或共享 Host PID namespace。被迁移的 shell 仍保留原来的 mount、network、PID 等 namespace；之后正常 fork/exec 的子进程会继承 sandbox cgroup。容器创建时必须已经挂载可能申请的设备节点，Neu Box 只改变 cgroup 设备权限，不会向运行中的容器热添加 `/dev` 节点。容器内客户端自身不需要 Bash、curl、Python 或动态链接库。
 
 ### 沙盒销毁流程
 

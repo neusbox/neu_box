@@ -37,14 +37,18 @@ Worker 额外要求：
 - 正确的 NPU/GPU 驱动和 `/dev` 设备节点；
 - 使用 Docker 目标时安装并运行 Docker daemon。
 
-发布包已携带 Python 解释器、Python 包和预编译 eBPF 对象。Worker 运行不需要目标机安装 Python、pip、uv 或 clang。当前 `neu-sbox` Bash 客户端仍使用 curl 和 Python 3 处理 HTTP/JSON。
+发布包已携带 Python 解释器、Python 包、预编译 eBPF 对象和静态
+`neu-sbox` Go 客户端。Worker 运行不需要目标机安装 Python、pip、uv、clang
+或 Go；挂载进容器的客户端也不依赖 Bash、curl、Python 或动态链接库。
 
 ## 构建发布包
 
 项目版本只在 `src/neu_box/__init__.py` 中维护。发布过的版本号不能复用；安装器会拒绝内容不同但版本号相同的包。
+构建机需要 Python/uv、clang 和 Go；这些工具都不是目标节点的运行依赖。
 
 ```bash
 uv sync --all-extras --all-groups --frozen
+(cd client/neu-sbox && go test ./...)
 UV_CACHE_DIR=/tmp/neu-box-uv-cache \
   uv run --frozen --all-extras --group build \
   python deploy/build_release.py
@@ -55,6 +59,7 @@ UV_CACHE_DIR=/tmp/neu-box-uv-cache \
 - 用锁文件中的依赖分别生成 Master/Worker PyInstaller `onedir`；
 - 生成单文件安装器；
 - 用 clang 编译当前源码对应的 `device_block.o`，同时放入 Worker 程序和共享资源；
+- 以 `CGO_ENABLED=0` 构建当前发布架构的静态 `neu-sbox`；
 - 写入 `manifest.json`、完整的 `SHA256SUMS`、tar.gz 及 tar 包 checksum。
 
 PyInstaller 产物不能直接跨 CPU 架构构建。amd64、arm64 应分别在对应架构构建；为提高兼容性，应使用不新于最老目标机的 Linux/glibc 构建环境。
@@ -62,9 +67,9 @@ PyInstaller 产物不能直接跨 CPU 架构构建。amd64、arm64 应分别在�
 验证并解包：
 
 ```bash
-sha256sum -c neu-box-0.1.0-linux-amd64.tar.gz.sha256
-tar -xzf neu-box-0.1.0-linux-amd64.tar.gz
-cd neu-box-0.1.0-linux-amd64
+sha256sum -c neu-box-0.1.1-linux-amd64.tar.gz.sha256
+tar -xzf neu-box-0.1.1-linux-amd64.tar.gz
+cd neu-box-0.1.1-linux-amd64
 ```
 
 ## 首次安装
