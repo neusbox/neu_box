@@ -2,7 +2,7 @@
 # eBPF CGROUP_DEVICE 沙盒 — 设备独占 + CPU 限制 + 内存限制
 # cgroup v2 only
 #
-# 运行依赖: bpftool。发布包包含预编译 device_block.o；仅 compile 命令需要 clang。
+# 运行依赖: bpftool。发布包包含构建阶段预编译的 device_block.o。
 #
 # ===== 用法 =====
 #
@@ -19,7 +19,6 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BPF_SRC="${SCRIPT_DIR}/device_block.bpf.c"
 BPF_OBJ="${SCRIPT_DIR}/device_block.o"
 BPF_PIN="/sys/fs/bpf/device_block"
 MAP_DIR="/sys/fs/bpf/sandbox_maps"
@@ -309,13 +308,8 @@ _ensure_bpf_ready() {
 # 命令
 # ==================================================================
 
-cmd_compile() {
-    clang -O2 -g -target bpf -c "$BPF_SRC" -o "$BPF_OBJ"
-    echo "✓ 编译完成: $BPF_OBJ"
-}
-
 cmd_load() {
-    [ -f "$BPF_OBJ" ] || die "先执行 compile"
+    [ -f "$BPF_OBJ" ] || die "发布包缺少预编译 BPF 对象: $BPF_OBJ"
     rm -rf "$BPF_PIN" "$MAP_DIR" 2>/dev/null || true
     mkdir -p "$MAP_DIR"
     bpftool prog load "$BPF_OBJ" "$BPF_PIN" pinmaps "$MAP_DIR"
@@ -563,7 +557,6 @@ cmd_cleanup() {
 # ==================================================================
 
 case "${1:-}" in
-    compile) cmd_compile ;;
     load)    cmd_load ;;
     create)  shift; cmd_create "$@" ;;
     join)    cmd_join    "${2:-}" "${3:-}" ;;

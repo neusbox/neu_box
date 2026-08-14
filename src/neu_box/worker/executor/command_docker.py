@@ -35,7 +35,7 @@ def _load_docker():
         import docker
     except ImportError as exc:
         raise DockerExecutorError(
-            'Worker 未包含 Docker SDK；开发环境请执行 uv sync --extra worker',
+            'Worker 发布包缺少 Docker SDK，请重新构建并部署完整发布包',
             'docker_sdk_unavailable',
         ) from exc
     return docker
