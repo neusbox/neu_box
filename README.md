@@ -190,12 +190,25 @@ neu-sbox acquire 1
 | `NEU_BOX_LOG_DIR` | `/var/log/neu-box` | 服务日志目录 |
 | `NEU_BOX_BACKUP_DIR` | `/var/backups/neu-box` | 数据库备份目录 |
 | `NEU_BOX_SANDBOX_SCRIPT` | `/opt/neu-box/current/share/neu-box/sandbox/v2/sandbox.sh` | 沙盒管理脚本 |
-| `NEU_BOX_DEVICE_INFO_SCRIPT` | — | 可选设备状态脚本，GPU 节点使用 |
+| `NEU_BOX_DEVICE_INFO_SCRIPT` | NPU 脚本路径 | 设备状态脚本；根据设备厂商显式配置 |
 | `NEU_BOX_SANDBOX_REAPER_INTERVAL` | `30` | 收尸线程扫描间隔（秒） |
 | `NEU_BOX_COMMAND_TIMEOUT` | `0` | 命令执行超时（秒），0 = 不限制 |
 | `NEU_BOX_COMMAND_MAX_COMPLETED` | `200` | 已完成任务保留上限 |
 | `NEU_BOX_COMMAND_QUEUE_RECENT` | `200` | 状态接口返回的近期任务上限 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+安装 Worker 后、启动服务前，编辑 `/etc/neu-box/worker.env`。Worker 不自动
+判断设备厂商，按节点类型选择下面一组配套配置：
+
+```dotenv
+# Ascend NPU
+NEU_BOX_DEVICE_FILTER=davinci[0-9]+
+NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/npu_info.sh
+
+# NVIDIA GPU
+NEU_BOX_DEVICE_FILTER=nvidia[0-9]+
+NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/gpu_info.sh
+```
 
 ## 数据流
 

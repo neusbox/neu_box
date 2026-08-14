@@ -5,7 +5,7 @@
   - 从配置读取 NEU_BOX_DEVICE_FILTER 正则匹配 /dev 下的设备名
   - 自动发现匹配的设备节点（如 nvidia0→195:0, nvidia1→195:1, ...）
   - 通过 DB 追踪每个沙盒已占用的设备
-  - 扫描 /proc/*/fd，排除已被沙盒外进程打开的设备
+  - 调用配置的 NPU/GPU 信息脚本，排除被沙盒外进程占用的设备
   - 命令任务或 CLI acquire 按 device_num 从空闲池中分配
 """
 
@@ -114,95 +114,24 @@ class SbxManager:
                 allocated.add(dev)
         return allocated
 
-    def get_open_device_users(self) -> dict[str, set[int]]:
-        """返回通过 FD 打开受管设备的进程，格式为 {major:minor: {pid}}。
-
-        直接检查设备 FD，不依赖厂商命令行工具，可同时覆盖 GPU/NPU。
-        进程退出和 FD 关闭会与扫描并发，ENOENT 等瞬态错误按已消失处理。
-        """
-        managed = set(self._discover_device_nodes())
-        users = {device: set() for device in managed}
-        if not managed:
-            return users
-
-        try:
-            proc_entries = os.scandir('/proc')
-        except OSError as exc:
-            logger.error('无法扫描 /proc，按全部设备忙碌处理: %s', exc)
-            for pids in users.values():
-                pids.add(0)
-            return users
-
-        incomplete = False
-        with proc_entries:
-            for entry in proc_entries:
-                if not entry.name.isdigit():
-                    continue
-                pid = int(entry.name)
-                fd_dir = f'/proc/{entry.name}/fd'
-                try:
-                    fds = os.scandir(fd_dir)
-                except PermissionError:
-                    incomplete = True
-                    continue
-                except (FileNotFoundError, OSError):
-                    continue
-                with fds:
-                    for fd in fds:
-                        try:
-                            info = fd.stat(follow_symlinks=True)
-                        except PermissionError:
-                            incomplete = True
-                            continue
-                        except (FileNotFoundError, OSError):
-                            continue
-                        if not stat.S_ISCHR(info.st_mode):
-                            continue
-                        device = (
-                            f'{os.major(info.st_rdev)}:'
-                            f'{os.minor(info.st_rdev)}'
-                        )
-                        if device in users:
-                            users[device].add(pid)
-        if incomplete:
-            logger.error('部分 /proc FD 无权读取，按全部设备忙碌处理')
-            for pids in users.values():
-                pids.add(0)
-        return users
-
-    def _get_open_devices(self) -> set[str]:
-        return {
-            device for device, pids in self.get_open_device_users().items()
-            if pids
-        }
-
     def _get_external_busy_devices(self) -> set[str]:
-        """返回沙盒外已占用的设备。
-
-        NVIDIA 的 Xorg/监控进程会长期打开所有 ``/dev/nvidiaN``，不能把
-        任意 GPU FD 都视为计算占用。配置 ``dev_info_script_path`` 时使用
-        GPU 状态脚本；其他节点继续使用通用 FD 扫描。脚本异常时失败关闭。
-        """
+        """调用配置的设备信息脚本，返回沙盒外已占用的设备。"""
         managed = set(self._discover_device_nodes())
         path = env_text(
             "NEU_BOX_DEVICE_INFO_SCRIPT", legacy="dev_info_script_path"
         )
         if not path:
-            return self._get_open_devices()
+            logger.error('未配置 NEU_BOX_DEVICE_INFO_SCRIPT')
+            return set()
         try:
             output = subprocess.check_output(
                 [path], timeout=10, stderr=subprocess.DEVNULL,
             )
             data = json.loads(output.decode())
-            raw_busy = data['busy_ids']
-            if not isinstance(raw_busy, list):
-                raise ValueError('busy_ids 不是数组')
-            if int(data.get('total', -1)) < len(managed):
-                raise ValueError('设备状态脚本返回的物理设备数不足')
-            busy_minors = {int(value) for value in raw_busy}
+            busy_minors = {int(value) for value in data.get('busy_ids', [])}
         except Exception as exc:
-            logger.error('设备状态脚本失败，按全部设备忙碌处理: %s', exc)
-            return managed
+            logger.error('设备状态脚本失败，忽略外部占用: %s', exc)
+            return set()
         return {
             device for device in managed
             if int(device.split(':', 1)[1]) in busy_minors
@@ -374,11 +303,6 @@ class SbxManager:
         """
         with self._lock:
             sandbox_name = f"sbx_{owner}_{sandbox_id}.slice"
-            open_users_before = (
-                self.get_open_device_users()
-                if device_ids or device_num > 0
-                else {}
-            )
 
             devices = []
             if device_ids:
@@ -408,23 +332,6 @@ class SbxManager:
             )
             if not success:
                 return None
-
-            # create 与后续 join 之间仍可能有外部进程抢先打开设备。比较
-            # 分配前后新增的 FD 使用者，避免 NVIDIA 的 Xorg 等长期句柄
-            # 被误判，同时仍能发现新进程抢卡。
-            if devices:
-                open_users_after = self.get_open_device_users()
-                raced = {
-                    device for device in devices
-                    if (
-                        open_users_after.get(device, set())
-                        - open_users_before.get(device, set())
-                    )
-                }
-                if raced:
-                    logger.warning('设备在分配期间被外部进程打开: %s', sorted(raced))
-                    self.destroy_sandbox(sandbox_name)
-                    return None
 
             return {'sandbox_name': sandbox_name, 'devices': devices}
 
