@@ -21,7 +21,7 @@
 - **Host 命令**：提交一次性 Host 命令并查询结果。
 - **已有容器命令**：通过 `docker_existing` 在运行中的容器内执行命令，不改变容器生命周期。
 
-## 打包、部署与运行
+## 部署与运行
 
 项目发布为四个自包含 Linux 程序：
 
@@ -32,32 +32,14 @@
 
 Master 和 Worker 发布程序包含 Python 解释器及 Python 依赖，目标机器不需要安装 Python、pip 或 uv。Worker 仍依赖宿主机的 cgroup v2、systemd、Bash、`bpftool`、`busctl` 和设备驱动；Docker 执行目标还需要 Docker daemon。
 
-```bash
-# 安装依赖并测试
-UV_CACHE_DIR=/tmp/neu-box-uv-cache \
-  uv sync --frozen --all-extras --all-groups
-UV_CACHE_DIR=/tmp/neu-box-uv-cache \
-  uv run --frozen pytest -q
-
-# 测试无运行时依赖的 Go 客户端
-(cd client/neu-sbox && go test ./...)
-
-# 构建当前机器架构的发布包
-UV_CACHE_DIR=/tmp/neu-box-uv-cache \
-  uv run --frozen --all-extras --group build \
-  python deploy/build_release.py
-```
-
-构建机需要 clang 来预编译 eBPF 对象，并需要 Go 来构建
-`CGO_ENABLED=0` 的静态客户端。PyInstaller 不支持直接跨架构构建，amd64
-和 arm64 应分别在对应架构、且不新于目标机 glibc 的 Linux 环境中构建。
+构建依赖、测试命令、打包流程和跨架构限制见 [构建发布包](docs/deployment.md#构建发布包)。
 
 ```bash
 # 校验并解压；版本和架构以实际产物为准
 cd dist
-sha256sum -c neu-box-0.1.1-linux-arm64.tar.gz.sha256
-tar -xzf neu-box-0.1.1-linux-arm64.tar.gz
-cd neu-box-0.1.1-linux-arm64
+sha256sum -c neu-box-0.1.2-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.1.2-linux-arm64.tar.gz
+cd neu-box-0.1.2-linux-arm64
 
 # 计算节点安装 Worker；默认安装后立即启动
 sudo ./neu-box-install install --role worker
@@ -86,18 +68,7 @@ sudo neu-box-install rollback
 
 安装器会校验发布包、备份 SQLite、在数据库副本上试跑迁移、切换版本、启动服务并检查 `/healthz`。`neu-sbox` 随 Worker 安装，是不依赖 Bash、curl、Python 或目标容器 glibc 的静态二进制。
 
-| 路径 | 内容 |
-|---|---|
-| `/opt/neu-box/releases/<version>/` | 不可变的版本化程序 |
-| `/opt/neu-box/current` | 当前版本原子符号链接 |
-| `/etc/neu-box/` | Master/Worker 配置与节点列表 |
-| `/var/lib/neu-box/` | SQLite、任务日志、上传文件和实验日志 |
-| `/var/log/neu-box/` | Master/Worker 运行日志 |
-| `/var/backups/neu-box/` | 升级和回滚备份 |
-| `/usr/local/sbin/neu-box-install` | 当前版本安装器 |
-| `/usr/local/bin/neu-sbox` | 指向当前 Worker 版本客户端的链接 |
-
-完整的首次安装、旧部署导入、NPU/GPU 配置、升级和回滚流程见 [部署与升级手册](docs/deployment.md)。数据库迁移规则见 [数据库迁移手册](docs/database-migrations.md)。
+完整的打包、首次安装、旧部署导入、NPU/GPU 配置、升级和回滚流程见 [部署与升级手册](docs/deployment.md)。数据库迁移规则见 [数据库迁移手册](docs/database-migrations.md)。第三方系统不依赖 `neu-sbox` 直接接入任务队列时，参阅 [Worker HTTP API](docs/worker-api.md)。
 
 ## 开发流程
 
@@ -174,54 +145,6 @@ neu-sbox acquire 1
 
 ## 配置
 
-### Master — `/etc/neu-box/master.env`
-
-| 变量 | 默认值 | 含义 |
-|---|---|---|
-| `NEU_BOX_LISTEN` | `0.0.0.0` | Master 监听地址 |
-| `NEU_BOX_PORT` | `25565` | Master 监听端口 |
-| `NEU_BOX_HTTP_THREADS` | `8` | Waitress HTTP 线程数 |
-| `NEU_BOX_POLL_INTERVAL` | `15` | 节点状态轮询间隔（秒） |
-| `NEU_BOX_DB_PATH` | `/var/lib/neu-box/master/master.db` | SQLite 数据库文件 |
-| `NEU_BOX_NODES_CONFIG` | `/etc/neu-box/nodes.json` | Worker 节点列表 |
-| `NEU_BOX_UPLOAD_DIR` | `/var/lib/neu-box/master/uploads` | 实验图片目录 |
-| `NEU_BOX_EXPERIMENT_LOG_DIR` | `/var/lib/neu-box/master/experiment-logs` | 实验日志副本目录 |
-| `NEU_BOX_LOG_DIR` | `/var/log/neu-box` | 服务日志目录 |
-| `NEU_BOX_BACKUP_DIR` | `/var/backups/neu-box` | 数据库备份目录 |
-| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `SECRET_KEY` | 安装时生成 | Flask session 加密密钥 |
-| `ADMIN_USER` | `admin` | 初始管理员用户名 |
-| `ADMIN_PASS` | `admin` | 初始管理员密码 |
-| `NEU_BOX_UPLOAD_MAX_SIZE` | `10485760` | 实验图片上传大小限制（字节），默认 10MB |
-
-节点列表由 `/etc/neu-box/nodes.json` 中的 `nodes_pool` 数组管理，支持前端 UI 动态增删：
-
-| 字段 | 含义 |
-|---|---|
-| `nodes_pool[].name` | 节点显示名称 |
-| `nodes_pool[].host` | Worker IP 地址 |
-| `nodes_pool[].port` | Worker 端口 |
-
-### Worker — `/etc/neu-box/worker.env`
-
-| 变量 | 默认值 | 含义 |
-|---|---|---|
-| `NEU_BOX_PORT` | `59075` | Worker 监听端口 |
-| `NEU_BOX_LISTEN` | `0.0.0.0` | Worker 监听地址 |
-| `NEU_BOX_HTTP_THREADS` | `8` | Waitress HTTP 线程数 |
-| `NEU_BOX_DEVICE_FILTER` | `davinci[0-9]+` | 设备名完整匹配正则，GPU 可设为 `nvidia[0-9]+` |
-| `NEU_BOX_DB_PATH` | `/var/lib/neu-box/worker/neu_box.db` | SQLite 数据库文件 |
-| `NEU_BOX_TASK_LOG_DIR` | `/var/lib/neu-box/worker/task-logs` | 任务日志目录 |
-| `NEU_BOX_LOG_DIR` | `/var/log/neu-box` | 服务日志目录 |
-| `NEU_BOX_BACKUP_DIR` | `/var/backups/neu-box` | 数据库备份目录 |
-| `NEU_BOX_SANDBOX_SCRIPT` | `/opt/neu-box/current/share/neu-box/sandbox/v2/sandbox.sh` | 沙盒管理脚本 |
-| `NEU_BOX_DEVICE_INFO_SCRIPT` | NPU 脚本路径 | 设备状态脚本；根据设备厂商显式配置 |
-| `NEU_BOX_SANDBOX_REAPER_INTERVAL` | `30` | 收尸线程扫描间隔（秒） |
-| `NEU_BOX_COMMAND_TIMEOUT` | `0` | 命令执行超时（秒），0 = 不限制 |
-| `NEU_BOX_COMMAND_MAX_COMPLETED` | `200` | 已完成任务保留上限 |
-| `NEU_BOX_COMMAND_QUEUE_RECENT` | `200` | 状态接口返回的近期任务上限 |
-| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
-
 安装 Worker 后、启动服务前，编辑 `/etc/neu-box/worker.env`。Worker 不自动
 判断设备厂商，按节点类型选择下面一组配套配置：
 
@@ -234,6 +157,8 @@ NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/npu_info.sh
 NEU_BOX_DEVICE_FILTER=nvidia[0-9]+
 NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/gpu_info.sh
 ```
+
+其余配置可使用默认值；完整的 Master/Worker 环境变量和节点列表说明见 [配置参考](docs/deployment.md#配置参考)。
 
 ## 数据流
 
@@ -265,8 +190,7 @@ GET /command/result/<id>/log?raw=1  → 纯文本日志 + Content-Length 头
 POST /sandbox/acquire {username, pid, device_num, cpu, memory [, container]}
   ├─ Host → /proc/<pid>/status 校验归属 → host PID 加入 sandbox
   └─ container=<name> → Docker + NSpid 映射 host PID
-       → 校验 namespace、原 Docker cgroup 和设备节点
-       → SIGSTOP shell → host PID 加入 sandbox → 核验 → SIGCONT
+       → 校验设备节点 → host PID 加入 sandbox
 POST /sandbox/join {username, pid, sandbox_name}
   → /proc/<pid>/status 校验 PID 归属 → sandbox 名称校验 owner → 加入目标 cgroup
 POST /command/run {user_id, command, device_ids/device_num, target}

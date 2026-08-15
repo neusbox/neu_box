@@ -9,10 +9,6 @@ __pycache__/
 build/
 dist/
 .env
-worker/db/
-master/db/
-master/static/uploads/*
-!master/static/uploads/.gitkeep
 *.log
 *.pytest_cache/
 nohup.out

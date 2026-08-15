@@ -47,8 +47,16 @@ Worker 额外要求：
 构建机需要 Python/uv、clang 和 Go；这些工具都不是目标节点的运行依赖。
 
 ```bash
-uv sync --all-extras --all-groups --frozen
+# 安装依赖并测试
+UV_CACHE_DIR=/tmp/neu-box-uv-cache \
+  uv sync --frozen --all-extras --all-groups
+UV_CACHE_DIR=/tmp/neu-box-uv-cache \
+  uv run --frozen pytest -q
+
+# 测试无运行时依赖的 Go 客户端
 (cd client/neu-sbox && go test ./...)
+
+# 构建当前机器架构的发布包
 UV_CACHE_DIR=/tmp/neu-box-uv-cache \
   uv run --frozen --all-extras --group build \
   python deploy/build_release.py
@@ -67,9 +75,9 @@ PyInstaller 产物不能直接跨 CPU 架构构建。amd64、arm64 应分别在�
 验证并解包：
 
 ```bash
-sha256sum -c neu-box-0.1.1-linux-amd64.tar.gz.sha256
-tar -xzf neu-box-0.1.1-linux-amd64.tar.gz
-cd neu-box-0.1.1-linux-amd64
+sha256sum -c neu-box-0.1.2-linux-amd64.tar.gz.sha256
+tar -xzf neu-box-0.1.2-linux-amd64.tar.gz
+cd neu-box-0.1.2-linux-amd64
 ```
 
 ## 首次安装
@@ -119,6 +127,56 @@ sudo systemctl start neu-box-worker neu-box-master
 ```
 
 每次命令只安装一个明确角色。
+
+## 配置参考
+
+### Master — `/etc/neu-box/master.env`
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `NEU_BOX_LISTEN` | `0.0.0.0` | Master 监听地址 |
+| `NEU_BOX_PORT` | `25565` | Master 监听端口 |
+| `NEU_BOX_HTTP_THREADS` | `8` | Waitress HTTP 线程数 |
+| `NEU_BOX_POLL_INTERVAL` | `15` | 节点状态轮询间隔（秒） |
+| `NEU_BOX_DB_PATH` | `/var/lib/neu-box/master/master.db` | SQLite 数据库文件 |
+| `NEU_BOX_NODES_CONFIG` | `/etc/neu-box/nodes.json` | Worker 节点列表 |
+| `NEU_BOX_UPLOAD_DIR` | `/var/lib/neu-box/master/uploads` | 实验图片目录 |
+| `NEU_BOX_EXPERIMENT_LOG_DIR` | `/var/lib/neu-box/master/experiment-logs` | 实验日志副本目录 |
+| `NEU_BOX_LOG_DIR` | `/var/log/neu-box` | 服务日志目录 |
+| `NEU_BOX_BACKUP_DIR` | `/var/backups/neu-box` | 数据库备份目录 |
+| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `SECRET_KEY` | 安装时生成 | Flask session 加密密钥 |
+| `ADMIN_USER` | `admin` | 初始管理员用户名 |
+| `ADMIN_PASS` | `admin` | 初始管理员密码 |
+| `NEU_BOX_UPLOAD_MAX_SIZE` | `10485760` | 实验图片上传大小限制（字节），默认 10MB |
+
+节点列表由 `/etc/neu-box/nodes.json` 中的 `nodes_pool` 数组管理，支持前端 UI 动态增删：
+
+| 字段 | 含义 |
+|---|---|
+| `nodes_pool[].name` | 节点显示名称 |
+| `nodes_pool[].host` | Worker IP 地址 |
+| `nodes_pool[].port` | Worker 端口 |
+
+### Worker — `/etc/neu-box/worker.env`
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `NEU_BOX_PORT` | `59075` | Worker 监听端口 |
+| `NEU_BOX_LISTEN` | `0.0.0.0` | Worker 监听地址 |
+| `NEU_BOX_HTTP_THREADS` | `8` | Waitress HTTP 线程数 |
+| `NEU_BOX_DEVICE_FILTER` | `davinci[0-9]+` | 设备名完整匹配正则，GPU 可设为 `nvidia[0-9]+` |
+| `NEU_BOX_DB_PATH` | `/var/lib/neu-box/worker/neu_box.db` | SQLite 数据库文件 |
+| `NEU_BOX_TASK_LOG_DIR` | `/var/lib/neu-box/worker/task-logs` | 任务日志目录 |
+| `NEU_BOX_LOG_DIR` | `/var/log/neu-box` | 服务日志目录 |
+| `NEU_BOX_BACKUP_DIR` | `/var/backups/neu-box` | 数据库备份目录 |
+| `NEU_BOX_SANDBOX_SCRIPT` | `/opt/neu-box/current/share/neu-box/sandbox/v2/sandbox.sh` | 沙盒管理脚本 |
+| `NEU_BOX_DEVICE_INFO_SCRIPT` | NPU 脚本路径 | 设备状态脚本；根据设备厂商显式配置 |
+| `NEU_BOX_SANDBOX_REAPER_INTERVAL` | `30` | 收尸线程扫描间隔（秒） |
+| `NEU_BOX_COMMAND_TIMEOUT` | `0` | 命令执行超时（秒），0 = 不限制 |
+| `NEU_BOX_COMMAND_MAX_COMPLETED` | `200` | 已完成任务保留上限 |
+| `NEU_BOX_COMMAND_QUEUE_RECENT` | `200` | 状态接口返回的近期任务上限 |
+| `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 ## 从源码部署导入
 
@@ -181,6 +239,21 @@ sudo neu-box-install rollback
 安装状态只维护一个可直接回滚的上一版本。回滚成功后，刚才的版本和回滚前救援备份会成为新的上一状态，因此可以再次回切。配置升级时从不自动覆盖，所以普通回滚不会替换当前配置；每次操作前的配置副本仍保留在 `/var/backups/neu-box`。
 
 ## 目录、权限与日志
+
+安装后的主要路径：
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/neu-box/releases/<version>/` | 不可变的版本化程序 |
+| `/opt/neu-box/current` | 当前版本原子符号链接 |
+| `/etc/neu-box/` | Master/Worker 配置与节点列表 |
+| `/var/lib/neu-box/` | SQLite、任务日志、上传文件和实验日志 |
+| `/var/log/neu-box/` | Master/Worker 运行日志 |
+| `/var/backups/neu-box/` | 升级和回滚备份 |
+| `/usr/local/sbin/neu-box-install` | 当前版本安装器 |
+| `/usr/local/bin/neu-sbox` | 指向当前 Worker 版本客户端的链接 |
+
+关键路径的默认权限：
 
 | 路径 | 默认所有者/用途 |
 |---|---|

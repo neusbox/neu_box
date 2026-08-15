@@ -9,7 +9,6 @@ from flask import Flask
 
 from neu_box.worker.executor import (
     command_docker,
-    container_terminal,
     sandbox_api,
 )
 from neu_box.worker.executor.command_docker import ContainerProcess
@@ -73,6 +72,8 @@ class _FakeSbx:
         self.moved = []
         self.destroyed = []
         self.allocated = []
+        self.join_result = True
+        self.move_result = True
         self.record = {'devices': [], 'pids': [43210]}
         self.db = SimpleNamespace(get_sandbox=lambda _name: self.record)
 
@@ -85,11 +86,11 @@ class _FakeSbx:
 
     def join_sandbox(self, name, pid):
         self.joined.append((name, pid))
-        return True
+        return self.join_result
 
     def move_pid_to_cgroup(self, pid, path):
         self.moved.append((pid, path))
-        return True
+        return self.move_result
 
     def destroy_sandbox(self, name):
         self.destroyed.append(name)
@@ -165,62 +166,13 @@ def test_find_sandbox_strips_filesystem_prefix():
         )
 
 
-def test_join_container_terminal_stops_checks_and_moves():
-    sbx = _FakeSbx()
-    process = _process(12, 43210)
-    with (
-        mock.patch.object(container_terminal.os, 'kill') as kill,
-        mock.patch.object(container_terminal, '_wait_stopped'),
-        mock.patch.object(container_terminal, 'verify_container_process'),
-        mock.patch.object(
-            container_terminal,
-            '_read_unified_cgroup',
-            side_effect=[
-                '/system.slice/docker-oprace.scope',
-                '/sandbox_sbx_yuxd_43210.slice',
-            ],
-        ),
-    ):
-        container_terminal.join_container_terminal(
-            sbx, 'sbx_yuxd_43210.slice', process,
-        )
-
-    assert sbx.joined == [('sbx_yuxd_43210.slice', 43210)]
-    assert kill.call_count == 2
-
-
-def test_restore_container_terminal_moves_shell_and_http_client():
-    sbx = _FakeSbx()
-    shell = _process(12, 43210)
-    client = _process(34, 43211)
-    sandbox = '/sandbox_sbx_yuxd_43210.slice'
-    with (
-        mock.patch.object(container_terminal.os, 'kill'),
-        mock.patch.object(container_terminal, '_wait_stopped'),
-        mock.patch.object(container_terminal, 'verify_container_process'),
-        mock.patch.object(
-            container_terminal,
-            '_read_unified_cgroup',
-            side_effect=[sandbox, sandbox, sandbox, sandbox],
-        ),
-    ):
-        container_terminal.restore_container_terminal(
-            sbx, 'sbx_yuxd_43210.slice', shell, client,
-        )
-
-    assert sbx.moved == [
-        (43210, '/system.slice/docker-oprace.scope'),
-        (43211, '/system.slice/docker-oprace.scope'),
-    ]
-
-
 def _api_client():
     app = Flask(__name__)
     app.register_blueprint(sandbox_api.sandbox_bp, url_prefix='/sandbox')
     return app.test_client()
 
 
-def test_acquire_maps_container_pid_before_existing_sandbox_flow():
+def test_acquire_maps_container_pid_and_joins_through_sbx_manager():
     sbx = _FakeSbx()
     process = _process(12, 43210)
     with (
@@ -239,10 +191,6 @@ def test_acquire_maps_container_pid_before_existing_sandbox_flow():
             '_find_sandbox_for_pid',
             return_value=None,
         ),
-        mock.patch.object(
-            sandbox_api,
-            'join_container_terminal',
-        ) as join,
     ):
         response = _api_client().post('/sandbox/acquire', json={
             'username': 'yuxd',
@@ -258,18 +206,13 @@ def test_acquire_maps_container_pid_before_existing_sandbox_flow():
     assert response.status_code == 201, response.get_json()
     resolve.assert_called_once_with('oprace', 12)
     assert sbx.allocated[0]['sandbox_id'] == '43210'
-    join.assert_called_once_with(
-        sbx, 'sbx_yuxd_43210.slice', process,
-    )
+    assert sbx.joined == [('sbx_yuxd_43210.slice', 43210)]
 
 
-def test_acquire_keeps_sandbox_when_failed_join_cgroup_is_unknown():
+def test_acquire_destroys_new_sandbox_when_direct_join_fails():
     sbx = _FakeSbx()
+    sbx.join_result = False
     process = _process(12, 43210)
-    error = command_docker.DockerExecutorError(
-        'join failed',
-        'docker_container_pid_join_failed',
-    )
     with (
         mock.patch.object(
             sandbox_api.SbxManager,
@@ -286,16 +229,6 @@ def test_acquire_keeps_sandbox_when_failed_join_cgroup_is_unknown():
             '_find_sandbox_for_pid',
             return_value=None,
         ),
-        mock.patch.object(
-            sandbox_api,
-            'join_container_terminal',
-            side_effect=error,
-        ),
-        mock.patch.object(
-            sandbox_api,
-            '_read_unified_cgroup',
-            side_effect=OSError('unknown cgroup'),
-        ),
     ):
         response = _api_client().post('/sandbox/acquire', json={
             'username': 'yuxd',
@@ -307,7 +240,8 @@ def test_acquire_keeps_sandbox_when_failed_join_cgroup_is_unknown():
         })
 
     assert response.status_code == 500
-    assert sbx.destroyed == []
+    assert sbx.joined == [('sbx_yuxd_43210.slice', 43210)]
+    assert sbx.destroyed == ['sbx_yuxd_43210.slice']
 
 
 def test_release_restores_registered_terminal_before_destroy():
@@ -325,10 +259,6 @@ def test_release_restores_registered_terminal_before_destroy():
             'resolve_container_pid',
             side_effect=[shell, client],
         ),
-        mock.patch.object(
-            sandbox_api,
-            'restore_container_terminal',
-        ) as restore,
     ):
         response = _api_client().post('/sandbox/release', json={
             'sandbox_name': 'sbx_yuxd_43210.slice',
@@ -338,9 +268,10 @@ def test_release_restores_registered_terminal_before_destroy():
         })
 
     assert response.status_code == 200, response.get_json()
-    restore.assert_called_once_with(
-        sbx, 'sbx_yuxd_43210.slice', shell, client,
-    )
+    assert sbx.moved == [
+        (43210, '/system.slice/docker-oprace.scope'),
+        (43211, '/system.slice/docker-oprace.scope'),
+    ]
     assert sbx.destroyed == ['sbx_yuxd_43210.slice']
 
 
@@ -358,10 +289,6 @@ def test_release_rejects_terminal_not_registered_in_sandbox():
             'resolve_container_pid',
             side_effect=[_process(12, 43210), _process(34, 43211)],
         ),
-        mock.patch.object(
-            sandbox_api,
-            'restore_container_terminal',
-        ) as restore,
     ):
         response = _api_client().post('/sandbox/release', json={
             'sandbox_name': 'sbx_yuxd_43210.slice',
@@ -371,11 +298,11 @@ def test_release_rejects_terminal_not_registered_in_sandbox():
         })
 
     assert response.status_code == 409
-    restore.assert_not_called()
+    assert sbx.moved == []
     assert sbx.destroyed == []
 
 
-def test_list_reports_container_terminal_current_sandbox():
+def test_list_reports_container_current_sandbox():
     process = _process(12, 43210)
     database = SimpleNamespace(list_sandboxes=lambda: [])
     with (

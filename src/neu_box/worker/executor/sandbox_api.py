@@ -14,13 +14,7 @@ from flask import Blueprint, request
 
 from neu_box.worker.executor.command_docker import (
     DockerExecutorError,
-    _expected_cgroup,
-    _read_unified_cgroup,
     resolve_container_pid,
-)
-from neu_box.worker.executor.container_terminal import (
-    join_container_terminal,
-    restore_container_terminal,
 )
 from neu_box.worker.executor.db import Database
 from neu_box.worker.executor.sbx_manager import SbxManager
@@ -104,18 +98,11 @@ def _docker_error_status(exc: DockerExecutorError) -> int:
         'docker_container_changed',
         'docker_container_pid_changed',
         'docker_container_pid_namespace_mismatch',
-        'docker_container_pid_cgroup_mismatch',
         'docker_container_release_identity_mismatch',
-        'docker_container_release_cgroup_mismatch',
         'docker_devices_not_visible',
     }:
         return 409
-    if exc.code in {
-        'docker_container_pid_join_failed',
-        'docker_container_pid_cgroup_verify_failed',
-        'docker_container_pid_stop_timeout',
-        'docker_container_release_restore_failed',
-    }:
+    if exc.code == 'docker_container_release_restore_failed':
         return 500
     return 400
 
@@ -230,32 +217,7 @@ def acquire():
             )
             return _docker_error_response(exc)
 
-        try:
-            join_container_terminal(sbx, sandbox_name, container_process)
-        except DockerExecutorError as exc:
-            # 回滚已把 shell 迁出时可以安全销毁；若回滚失败则保留现场，
-            # 避免 destroy 的 cgroup.kill 杀死交互终端。
-            safe_to_destroy = False
-            try:
-                safe_to_destroy = (
-                    _read_unified_cgroup(pid)
-                    != _expected_cgroup(sandbox_name)
-                )
-            except (DockerExecutorError, OSError):
-                logger.exception(
-                    "无法确认容器 shell PID %s 的 cgroup，保留沙盒 '%s'",
-                    pid,
-                    sandbox_name,
-                )
-            if safe_to_destroy:
-                sbx.destroy_sandbox(sandbox_name)
-            else:
-                logger.error(
-                    "容器 shell 可能仍在沙盒 '%s'，为避免误杀不执行 destroy",
-                    sandbox_name,
-                )
-            return _docker_error_response(exc)
-    elif not sbx.join_sandbox(sandbox_name, pid):
+    if not sbx.join_sandbox(sandbox_name, pid):
         sbx.destroy_sandbox(sandbox_name)
         return {'error': '加入沙盒失败'}, 500
 
@@ -329,9 +291,15 @@ def release():
                     '当前容器 shell 不是该沙盒登记的终端进程',
                     'docker_container_release_identity_mismatch',
                 )
-            restore_container_terminal(
-                sbx, sandbox_name, shell, client,
-            )
+            for process in (shell, client):
+                if not sbx.move_pid_to_cgroup(
+                    process.host_pid,
+                    process.container_cgroup,
+                ):
+                    raise DockerExecutorError(
+                        f'无法将 PID {process.host_pid} 迁回 Docker cgroup',
+                        'docker_container_release_restore_failed',
+                    )
         except DockerExecutorError as exc:
             return _docker_error_response(exc)
 
