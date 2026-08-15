@@ -1,0 +1,2 @@
+"""Neu Box Worker service."""
+
