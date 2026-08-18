@@ -75,9 +75,10 @@ PyInstaller 产物不能直接跨 CPU 架构构建。amd64、arm64 应分别在�
 验证并解包：
 
 ```bash
-sha256sum -c neu-box-0.1.2-linux-amd64.tar.gz.sha256
-tar -xzf neu-box-0.1.2-linux-amd64.tar.gz
-cd neu-box-0.1.2-linux-amd64
+cd dist
+sha256sum -c neu-box-0.1.3-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.1.3-linux-arm64.tar.gz
+cd neu-box-0.1.3-linux-arm64
 ```
 
 ## 首次安装
@@ -210,8 +211,8 @@ sudo ./neu-box-install install --role master --no-start \
 Worker 升级前应安排维护窗口，停止提交新任务并确认队列中没有必须保留的运行任务。安装器会停止服务，但不会替你等待业务任务排空。
 
 ```bash
-tar -xzf neu-box-0.2.0-linux-amd64.tar.gz
-cd neu-box-0.2.0-linux-amd64
+tar -xzf neu-box-0.1.3-linux-arm64.tar.gz
+cd neu-box-0.1.3-linux-arm64
 sudo ./neu-box-install upgrade --role worker
 ```
 

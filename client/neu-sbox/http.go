@@ -71,10 +71,21 @@ func (client *apiClient) request(
 }
 
 func responseError(status int, raw []byte) error {
+	message, code := apiErrorDetails(status, raw)
+	if status >= 200 && status < 300 && message == "" {
+		return nil
+	}
+	if code != "" {
+		return fmt.Errorf("Worker 返回 HTTP %d: %s (%s)", status, message, code)
+	}
+	return fmt.Errorf("Worker 返回 HTTP %d: %s", status, message)
+}
+
+func apiErrorDetails(status int, raw []byte) (string, string) {
 	var body apiErrorBody
 	_ = json.Unmarshal(raw, &body)
 	if status >= 200 && status < 300 && body.Error == "" {
-		return nil
+		return "", ""
 	}
 	message := strings.TrimSpace(body.Error)
 	if message == "" {
@@ -83,10 +94,27 @@ func responseError(status int, raw []byte) error {
 	if message == "" {
 		message = http.StatusText(status)
 	}
-	if body.Code != "" {
-		return fmt.Errorf("Worker 返回 HTTP %d: %s (%s)", status, message, body.Code)
+	return message, body.Code
+}
+
+func (a *app) workerFailure(status int, raw []byte) int {
+	message, code := apiErrorDetails(status, raw)
+	if a.jsonOutput {
+		output := map[string]any{
+			"error":       message,
+			"http_status": status,
+		}
+		if code != "" {
+			output["code"] = code
+		}
+		_ = printJSONValue(a.errOut, output)
+		return 1
 	}
-	return fmt.Errorf("Worker 返回 HTTP %d: %s", status, message)
+	fmt.Fprintf(a.errOut, "[neu-sbox] 操作失败 (HTTP %d): %s\n", status, message)
+	if code != "" {
+		fmt.Fprintf(a.errOut, "    code: %s\n", code)
+	}
+	return 1
 }
 
 func printJSON(writer io.Writer, raw []byte) error {
@@ -102,6 +130,10 @@ func printJSON(writer io.Writer, raw []byte) error {
 		}
 		return err
 	}
+	return printJSONValue(writer, value)
+}
+
+func printJSONValue(writer io.Writer, value any) error {
 	encoder := json.NewEncoder(writer)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "  ")

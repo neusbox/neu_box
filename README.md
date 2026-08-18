@@ -37,9 +37,9 @@ Master 和 Worker 发布程序包含 Python 解释器及 Python 依赖，目标�
 ```bash
 # 校验并解压；版本和架构以实际产物为准
 cd dist
-sha256sum -c neu-box-0.1.2-linux-arm64.tar.gz.sha256
-tar -xzf neu-box-0.1.2-linux-arm64.tar.gz
-cd neu-box-0.1.2-linux-arm64
+sha256sum -c neu-box-0.1.3-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.1.3-linux-arm64.tar.gz
+cd neu-box-0.1.3-linux-arm64
 
 # 计算节点安装 Worker；默认安装后立即启动
 sudo ./neu-box-install install --role worker
@@ -91,35 +91,41 @@ sudo neu-box-install rollback
 
 ## CLI用法
 
-管理当前 shell 的独占沙盒，或提交 Host、已有容器命令。Host 终端通过 `/proc/<pid>/status` 校验 PID 归属；容器终端通过 Docker 身份、PID namespace 和 `NSpid` 映射到宿主机进程。
+- `acquire` 是同步操作：返回成功时，当前 shell 或 `--pid` 指定的进程已经进入沙盒。
+- `submit` 是异步操作：返回成功只表示任务已经进入队列，需要使用
+  `neu-sbox result <task_id>` 查询任务状态、执行结果和日志。
 
 ```bash
 # neu-box-install 安装 Worker 时创建 /usr/local/bin/neu-sbox
 
-# ── 沙盒（终端隔离） ──
-neu-sbox acquire 1              # 申请 1 个 NPU，加入当前 shell
-neu-sbox acquire 2 4 8          # 申请 2 NPU + 4 核 CPU + 8G 内存
-neu-sbox acquire --devices 1,3  # 指定卡 1、3，加入当前 shell
-neu-sbox acquire --devices 1 --pid 12345  # 将指定进程加入新沙盒
-neu-sbox status                 # 查看当前 shell 是否在沙盒中
-neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
-neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
-neu-sbox release <name>         # 释放指定沙盒
+# ── 终端沙盒（acquire 同步，成功返回时已进入沙盒） ──
+neu-sbox acquire --device-num 1                 # 自动分配 1 个 NPU，加入当前 shell
+neu-sbox acquire --json --device-num 1          # 同步申请并以 JSON 返回 sandbox_name
+neu-sbox acquire --device-num 2 --cpu 4 --mem 8 # 自动分配 2 NPU + 4 核 CPU + 8G 内存
+neu-sbox acquire --device 1 --device 3           # 指定卡 1、3，加入当前 shell
+neu-sbox acquire --device 1 --pid 12345          # 将指定进程加入新沙盒
+neu-sbox status                                  # 查看当前 shell 所在沙盒
+neu-sbox status --json                           # 以 JSON 输出当前 shell 的沙盒状态
+neu-sbox join sbx_pengyt_12345.slice             # 将当前 shell 加入已有沙盒（需归属校验）
+neu-sbox list                                    # 列出沙盒及设备、CPU、内存
+neu-sbox release <sandbox_name>                  # 释放指定沙盒
 # Host 终端重复 acquire 会覆盖旧沙盒；容器终端需先 release
 
-# ── 命令任务（一次性执行，类似前端命令模式） ──
-neu-sbox acquire 1 2 4 "npu-smi info"     # 1 NPU + 2 核 + 4G 执行 Host 命令
-neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
-neu-sbox tasks                              # 查看任务队列
-neu-sbox result <task_id>                   # 查看任务结果和日志
+# ── 命令任务（submit 异步，成功只表示入队） ──
+neu-sbox submit --device-num 1 --cpu 2 --mem 4 -- npu-smi info # 提交 Host 任务
+neu-sbox submit --device-num 0 --cpu 4 --mem 8 -- python train.py
+neu-sbox submit --device 1 --device 3 -- python train.py       # 指定卡 1、3
+neu-sbox tasks                                                 # 查看任务队列
+neu-sbox result <task_id>                                      # 查询任务状态、结果和日志
+neu-sbox result --json <task_id>                               # 以 JSON 输出结果和 log 字段
 
-# ── 已有容器命令 ──
-neu-sbox acquire --devices 1 --container training-01 \
-  --workdir /workspace --command "python train.py"
+# ── 已有容器命令（在 host 执行） ──
 # 支持 --env、--workdir、--container-user
 # 目标容器需已挂载所申请的 /dev/davinciN 或 /dev/nvidiaN
+neu-sbox submit --devices 1 --container training-01 \
+  --workdir /workspace -- python train.py
 
-# ── 已有容器中的交互终端 ──
+# ── 已有容器命令（在 container 中执行） ──
 # 在 Host 创建容器；保留原有镜像和设备挂载参数
 docker run --name training-01 \
   --add-host host.docker.internal:host-gateway \
@@ -132,7 +138,7 @@ docker run --name training-01 \
 # 在容器交互 shell 中
 neu-sbox acquire --device-num 1
 neu-sbox status
-neu-sbox release <name>
+neu-sbox release <sandbox>
 
 # 未设置 NEU_BOX_CONTAINER 时，也可在 acquire 时显式指定；客户端会为
 # 随后的 release 在 /tmp 记录该 sandbox 对应的容器名
@@ -140,7 +146,7 @@ neu-sbox acquire --container training-01 --device-num 1
 
 # ── 远程 Worker ──
 export NEU_BOX_URL=http://<worker_ip>:59075
-neu-sbox acquire 1
+neu-sbox acquire --device-num 1
 ```
 
 ## 配置

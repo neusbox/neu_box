@@ -11,13 +11,25 @@ import (
 	"time"
 )
 
+type resourceOptions struct {
+	deviceIDs    []string
+	deviceNum    int
+	deviceNumSet bool
+	cpu          int
+	cpuSet       bool
+	memory       int
+	memorySet    bool
+}
+
 type acquireOptions struct {
-	deviceIDs     []string
-	deviceNum     int
-	cpu           int
-	memory        int
-	pid           int
-	pidSet        bool
+	resourceOptions
+	pid       int
+	pidSet    bool
+	container string
+}
+
+type submitOptions struct {
+	resourceOptions
 	command       string
 	container     string
 	workdir       string
@@ -72,69 +84,25 @@ func (a *app) runAcquire(args []string) int {
 	if err != nil {
 		return a.usageError(err.Error())
 	}
-	if options.command != "" {
-		return a.runCommandAcquire(options)
-	}
 	return a.runTerminalAcquire(options)
 }
 
 func parseAcquireOptions(args []string) (acquireOptions, error) {
-	options := acquireOptions{environment: make(map[string]string)}
-	positionals := make([]string, 0, 4)
+	options := acquireOptions{}
+	positionals := make([]string, 0, 3)
 
 	for index := 0; index < len(args); index++ {
 		argument := args[index]
-		value := func() (string, error) {
-			if index+1 >= len(args) {
-				return "", fmt.Errorf("%s 缺少参数", argument)
+		if handled, err := consumeResourceOption(args, &index, &options.resourceOptions); handled || err != nil {
+			if err != nil {
+				return options, err
 			}
-			index++
-			return args[index], nil
+			continue
 		}
 
 		switch argument {
-		case "--devices":
-			raw, err := value()
-			if err != nil {
-				return options, err
-			}
-			for _, item := range strings.Split(raw, ",") {
-				if item = strings.TrimSpace(item); item != "" {
-					options.deviceIDs = append(options.deviceIDs, item)
-				}
-			}
-			if len(options.deviceIDs) == 0 {
-				return options, errors.New("--devices 不能为空")
-			}
-		case "--device-num":
-			raw, err := value()
-			if err != nil {
-				return options, err
-			}
-			options.deviceNum, err = nonNegativeInteger("--device-num", raw)
-			if err != nil {
-				return options, err
-			}
-		case "--cpu":
-			raw, err := value()
-			if err != nil {
-				return options, err
-			}
-			options.cpu, err = nonNegativeInteger("--cpu", raw)
-			if err != nil {
-				return options, err
-			}
-		case "--mem":
-			raw, err := value()
-			if err != nil {
-				return options, err
-			}
-			options.memory, err = nonNegativeInteger("--mem", raw)
-			if err != nil {
-				return options, err
-			}
 		case "--pid":
-			raw, err := value()
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
@@ -143,14 +111,79 @@ func parseAcquireOptions(args []string) (acquireOptions, error) {
 				return options, err
 			}
 			options.pidSet = true
-		case "--command":
-			raw, err := value()
+		case "--container":
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
-			options.command = raw
+			options.container = strings.TrimSpace(raw)
+			if options.container == "" {
+				return options, errors.New("--container 不能为空")
+			}
+		case "--command", "--workdir", "--container-user", "--env", "--":
+			return options, errors.New("命令任务已移至 submit；请使用 neu-sbox submit [选项] -- <command>")
+		default:
+			if strings.HasPrefix(argument, "-") {
+				return options, fmt.Errorf("未知 acquire 选项: %s", argument)
+			}
+			positionals = append(positionals, argument)
+		}
+	}
+
+	if len(positionals) > 3 {
+		return options, errors.New("acquire 最多接受 3 个位置参数: device_num cpu mem；命令任务请使用 submit")
+	}
+	if err := applyPositionalResources(&options.resourceOptions, positionals); err != nil {
+		return options, err
+	}
+	if err := validateResourceOptions(options.resourceOptions); err != nil {
+		return options, err
+	}
+	return options, nil
+}
+
+func (a *app) runSubmit(args []string) int {
+	options, err := parseSubmitOptions(args)
+	if err != nil {
+		return a.usageError(err.Error())
+	}
+	return a.submitCommand(options)
+}
+
+func parseSubmitOptions(args []string) (submitOptions, error) {
+	options := submitOptions{environment: make(map[string]string)}
+
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		if argument == "--" {
+			if options.command != "" {
+				return options, errors.New("submit 只能指定一个命令")
+			}
+			if index+1 >= len(args) {
+				return options, errors.New("submit 缺少命令；请在 -- 后指定命令")
+			}
+			options.command = joinCommandArguments(args[index+1:])
+			break
+		}
+		if handled, err := consumeResourceOption(args, &index, &options.resourceOptions); handled || err != nil {
+			if err != nil {
+				return options, err
+			}
+			continue
+		}
+
+		switch argument {
+		case "--command":
+			if options.command != "" {
+				return options, errors.New("submit 只能指定一个命令")
+			}
+			raw, err := optionValue(args, &index)
+			if err != nil {
+				return options, err
+			}
+			options.command = strings.TrimSpace(raw)
 		case "--container":
-			raw, err := value()
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
@@ -159,19 +192,19 @@ func parseAcquireOptions(args []string) (acquireOptions, error) {
 				return options, errors.New("--container 不能为空")
 			}
 		case "--workdir":
-			raw, err := value()
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
 			options.workdir = raw
 		case "--container-user":
-			raw, err := value()
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
 			options.containerUser = raw
 		case "--env":
-			raw, err := value()
+			raw, err := optionValue(args, &index)
 			if err != nil {
 				return options, err
 			}
@@ -182,47 +215,156 @@ func parseAcquireOptions(args []string) (acquireOptions, error) {
 			options.environment[key] = envValue
 		default:
 			if strings.HasPrefix(argument, "-") {
-				return options, fmt.Errorf("未知 acquire 选项: %s", argument)
+				return options, fmt.Errorf("未知 submit 选项: %s", argument)
 			}
-			positionals = append(positionals, argument)
+			return options, fmt.Errorf("无法识别 submit 参数 %q；命令必须放在 -- 后", argument)
 		}
 	}
 
-	if len(positionals) > 4 {
-		return options, errors.New("acquire 最多接受 4 个位置参数: device_num cpu mem command")
+	if strings.TrimSpace(options.command) == "" {
+		return options, errors.New("submit 缺少命令；请在 -- 后指定命令")
 	}
-	var err error
-	if len(positionals) > 0 && options.deviceNum == 0 && len(options.deviceIDs) == 0 {
-		options.deviceNum, err = nonNegativeInteger("device_num", positionals[0])
+	if options.container == "" && (options.workdir != "" || options.containerUser != "" || len(options.environment) > 0) {
+		return options, errors.New("--workdir/--container-user/--env 必须配合 --container")
+	}
+	if err := validateResourceOptions(options.resourceOptions); err != nil {
+		return options, err
+	}
+	return options, nil
+}
+
+func consumeResourceOption(args []string, index *int, options *resourceOptions) (bool, error) {
+	argument := args[*index]
+	switch argument {
+	case "--device":
+		raw, err := optionValue(args, index)
 		if err != nil {
-			return options, err
+			return true, err
 		}
-	}
-	if len(positionals) > 1 && options.cpu == 0 {
-		options.cpu, err = nonNegativeInteger("cpu", positionals[1])
+		deviceID := strings.TrimSpace(raw)
+		if deviceID == "" {
+			return true, errors.New("--device 不能为空")
+		}
+		options.deviceIDs = append(options.deviceIDs, deviceID)
+	case "--devices":
+		raw, err := optionValue(args, index)
 		if err != nil {
-			return options, err
+			return true, err
 		}
-	}
-	if len(positionals) > 2 && options.memory == 0 {
-		options.memory, err = nonNegativeInteger("mem", positionals[2])
+		count := len(options.deviceIDs)
+		for _, item := range strings.Split(raw, ",") {
+			if item = strings.TrimSpace(item); item != "" {
+				options.deviceIDs = append(options.deviceIDs, item)
+			}
+		}
+		if len(options.deviceIDs) == count {
+			return true, errors.New("--devices 不能为空")
+		}
+	case "--device-num":
+		raw, err := optionValue(args, index)
 		if err != nil {
-			return options, err
+			return true, err
 		}
-	}
-	if len(positionals) > 3 && options.command == "" {
-		options.command = positionals[3]
+		options.deviceNum, err = nonNegativeInteger("--device-num", raw)
+		if err != nil {
+			return true, err
+		}
+		options.deviceNumSet = true
+	case "--cpu":
+		raw, err := optionValue(args, index)
+		if err != nil {
+			return true, err
+		}
+		options.cpu, err = nonNegativeInteger("--cpu", raw)
+		if err != nil {
+			return true, err
+		}
+		options.cpuSet = true
+	case "--mem":
+		raw, err := optionValue(args, index)
+		if err != nil {
+			return true, err
+		}
+		options.memory, err = nonNegativeInteger("--mem", raw)
+		if err != nil {
+			return true, err
+		}
+		options.memorySet = true
+	default:
+		return false, nil
 	}
 	if len(options.deviceIDs) > 0 {
 		options.deviceNum = 0
 	}
-	if options.command == "" && (options.workdir != "" || options.containerUser != "" || len(options.environment) > 0) {
-		return options, errors.New("--workdir/--container-user/--env 必须配合 --command")
+	return true, nil
+}
+
+func optionValue(args []string, index *int) (string, error) {
+	argument := args[*index]
+	if *index+1 >= len(args) {
+		return "", fmt.Errorf("%s 缺少参数", argument)
 	}
-	if options.command != "" && options.container == "" && (options.workdir != "" || options.containerUser != "" || len(options.environment) > 0) {
-		return options, errors.New("--workdir/--container-user/--env 必须配合 --container")
+	*index++
+	return args[*index], nil
+}
+
+func applyPositionalResources(options *resourceOptions, positionals []string) error {
+	var err error
+	if len(positionals) > 0 && !options.deviceNumSet && len(options.deviceIDs) == 0 {
+		options.deviceNum, err = nonNegativeInteger("device_num", positionals[0])
+		if err != nil {
+			return err
+		}
 	}
-	return options, nil
+	if len(positionals) > 1 && !options.cpuSet {
+		options.cpu, err = nonNegativeInteger("cpu", positionals[1])
+		if err != nil {
+			return err
+		}
+	}
+	if len(positionals) > 2 && !options.memorySet {
+		options.memory, err = nonNegativeInteger("mem", positionals[2])
+		if err != nil {
+			return err
+		}
+	}
+	if len(options.deviceIDs) > 0 {
+		options.deviceNum = 0
+	}
+	return nil
+}
+
+func validateResourceOptions(options resourceOptions) error {
+	if options.deviceNumSet && len(options.deviceIDs) > 0 {
+		return errors.New("--device/--devices 与 --device-num 互斥")
+	}
+	return nil
+}
+
+func joinCommandArguments(arguments []string) string {
+	if len(arguments) == 1 {
+		return arguments[0]
+	}
+	quoted := make([]string, 0, len(arguments))
+	for _, argument := range arguments {
+		quoted = append(quoted, quoteCommandArgument(argument))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func quoteCommandArgument(argument string) string {
+	if argument == "" {
+		return "''"
+	}
+	if strings.IndexFunc(argument, func(character rune) bool {
+		return !(character >= 'a' && character <= 'z') &&
+			!(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') &&
+			!strings.ContainsRune("_@%+=:,./-", character)
+	}) == -1 {
+		return argument
+	}
+	return "'" + strings.ReplaceAll(argument, "'", "'\"'\"'") + "'"
 }
 
 func nonNegativeInteger(name, raw string) (int, error) {
@@ -249,7 +391,7 @@ func nullableString(value string) *string {
 	return &copy
 }
 
-func (a *app) runCommandAcquire(options acquireOptions) int {
+func (a *app) submitCommand(options submitOptions) int {
 	payload := commandRequest{
 		UserID:    a.config.username,
 		Command:   options.command,
@@ -269,35 +411,29 @@ func (a *app) runCommandAcquire(options acquireOptions) int {
 		}
 	}
 
-	fmt.Fprintf(a.out, "[neu-sbox] 提交任务: device=%d cpu=%d mem=%dG\n", options.deviceNum, options.cpu, options.memory)
-	if len(options.deviceIDs) > 0 {
-		fmt.Fprintf(a.out, "[neu-sbox] 指定设备: %s\n", strings.Join(options.deviceIDs, ","))
-	}
-	fmt.Fprintf(a.out, "[neu-sbox] 命令: %s\n", options.command)
-	fmt.Fprintf(a.out, "[neu-sbox] user=%s\n", a.config.username)
-	if options.container != "" {
-		fmt.Fprintf(a.out, "[neu-sbox] 现有 Docker container=%s\n", options.container)
-	}
-
 	status, raw, err := a.api.request(http.MethodPost, "/command/run", nil, payload)
 	if err != nil {
 		return a.requestError(err)
 	}
-	_ = printJSON(a.out, raw)
 	if err := responseError(status, raw); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
 	var response commandResponse
 	if err := decodeJSON(raw, &response); err != nil || response.TaskID == "" {
 		if err == nil {
 			err = errors.New("Worker 响应缺少 task_id")
 		}
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.internalError("invalid_worker_response", err)
 	}
-	fmt.Fprintf(a.out, "\n✓ 任务已提交，ID=%s 队列位置 #%d\n", response.TaskID, response.Position)
-	fmt.Fprintf(a.out, "  查看日志: neu-sbox result %s\n", response.TaskID)
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 任务已提交")
+	fmt.Fprintf(a.out, "    ID=%s\n", response.TaskID)
+	fmt.Fprintf(a.out, "    queue_position: #%d\n", response.Position)
+	fmt.Fprintf(a.out, "    command: %s\n", options.command)
+	fmt.Fprintf(a.out, "    result: neu-sbox result %s\n", response.TaskID)
 	return 0
 }
 
@@ -324,38 +460,44 @@ func (a *app) runTerminalAcquire(options acquireOptions) int {
 		Container: container,
 	}
 
-	fmt.Fprintf(a.out, "[neu-sbox] 申请沙盒: device=%d cpu=%d mem=%dG\n", options.deviceNum, options.cpu, options.memory)
-	if len(options.deviceIDs) > 0 {
-		fmt.Fprintf(a.out, "[neu-sbox] 指定设备: %s\n", strings.Join(options.deviceIDs, ","))
-	}
-	fmt.Fprintf(a.out, "[neu-sbox] PID=%d user=%s\n", shellPID, a.config.username)
-	if container != "" {
-		fmt.Fprintf(a.out, "[neu-sbox] 当前容器=%s\n", container)
-	}
-
 	status, raw, err := a.api.request(http.MethodPost, "/sandbox/acquire", nil, payload)
 	if err != nil {
 		return a.requestError(err)
 	}
-	_ = printJSON(a.out, raw)
 	if err := responseError(status, raw); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
 	var response acquireResponse
 	if err := decodeJSON(raw, &response); err != nil || response.SandboxName == "" {
 		if err == nil {
 			err = errors.New("Worker 响应缺少 sandbox_name")
 		}
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.internalError("invalid_worker_response", err)
 	}
 	if container != "" {
 		if err := a.rememberContainer(response.SandboxName, container); err != nil {
-			fmt.Fprintf(a.errOut, "警告: 无法保存容器标识；release 时请传 --container %s: %v\n", container, err)
+			a.printWarning(
+				"container_state_write_failed",
+				fmt.Sprintf("无法保存容器标识；release 时请传 --container %s: %v", container, err),
+			)
 		}
 	}
-	fmt.Fprintf(a.out, "\n✓ 沙盒已创建，PID %d 独占设备。释放: neu-sbox release %s\n", shellPID, response.SandboxName)
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	devices := "无"
+	if len(response.Devices) > 0 {
+		devices = strings.Join(response.Devices, ",")
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 沙盒已创建")
+	fmt.Fprintf(a.out, "    sandbox: %s\n", response.SandboxName)
+	fmt.Fprintf(a.out, "    pid: %d\n", shellPID)
+	fmt.Fprintf(a.out, "    devices: %s\n", devices)
+	if container != "" {
+		fmt.Fprintf(a.out, "    container: %s\n", container)
+	}
+	fmt.Fprintf(a.out, "    release: neu-sbox release %s\n", response.SandboxName)
 	return 0
 }
 
@@ -378,13 +520,11 @@ func (a *app) runRelease(args []string) int {
 		if saved, err := a.savedContainer(sandboxName); err == nil {
 			container = saved
 		} else if !errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintf(a.errOut, "警告: 无法读取保存的容器标识: %v\n", err)
+			a.printWarning("container_state_read_failed", fmt.Sprintf("无法读取保存的容器标识: %v", err))
 		}
 	}
 	if a.insideContainer() && container == "" {
-		fmt.Fprintln(a.errOut, "无法确定当前容器；请传 --container NAME 或设置 NEU_BOX_CONTAINER")
-		fmt.Fprintln(a.errOut, "为避免销毁 sandbox 时连当前终端一起杀掉，本次未释放。")
-		return 2
+		return a.usageError("无法确定当前容器；请传 --container NAME 或设置 NEU_BOX_CONTAINER。为避免销毁当前终端，本次未释放")
 	}
 
 	payload := map[string]any{"sandbox_name": sandboxName}
@@ -393,20 +533,22 @@ func (a *app) runRelease(args []string) int {
 		payload["pid"] = a.getPPID()
 		payload["client_pid"] = a.getPID()
 	}
-	fmt.Fprintf(a.out, "[neu-sbox] 释放沙盒: %s...\n", sandboxName)
 	status, raw, err := a.api.request(http.MethodPost, "/sandbox/release", nil, payload)
 	if err != nil {
 		return a.requestError(err)
 	}
-	_ = printJSON(a.out, raw)
 	if err := responseError(status, raw); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
 	if err := a.forgetContainer(sandboxName); err != nil {
-		fmt.Fprintf(a.errOut, "警告: 无法删除容器状态文件: %v\n", err)
+		a.printWarning("container_state_delete_failed", fmt.Sprintf("无法删除容器状态文件: %v", err))
 	}
-	fmt.Fprintln(a.out, "\n✓ 沙盒已释放")
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 沙盒已释放")
+	fmt.Fprintf(a.out, "    sandbox: %s\n", sandboxName)
 	return 0
 }
 
@@ -427,23 +569,24 @@ func (a *app) runList(args []string) int {
 	if len(args) != 0 {
 		return a.usageError("用法: neu-sbox list")
 	}
-	fmt.Fprintln(a.out, "[neu-sbox] 所有沙盒:")
 	status, raw, err := a.api.request(http.MethodGet, "/sandbox/list", nil, nil)
 	if err != nil {
 		return a.requestError(err)
 	}
 	if err := responseError(status, raw); err != nil {
-		_ = printJSON(a.errOut, raw)
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
 	var response sandboxListResponse
 	if err := decodeJSON(raw, &response); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.internalError("invalid_worker_response", err)
 	}
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 沙盒列表")
 	if len(response.Sandboxes) == 0 {
-		fmt.Fprintln(a.out, "  (无)")
+		fmt.Fprintln(a.out, "    (无)")
 		return 0
 	}
 	for _, sandbox := range response.Sandboxes {
@@ -466,8 +609,8 @@ func (a *app) runList(args []string) int {
 		if len(resources) > 0 {
 			resourceText = strings.Join(resources, " ")
 		}
-		fmt.Fprintf(a.out, "  %s\n", sandbox.Name)
-		fmt.Fprintf(a.out, "    用户: %s  |  设备: %s  |  %s\n", owner, devices, resourceText)
+		fmt.Fprintf(a.out, "    %s\n", sandbox.Name)
+		fmt.Fprintf(a.out, "        用户: %s  |  设备: %s  |  %s\n", owner, devices, resourceText)
 	}
 	return 0
 }
@@ -488,41 +631,71 @@ func (a *app) runStatus(args []string) int {
 			return a.requestError(err)
 		}
 		if err := responseError(status, raw); err != nil {
-			_ = printJSON(a.errOut, raw)
-			fmt.Fprintln(a.errOut, err)
-			return 1
+			return a.workerFailure(status, raw)
 		}
 		var response sandboxListResponse
 		if err := decodeJSON(raw, &response); err != nil {
-			fmt.Fprintln(a.errOut, err)
-			return 1
+			return a.internalError("invalid_worker_response", err)
 		}
-		fmt.Fprintf(a.out, "[neu-sbox] Shell PID=%d container=%s\n", shellPID, a.config.container)
-		if response.CurrentSandbox == nil || *response.CurrentSandbox == "" {
-			fmt.Fprintln(a.out, "  未在任何沙盒中")
-		} else {
-			fmt.Fprintf(a.out, "  %s\n", *response.CurrentSandbox)
+		sandboxName := ""
+		if response.CurrentSandbox != nil {
+			sandboxName = *response.CurrentSandbox
 		}
-		return 0
+		return a.printShellStatus(shellPID, a.config.container, sandboxName)
 	}
 
-	fmt.Fprintf(a.out, "[neu-sbox] Shell PID=%d\n", shellPID)
 	raw, err := a.readFile(fmt.Sprintf("/proc/%d/cgroup", shellPID))
 	if err != nil {
-		fmt.Fprintln(a.errOut, "  无法读取 cgroup 信息")
-		return 1
+		return a.internalError("cgroup_read_failed", errors.New("无法读取 cgroup 信息"))
 	}
-	found := false
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if strings.Contains(line, "sandbox_") {
-			fmt.Fprintln(a.out, line)
-			found = true
+	return a.printShellStatus(shellPID, "", sandboxNameFromCgroup(raw))
+}
+
+func (a *app) printShellStatus(shellPID int, container, sandboxName string) int {
+	if a.jsonOutput {
+		var containerValue any
+		if container != "" {
+			containerValue = container
 		}
+		var sandboxValue any
+		if sandboxName != "" {
+			sandboxValue = sandboxName
+		}
+		_ = printJSONValue(a.out, map[string]any{
+			"container": containerValue,
+			"pid":       shellPID,
+			"sandbox":   sandboxValue,
+		})
+		return 0
 	}
-	if !found {
-		fmt.Fprintln(a.out, "  未在任何沙盒中")
+	fmt.Fprintln(a.out, "[neu-sbox] Shell 状态")
+	fmt.Fprintf(a.out, "    pid: %d\n", shellPID)
+	if container != "" {
+		fmt.Fprintf(a.out, "    container: %s\n", container)
+	}
+	if sandboxName == "" {
+		fmt.Fprintln(a.out, "    sandbox: none")
+	} else {
+		fmt.Fprintf(a.out, "    sandbox: %s\n", sandboxName)
 	}
 	return 0
+}
+
+func sandboxNameFromCgroup(raw []byte) string {
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		marker := strings.Index(line, "sandbox_")
+		if marker < 0 {
+			continue
+		}
+		name := line[marker+len("sandbox_"):]
+		if separator := strings.IndexRune(name, '/'); separator >= 0 {
+			name = name[:separator]
+		}
+		if name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 func (a *app) runJoin(args []string) int {
@@ -539,34 +712,66 @@ func (a *app) runJoin(args []string) int {
 		"pid":          shellPID,
 		"sandbox_name": sandboxName,
 	}
-	fmt.Fprintf(a.out, "[neu-sbox] 加入沙盒: %s\n", sandboxName)
-	fmt.Fprintf(a.out, "[neu-sbox] PID=%d user=%s\n", shellPID, a.config.username)
 	status, raw, err := a.api.request(http.MethodPost, "/sandbox/join", nil, payload)
 	if err != nil {
 		return a.requestError(err)
 	}
-	_ = printJSON(a.out, raw)
 	if err := responseError(status, raw); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
-	fmt.Fprintf(a.out, "\n✓ 已加入沙盒 %s\n", sandboxName)
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 已加入沙盒")
+	fmt.Fprintf(a.out, "    sandbox: %s\n", sandboxName)
+	fmt.Fprintf(a.out, "    pid: %d\n", shellPID)
 	return 0
+}
+
+type taskQueueResponse struct {
+	Queue        []taskResultResponse `json:"queue"`
+	TotalPending int                  `json:"total_pending"`
 }
 
 func (a *app) runTasks(args []string) int {
 	if len(args) != 0 {
 		return a.usageError("用法: neu-sbox tasks")
 	}
-	fmt.Fprintln(a.out, "[neu-sbox] 任务队列:")
 	status, raw, err := a.api.request(http.MethodGet, "/command/queue", nil, nil)
 	if err != nil {
 		return a.requestError(err)
 	}
-	_ = printJSON(a.out, raw)
 	if err := responseError(status, raw); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
+	}
+	var response taskQueueResponse
+	if err := decodeJSON(raw, &response); err != nil {
+		return a.internalError("invalid_worker_response", err)
+	}
+	if a.jsonOutput {
+		_ = printJSON(a.out, raw)
+		return 0
+	}
+	fmt.Fprintln(a.out, "[neu-sbox] 任务列表")
+	fmt.Fprintf(a.out, "    total: %d\n", len(response.Queue))
+	fmt.Fprintf(a.out, "    pending: %d\n", response.TotalPending)
+	if len(response.Queue) == 0 {
+		fmt.Fprintln(a.out, "    (无)")
+		return 0
+	}
+	for _, task := range response.Queue {
+		fmt.Fprintln(a.out)
+		fmt.Fprintf(a.out, "    %s\n", task.TaskID)
+		fmt.Fprintf(a.out, "        status: %s\n", task.Status)
+		fmt.Fprintf(a.out, "        user: %s\n", task.UserID)
+		fmt.Fprintf(a.out, "        command: %s\n", task.Command)
+		if task.Status == "queued" && task.Position > 0 {
+			fmt.Fprintf(a.out, "        position: #%d\n", task.Position)
+		}
+		if resources := taskResourceText(task); resources != "" {
+			fmt.Fprintf(a.out, "        resources: %s\n", resources)
+		}
 	}
 	return 0
 }
@@ -574,6 +779,7 @@ func (a *app) runTasks(args []string) int {
 type taskResult struct {
 	ReturnCode *int `json:"returncode"`
 	TimedOut   bool `json:"timed_out"`
+	Error      any  `json:"error"`
 }
 
 type taskResultResponse struct {
@@ -581,6 +787,7 @@ type taskResultResponse struct {
 	UserID     string      `json:"user_id"`
 	Command    string      `json:"command"`
 	Status     string      `json:"status"`
+	Position   int         `json:"position"`
 	CPU        int         `json:"cpu"`
 	Mem        string      `json:"mem"`
 	DeviceNum  int         `json:"device_num"`
@@ -601,14 +808,11 @@ func (a *app) runResult(args []string) int {
 		return a.requestError(err)
 	}
 	if err := responseError(status, raw); err != nil {
-		_ = printJSON(a.errOut, raw)
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.workerFailure(status, raw)
 	}
 	var response taskResultResponse
 	if err := decodeJSON(raw, &response); err != nil {
-		fmt.Fprintln(a.errOut, err)
-		return 1
+		return a.internalError("invalid_worker_response", err)
 	}
 
 	logStatus, logRaw, logErr := a.api.request(
@@ -617,13 +821,28 @@ func (a *app) runResult(args []string) int {
 		url.Values{"raw": []string{"1"}},
 		nil,
 	)
-	if logErr != nil || logStatus < 200 || logStatus >= 300 {
-		logRaw = nil
+	if logErr != nil {
+		return a.requestError(fmt.Errorf("获取任务日志: %w", logErr))
 	}
+	if err := responseError(logStatus, logRaw); err != nil {
+		return a.workerFailure(logStatus, logRaw)
+	}
+
+	if a.jsonOutput {
+		var output map[string]any
+		if err := decodeJSON(raw, &output); err != nil {
+			return a.internalError("invalid_worker_response", err)
+		}
+		output["log"] = string(logRaw)
+		_ = printJSONValue(a.out, output)
+		return 0
+	}
+
+	fmt.Fprintln(a.out, "[neu-sbox] 任务日志")
 	if len(logRaw) > 0 {
 		fmt.Fprintln(a.out, strings.TrimRight(string(logRaw), "\r\n"))
 	} else {
-		fmt.Fprintln(a.out, "(无输出)")
+		fmt.Fprintln(a.out, "    (暂无日志)")
 	}
 
 	icons := map[string]string{
@@ -636,30 +855,24 @@ func (a *app) runResult(args []string) int {
 	if icon == "" {
 		icon = "?"
 	}
-	var summary strings.Builder
-	fmt.Fprintf(&summary, "[%s %s]", icon, response.Status)
+	fmt.Fprintln(a.out)
+	fmt.Fprintln(a.out, "[neu-sbox] 任务结果")
+	fmt.Fprintf(a.out, "    ID=%s\n", response.TaskID)
+	fmt.Fprintf(a.out, "    status: [%s %s]\n", icon, response.Status)
 	if response.Result != nil && response.Result.ReturnCode != nil {
-		fmt.Fprintf(&summary, "  rc=%d", *response.Result.ReturnCode)
+		fmt.Fprintf(a.out, "    rc=%d\n", *response.Result.ReturnCode)
 		if response.Result.TimedOut {
-			summary.WriteString(" (超时)")
+			fmt.Fprintln(a.out, "    timed_out: true")
+		}
+		if response.Result.Error != nil {
+			fmt.Fprintf(a.out, "    error: %v\n", response.Result.Error)
 		}
 	}
-	fmt.Fprintf(&summary, "  |  %s  |  %s", response.UserID, response.Command)
-	resources := make([]string, 0, 2)
-	if response.CPU != 0 {
-		resources = append(resources, fmt.Sprintf("CPU=%d", response.CPU))
-	}
-	if response.Mem != "" && response.Mem != "0" {
-		resources = append(resources, "mem="+response.Mem)
-	}
-	if len(resources) > 0 {
-		fmt.Fprintf(&summary, "  |  %s", strings.Join(resources, "  "))
-	}
-	if response.DeviceNum != 0 {
-		fmt.Fprintf(&summary, "  |  设备=%d", response.DeviceNum)
-		if len(response.Devices) > 0 {
-			fmt.Fprintf(&summary, " (%s)", strings.Join(response.Devices, ","))
-		}
+	fmt.Fprintf(a.out, "    user: %s\n", response.UserID)
+	fmt.Fprintf(a.out, "    command: %s\n", response.Command)
+	resources := taskResourceText(response)
+	if resources != "" {
+		fmt.Fprintf(a.out, "    resources: %s\n", resources)
 	}
 	timestamp := response.FinishedAt
 	if timestamp == nil {
@@ -667,8 +880,25 @@ func (a *app) runResult(args []string) int {
 	}
 	if timestamp != nil {
 		formatted := time.Unix(int64(*timestamp), 0).Local().Format("01-02 15:04")
-		fmt.Fprintf(&summary, "  |  %s", formatted)
+		fmt.Fprintf(a.out, "    time: %s\n", formatted)
 	}
-	fmt.Fprintf(a.out, "\n%s\n", summary.String())
 	return 0
+}
+
+func taskResourceText(task taskResultResponse) string {
+	resources := make([]string, 0, 3)
+	if task.CPU != 0 {
+		resources = append(resources, fmt.Sprintf("CPU=%d", task.CPU))
+	}
+	if task.Mem != "" && task.Mem != "0" {
+		resources = append(resources, "mem="+task.Mem)
+	}
+	if task.DeviceNum != 0 {
+		devices := fmt.Sprintf("设备=%d", task.DeviceNum)
+		if len(task.Devices) > 0 {
+			devices += " (" + strings.Join(task.Devices, ",") + ")"
+		}
+		resources = append(resources, devices)
+	}
+	return strings.Join(resources, "  ")
 }

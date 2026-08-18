@@ -127,9 +127,12 @@ func TestReleaseUsesClientPIDAndSavedContainer(t *testing.T) {
 	}
 }
 
-func TestCommandAcquireBuildsDockerTarget(t *testing.T) {
+func TestSubmitBuildsDockerTarget(t *testing.T) {
 	var received commandRequest
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/command/run" {
+			t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+		}
 		decodeRequest(t, request, &received)
 		writeJSON(t, writer, http.StatusAccepted, map[string]any{
 			"task_id":  "abc123",
@@ -140,15 +143,16 @@ func TestCommandAcquireBuildsDockerTarget(t *testing.T) {
 
 	application, out, errOut := testApplication(server.URL, t.TempDir())
 	code := application.run([]string{
-		"acquire",
-		"--devices", "1,3",
+		"submit",
+		"--device", "1",
+		"--device", "3",
 		"--cpu", "4",
 		"--mem", "8",
 		"--container", "training-01",
 		"--workdir", "/workspace",
 		"--container-user", "root",
 		"--env", "MODE=perf",
-		"--command", "python train.py",
+		"--", "python", "train.py",
 	})
 
 	if code != 0 {
@@ -156,6 +160,9 @@ func TestCommandAcquireBuildsDockerTarget(t *testing.T) {
 	}
 	if received.DeviceNum != 0 || len(received.DeviceIDs) != 2 || received.Target == nil {
 		t.Fatalf("unexpected request: %+v", received)
+	}
+	if received.Command != "python train.py" {
+		t.Fatalf("unexpected command: %q", received.Command)
 	}
 	if received.Target.Container != "training-01" || received.Target.Env["MODE"] != "perf" {
 		t.Fatalf("unexpected target: %+v", received.Target)
@@ -165,6 +172,41 @@ func TestCommandAcquireBuildsDockerTarget(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "ID=abc123") {
 		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestAcquireRejectsCommandMode(t *testing.T) {
+	application, _, errOut := testApplication("http://127.0.0.1:1", t.TempDir())
+	code := application.run([]string{"acquire", "--command", "echo ok"})
+	if code != 2 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(errOut.String(), "已移至 submit") {
+		t.Fatalf("unexpected stderr: %s", errOut.String())
+	}
+}
+
+func TestSubmitRequiresCommandSeparator(t *testing.T) {
+	application, _, errOut := testApplication("http://127.0.0.1:1", t.TempDir())
+	code := application.run([]string{"submit", "--device-num", "1", "echo ok"})
+	if code != 2 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(errOut.String(), "命令必须放在 -- 后") {
+		t.Fatalf("unexpected stderr: %s", errOut.String())
+	}
+}
+
+func TestSubmitRejectsDeviceNumberWithExplicitDevice(t *testing.T) {
+	application, _, errOut := testApplication("http://127.0.0.1:1", t.TempDir())
+	code := application.run([]string{
+		"submit", "--device-num", "1", "--device", "3", "--", "echo", "ok",
+	})
+	if code != 2 {
+		t.Fatalf("exit=%d", code)
+	}
+	if !strings.Contains(errOut.String(), "互斥") {
+		t.Fatalf("unexpected stderr: %s", errOut.String())
 	}
 }
 
@@ -192,18 +234,19 @@ func TestContainerStatusQueriesParentPID(t *testing.T) {
 }
 
 func TestHostStatusReadsProcWithoutExternalCommands(t *testing.T) {
+	const sandboxName = "sbx_yuxd_43210.slice"
 	application, out, errOut := testApplication("http://127.0.0.1:1", t.TempDir())
 	application.readFile = func(path string) ([]byte, error) {
 		if path != "/proc/111/cgroup" {
 			t.Fatalf("unexpected path: %s", path)
 		}
-		return []byte("0::/sandbox_sbx_yuxd_43210.slice\n"), nil
+		return []byte("0::/sandbox_" + sandboxName + "\n"), nil
 	}
 	code := application.run([]string{"status"})
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "sandbox_sbx_yuxd_43210.slice") {
+	if !strings.Contains(out.String(), "sandbox: "+sandboxName) {
 		t.Fatalf("unexpected output: %s", out.String())
 	}
 }
@@ -235,6 +278,24 @@ func TestAcquireRejectsUnknownOptionBeforeHTTP(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "未知 acquire 选项") {
 		t.Fatalf("unexpected stderr: %s", errOut.String())
+	}
+}
+
+func TestHelpUsesReadableIndentation(t *testing.T) {
+	application, out, errOut := testApplication("http://127.0.0.1:1", t.TempDir())
+	code := application.run([]string{"--help"})
+	if code != 0 || errOut.Len() != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	for _, expected := range []string{
+		"\n    neu-sbox acquire",
+		"\n    --device ID",
+		"\n    list ",
+		"\n    NEU_BOX_URL",
+	} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatalf("missing %q in help:\n%s", expected, out.String())
+		}
 	}
 }
 
