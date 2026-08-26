@@ -1,6 +1,6 @@
 [submodule "webui"]
-	path = webui
-	url = /home/pengyt/projects/neu_box_webui
+	path = thirds/webui
+	url = https://github.com/neusbox/neu_box_webui.git
 [submodule "goClient"]
-	path = goClient
-	url = /home/pengyt/projects/neu_box_goClient
+	path = thirds/goClient
+	url = https://github.com/neusbox/neu_box_goClient.git
