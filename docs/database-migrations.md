@@ -38,14 +38,18 @@ CREATE TABLE schema_migrations (
 ```
 
 ```sql
-ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0 CHECK (priority >= 0);
 CREATE INDEX idx_tasks_priority ON tasks(priority);
 ```
+
+`0003_tighten_task_priority.sql` 收紧 priority 到 0..1。SQLite 无法给已有列追加
+CHECK 约束，所以采用 暂存数据 → 删索引 → 删列 → 以新 CHECK 重新加列 → 回填
+（历史值 >1 钳制为 1）→ 重建索引 的方式完成。
 
 必须解析 JSON 或执行复杂数据转换时，可以使用 Python：
 
 ```text
-0003_normalize_task_target.py
+0004_normalize_task_target.py
 ```
 
 ```python
@@ -70,6 +74,9 @@ def upgrade(conn):
 
 1. 在对应角色的 `migrations/` 增加下一个连续版本文件；
 2. 更新数据库模块中的 `REQUIRED_COLUMNS` / `REQUIRED_INDEXES`，让启动和 `db check` 能发现实际 schema 损坏；
+   例外：迁移只是**新增**列或索引时，不要把它们加入必需集合——旧库 baseline
+   接管的校验发生在新迁移执行**之前**，要求新字段会让所有存量旧库被拒绝接管。
+   迁移本身会给所有库（含 legacy）补齐对象，代价只是启动校验发现不了该对象丢失；
 3. 更新 CRUD 代码；
 4. 增加迁移测试，至少覆盖新库和上一版本数据库升级，并验证数据保留；
 5. 运行单元测试；

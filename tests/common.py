@@ -1,27 +1,35 @@
 """测试共用模块 — HTTP 请求、断言、框架。"""
 
+import http.cookiejar
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
 
-MASTER = "http://202.199.13.164:25565"
+MASTER = os.environ.get("NEU_BOX_TEST_MASTER", "http://219.216.64.157:25565")
 
 _passed = 0
 _failed = 0
+
+# 会话（master 启用了登录鉴权，登录态通过 Cookie 保持）
+_cookie_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_cookie_jar))
+_login_attempted = False
 
 
 # ═══════════════════════════════════════════════════════════════
 # HTTP helpers
 # ═══════════════════════════════════════════════════════════════
 
-def _req(method, path, body=None, timeout=15):
+def _raw_req(method, path, body=None, timeout=15):
     url = f"{MASTER}{path}"
-    data_bytes = json.dumps(body).encode() if body else None
+    data_bytes = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data_bytes, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
@@ -32,6 +40,28 @@ def _req(method, path, body=None, timeout=15):
             return e.code, {"error": raw.decode(errors='replace')[:200] if raw else f"HTTP {e.code}"}
     except Exception as e:
         return 0, {"error": str(e)}
+
+
+def _login_once():
+    global _login_attempted
+    if _login_attempted:
+        return
+    _login_attempted = True
+    user = os.environ.get("NEU_BOX_TEST_USER", "admin")
+    pw = os.environ.get("NEU_BOX_TEST_PASS", "")
+    status, d = _raw_req("POST", "/auth/login",
+                         {"username": user, "password": pw})
+    if status != 200:
+        raise AssertionError(
+            f"登录失败: HTTP {status} {d}（请设置 NEU_BOX_TEST_PASS）")
+
+
+def _req(method, path, body=None, timeout=15):
+    status, d = _raw_req(method, path, body, timeout)
+    if status == 401 and d.get("error") == "请先登录":
+        _login_once()
+        status, d = _raw_req(method, path, body, timeout)
+    return status, d
 
 
 def get(path, timeout=10):

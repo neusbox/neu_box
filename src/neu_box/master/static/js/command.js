@@ -60,6 +60,7 @@ function renderQueue(data) {
         mem: task.mem || '0',
         device_num: task.device_num || 0,
         est_time: task.est_time || 0,
+        priority: task.priority || 0,
       };
     }
 
@@ -205,6 +206,7 @@ async function rerunTask(taskId) {
     memory:     result.memory,
     mem_unit:   'GB',
     device_num: result.device_num,
+    priority:   meta.priority || 0,
   };
 
   try {
@@ -364,6 +366,9 @@ function _renderMeta(task) {
   m += `<strong>创建时间:</strong> ${formatTime(task.created_at)}<br>`;
   if (task.est_time > 0) {
     m += `<strong>预估耗时:</strong> ${task.est_time} 分钟<br>`;
+  }
+  if (task.priority > 0) {
+    m += `<strong>优先级:</strong> ${task.priority}（赶论文）<br>`;
   }
   m += `<strong>状态:</strong> ${statusLabel(task.status)}`;
   if (task.result) {
@@ -552,6 +557,7 @@ async function submitCommand() {
     device_num: state.device_ids.length > 0 ? 0 : state.device_num,
     device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
     est_time:   estTime,
+    priority:   parseInt(cmdPriorityEl.value, 10) || 0,
     target,
   };
 
@@ -628,6 +634,7 @@ batchBtn.addEventListener('click', async () => {
       device_num: state.device_ids.length > 0 ? 0 : state.device_num,
       device_ids: state.device_ids.length > 0 ? state.device_ids.map(String) : undefined,
       est_time:   parseInt(cmdEstTimeEl.value, 10) || 0,
+      priority:   parseInt(cmdPriorityEl.value, 10) || 0,
       target,
     };
     try {

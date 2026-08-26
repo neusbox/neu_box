@@ -39,6 +39,7 @@ def run():
         'device_ids': data.get('device_ids'),
         'est_time': data.get('est_time', 0),
         'target': data.get('target'),
+        'priority': data.get('priority', 0),
     }
 
     try:

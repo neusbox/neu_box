@@ -439,6 +439,49 @@ body {
   margin-top: 2px;
 }
 
+/* 活跃沙盒列表（节点详情面板） */
+.sandbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.sandbox-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  color: var(--text);
+}
+.sandbox-tag {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  border: 1px solid var(--border);
+  color: var(--sub);
+}
+.sandbox-tag.terminal {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.sandbox-owner {
+  font-weight: 600;
+}
+.sandbox-devs {
+  color: var(--accent);
+}
+.sandbox-time {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--sub);
+}
+
 /* ── Stepper ───────────────────────────────────────────────── */
 
 .stepper {

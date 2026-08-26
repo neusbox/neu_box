@@ -38,6 +38,7 @@ const commandFields     = document.getElementById('commandFields');
 const cmdUserIdEl       = document.getElementById('cmdUserId');
 const cmdInputEl        = document.getElementById('cmdInput');
 const cmdEstTimeEl      = document.getElementById('cmdEstTime');
+const cmdPriorityEl     = document.getElementById('cmdPriority');
 const cmdTargetTypeEl   = document.getElementById('cmdTargetType');
 const dockerTargetFields = document.getElementById('dockerTargetFields');
 const cmdContainerEl    = document.getElementById('cmdContainer');
@@ -53,6 +54,8 @@ const queueBatchDeleteBtn = document.getElementById('queueBatchDeleteBtn');
 const queueUserFilter    = document.getElementById('queueUserFilter');
 const devicePicker       = document.getElementById('devicePicker');
 const devicePickerField  = document.getElementById('devicePickerField');
+const sandboxPanelField  = document.getElementById('sandboxPanelField');
+const sandboxList        = document.getElementById('sandboxList');
 
 // Experiment (shared refs)
 const logActions        = document.getElementById('logActions');
@@ -315,6 +318,7 @@ function selectNode(nodeId, nodes) {
   const node = nodes.find(n => n.node_id === nodeId);
   renderDevicePicker(node ? node.dev_status : {});
   fetchQueue();
+  fetchNodeSandboxes();
   // 自动填入凭据
   autoFillCredentials();
 }
@@ -356,6 +360,7 @@ async function fetchNodes() {
     updateSubmitBtn();
     if (state.selectedNodeId) {
       fetchQueue();
+      fetchNodeSandboxes();
     }
 
   } catch (err) {
@@ -367,6 +372,41 @@ async function fetchNodes() {
     nodeCount.textContent = '加载失败';
     showToast('节点列表加载失败: ' + err.message, 'error');
     submitBtn.disabled = true;
+  }
+}
+
+// ── 活跃沙盒列表（终端 acquire + 命令任务沙盒） ────────────────
+
+async function fetchNodeSandboxes() {
+  if (!state.selectedNodeId) {
+    sandboxPanelField.style.display = 'none';
+    return;
+  }
+  try {
+    const resp = await fetch(`/nodes/${state.selectedNodeId}/sandboxes`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const sandboxes = data.sandboxes || [];
+    if (sandboxes.length === 0) {
+      sandboxPanelField.style.display = 'none';
+      return;
+    }
+    sandboxPanelField.style.display = '';
+    sandboxList.innerHTML = sandboxes.map(s => {
+      // sbx_{owner}_{id}.slice：id 以 task_ 开头 → 任务沙盒；纯数字 PID → 终端沙盒
+      const rest = (s.name || '').replace(/^sbx_[^_]+_/, '').replace(/\.slice$/, '');
+      const isTask = rest.startsWith('task_');
+      const devs = (s.devices || []).map(d => String(d).split(':')[1]);
+      const devText = devs.length ? `卡 ${devs.join(', ')}` : '无设备';
+      return `<div class="sandbox-item" title="${escapeHtml(s.name)}">
+        <span class="sandbox-tag ${isTask ? '' : 'terminal'}">${isTask ? '任务' : '终端'}</span>
+        <span class="sandbox-owner">${escapeHtml(s.owner || '?')}</span>
+        <span class="sandbox-devs">${escapeHtml(devText)}</span>
+        <span class="sandbox-time">${formatTime(s.created_at)}</span>
+      </div>`;
+    }).join('');
+  } catch {
+    sandboxPanelField.style.display = 'none';
   }
 }
 

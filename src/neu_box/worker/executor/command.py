@@ -13,6 +13,7 @@ import logging
 import os
 import pwd
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
@@ -290,7 +291,12 @@ from neu_box.worker.executor.db import Database
 
 
 class TaskQueue:
-    """每个 Worker 一个 FIFO 命令队列。"""
+    """每个 Worker 一个命令队列。
+
+    单队列，出队顺序为 优先级 DESC → created_at ASC（FIFO）：
+    priority 数字越大越先执行（当前 0=普通，1=赶论文），
+    同优先级内按提交时间先到先执行。
+    """
 
     _instance = None
 
@@ -351,6 +357,7 @@ class TaskQueue:
                         'type': TARGET_HOST,
                     },
                     'est_time': task.get('est_time', 0),
+                    'priority': task.get('priority', 0) or 0,
                     'devices': [],
                     'status': 'queued',
                     'position': 0,
@@ -374,6 +381,7 @@ class TaskQueue:
         device_ids: list | None = None,
         target: dict | None = None,
         est_time: int = 0,
+        priority: int = 0,
     ) -> str:
         """提交任务到队列。device_ids 指定设备时优先于 device_num 自动分配。"""
         task_id = uuid.uuid4().hex[:12]
@@ -390,6 +398,7 @@ class TaskQueue:
             device_ids=device_ids,
             target=target,
             est_time=est_time,
+            priority=priority,
         )
         task = {
             'task_id': task_id,
@@ -401,6 +410,7 @@ class TaskQueue:
             'device_ids': device_ids,
             'target': target,
             'est_time': est_time,
+            'priority': priority,
             'devices': [],
             'status': 'queued',
             'position': 0,
@@ -414,9 +424,10 @@ class TaskQueue:
             self._reindex()
             self._cv.notify()
         logger.info(
-            '任务入队: %s user=%s cmd=%s...',
+            '任务入队: %s user=%s priority=%s cmd=%s...',
             task_id,
             user_id,
+            priority,
             command[:60],
         )
         return task_id
@@ -489,8 +500,25 @@ class TaskQueue:
         }
         return public
 
+    @staticmethod
+    def _sort_key(task: dict):
+        """队列排序键：优先级 DESC，同级按创建时间 ASC（FIFO），task_id 兜底。"""
+        return (
+            -(task.get('priority', 0) or 0),
+            task.get('created_at') or 0.0,
+            task['task_id'],
+        )
+
+    def _head_task_id(self) -> str | None:
+        """返回当前队首 task_id（持锁调用）。空队列返回 None。"""
+        if not self._pending:
+            return None
+        return min(self._pending, key=lambda tid: self._sort_key(self._pending[tid]))
+
     def _reindex(self):
-        task_ids = list(self._pending)
+        task_ids = sorted(
+            self._pending, key=lambda tid: self._sort_key(self._pending[tid])
+        )
         for position, task_id in enumerate(task_ids, start=1):
             self._pending[task_id]['position'] = position
         if task_ids:
@@ -508,6 +536,7 @@ class TaskQueue:
             'command': task['command'],
             'status': task['status'],
             'position': task.get('position', 0),
+            'priority': task.get('priority', 0) or 0,
             'cpu': task.get('cpu', 0),
             'est_time': task.get('est_time', 0) or 0,
             'eta': eta,  # 预估等待时间（分钟），仅 queued 任务有值
@@ -633,7 +662,7 @@ class TaskQueue:
                     if not self._pending:
                         self._cv.wait(timeout=5)
                         continue
-                    task_id = next(iter(self._pending))
+                    task_id = self._head_task_id()
                     candidate = dict(self._pending[task_id])
 
                 allocated = sbx.allocate_sandbox(
@@ -652,10 +681,7 @@ class TaskQueue:
 
                 stale = False
                 with self._lock:
-                    if (
-                        task_id not in self._pending
-                        or next(iter(self._pending), None) != task_id
-                    ):
+                    if self._head_task_id() != task_id:
                         stale = True
                     else:
                         task = self._pending.pop(task_id)
@@ -785,21 +811,27 @@ def run_command():
     if not isinstance(est_time, int) or est_time < 0:
         est_time = 0
 
-    task_id = TaskQueue.get_instance().submit(
-        user_id=user_id,
-        command=command,
-        cpu=cpu,
-        mem=sandbox_mem,
-        device_num=0 if normalized_ids else device_num,
-        device_ids=normalized_ids,
-        target=target,
-        est_time=est_time,
-    )
+    try:
+        task_id = TaskQueue.get_instance().submit(
+            user_id=user_id,
+            command=command,
+            cpu=cpu,
+            mem=sandbox_mem,
+            device_num=0 if normalized_ids else device_num,
+            device_ids=normalized_ids,
+            target=target,
+            est_time=est_time,
+            priority=body.get('priority', 0),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        # 数据层校验失败（如非法 priority）由 Database 层向上抛出
+        return {'error': str(exc)}, 400
     task = Database.get_instance().get_task(task_id)
     position = task['position'] if task else 0
     return {
         'task_id': task_id,
         'position': position,
+        'priority': task['priority'] if task else 0,
         'target': public_execution_target(target),
         'message': f'任务已提交，队列位置 #{position}',
     }, 202

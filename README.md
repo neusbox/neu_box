@@ -37,9 +37,9 @@ Master 和 Worker 发布程序包含 Python 解释器及 Python 依赖，目标�
 ```bash
 # 校验并解压；版本和架构以实际产物为准
 cd dist
-sha256sum -c neu-box-0.1.2-linux-arm64.tar.gz.sha256
-tar -xzf neu-box-0.1.2-linux-arm64.tar.gz
-cd neu-box-0.1.2-linux-arm64
+sha256sum -c neu-box-0.2.2-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.2.2-linux-arm64.tar.gz
+cd neu-box-0.2.2-linux-arm64
 
 # 计算节点安装 Worker；默认安装后立即启动
 sudo ./neu-box-install install --role worker
@@ -110,6 +110,7 @@ neu-sbox release <name>         # 释放指定沙盒
 # ── 命令任务（一次性执行，类似前端命令模式） ──
 neu-sbox acquire 1 2 4 "npu-smi info"     # 1 NPU + 2 核 + 4G 执行 Host 命令
 neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
+neu-sbox acquire --device-num 1 --priority 1 --command "python train.py"  # 赶论文（优先级 1，先于普通任务）
 neu-sbox tasks                              # 查看任务队列
 neu-sbox result <task_id>                   # 查看任务结果和日志
 

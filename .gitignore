@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 *.o
 *.db
+*.db-shm
+*.db-wal
 .venv/
 build/
 dist/
@@ -14,3 +16,4 @@ dist/
 nohup.out
 config.json
 tmp/
+*.png

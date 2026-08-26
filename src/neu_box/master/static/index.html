@@ -87,6 +87,12 @@
         <div class="device-picker" id="devicePicker"></div>
       </div>
 
+      <!-- 活跃沙盒（终端 acquire + 命令任务） -->
+      <div class="field" id="sandboxPanelField" style="display:none">
+        <label>活跃沙盒 <span class="unit">当前节点的沙盒占用</span></label>
+        <div class="sandbox-list" id="sandboxList"></div>
+      </div>
+
       <!-- ── 命令模式字段 ── -->
       <div id="commandFields">
         <div class="field">
@@ -121,6 +127,13 @@
             <label>环境变量 <span class="unit">可选，每行 KEY=VALUE</span></label>
             <textarea class="text-input cmd-textarea" id="cmdEnv" placeholder="MODEL=resnet50" rows="3"></textarea>
           </div>
+        </div>
+        <div class="field">
+          <label>优先级 <span class="unit">数值越大越先执行</span></label>
+          <select class="text-input" id="cmdPriority">
+            <option value="0" selected>普通（0）</option>
+            <option value="1">赶论文（1）</option>
+          </select>
         </div>
         <div class="field">
           <label>预估耗时 <span class="unit">分钟，可选</span></label>

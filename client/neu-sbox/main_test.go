@@ -168,6 +168,53 @@ func TestCommandAcquireBuildsDockerTarget(t *testing.T) {
 	}
 }
 
+func TestCommandAcquirePriority(t *testing.T) {
+	var received commandRequest
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		decodeRequest(t, request, &received)
+		writeJSON(t, writer, http.StatusAccepted, map[string]any{
+			"task_id":  "abc123",
+			"position": 1,
+			"priority": 1,
+		})
+	}))
+	defer server.Close()
+
+	application, out, errOut := testApplication(server.URL, t.TempDir())
+	code := application.run([]string{
+		"acquire", "--device-num", "1", "--priority", "1", "--command", "echo hi",
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	if received.Priority != 1 {
+		t.Fatalf("unexpected priority: %+v", received)
+	}
+	if !strings.Contains(out.String(), "优先级: 1") {
+		t.Fatalf("missing priority notice: %s", out.String())
+	}
+
+	// 不带 --priority 时 priority 应为 0
+	received = commandRequest{}
+	code = application.run([]string{
+		"acquire", "--device-num", "1", "--command", "echo hi",
+	})
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	if received.Priority != 0 {
+		t.Fatalf("unexpected priority: %+v", received)
+	}
+
+	// 非法 priority（负数）在客户端被拒绝
+	code = application.run([]string{
+		"acquire", "--device-num", "1", "--priority", "-1", "--command", "echo hi",
+	})
+	if code == 0 {
+		t.Fatalf("negative priority should be rejected: %s", out.String())
+	}
+}
+
 func TestContainerStatusQueriesParentPID(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Query().Get("container") != "oprace" || request.URL.Query().Get("pid") != "111" {

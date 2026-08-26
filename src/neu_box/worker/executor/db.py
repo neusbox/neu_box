@@ -112,18 +112,23 @@ class Database:
                     cpu: int = 0, mem: str = "0", devices: list = None,
                     position: int = 0,
                     device_num: int = 0, device_ids: list = None,
-                    target: dict | None = None, est_time: int = 0):
+                    target: dict | None = None, est_time: int = 0,
+                    priority: int = 0):
+        if not isinstance(priority, int) or isinstance(priority, bool) \
+                or not 0 <= priority <= 1:
+            raise ValueError(
+                f'priority 只能是 0（普通）或 1（赶论文）: {priority!r}')
         conn = self._get_conn()
         target = dict(target or {'type': 'host'})
         conn.execute(
             'INSERT INTO tasks (task_id, user_id, command, status, position, '
             'cpu, mem, devices, created_at, device_num, device_ids, '
-            'target_spec, est_time) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'target_spec, est_time, priority) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (task_id, user_id, command, 'queued', position,
              cpu, mem, json.dumps(devices or []), time.time(), device_num,
              json.dumps(device_ids or []),
-             json.dumps(target, ensure_ascii=False), est_time))
+             json.dumps(target, ensure_ascii=False), est_time, priority))
         conn.commit()
 
     def update_task_status(self, task_id: str, status: str,
@@ -174,12 +179,15 @@ class Database:
         return self._row_to_dict(row) if row else None
 
     def get_queue_tasks(self) -> list[dict]:
-        """返回所有 queued + running 任务（按 position / 时间排序）。"""
+        """返回所有 queued + running 任务。
+
+        排队任务按 优先级 DESC, created_at ASC 排序（赶论文优先，同级 FIFO）。
+        """
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM tasks WHERE status IN ('queued','running') "
             "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, "
-            "position ASC, created_at ASC"
+            "priority DESC, created_at ASC, task_id ASC"
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 

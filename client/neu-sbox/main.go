@@ -158,6 +158,7 @@ acquire 选项:
   --cpu 4             CPU 核数，0 表示不限
   --mem 8             内存 GB，0 表示不限
   --pid 12345         指定 PID；默认使用启动客户端的当前 shell
+  --priority 1        队列优先级，数值越大越先执行；0=普通，1=赶论文
   --command "..."     提交一次性命令；不指定则管理当前终端
   --container NAME    容器终端身份；命令模式下表示执行目标
   --workdir PATH      已有容器命令的工作目录
@@ -177,6 +178,7 @@ acquire 选项:
   neu-sbox acquire --devices 1,3 --cpu 4 --mem 8
   neu-sbox acquire --container training-01 --device-num 1
   neu-sbox acquire --devices 1 --command "npu-smi info"
+  neu-sbox acquire --device-num 1 --priority 1 --command "python train.py"
   neu-sbox acquire --devices 1 --container training-01 --command "python train.py"
   neu-sbox release sbx_yuxd_12345.slice
 

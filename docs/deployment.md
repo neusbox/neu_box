@@ -178,6 +178,14 @@ sudo systemctl start neu-box-worker neu-box-master
 | `NEU_BOX_COMMAND_QUEUE_RECENT` | `200` | 状态接口返回的近期任务上限 |
 | `LOG_LEVEL` | `INFO` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
+### 设备分配与外部占用
+
+空闲设备 = 受管设备 − 沙盒已分配（worker DB）− 沙盒外占用（`NEU_BOX_DEVICE_INFO_SCRIPT` 实时查询）。外部占用检测**每次分配前**同步执行，因此 vLLM、docker 等沙盒外进程占用的卡不会被分配；沙盒内任务释放后设备立即回到空闲池。
+
+设备状态脚本查询失败/超时/返回 `total=0` 时，worker **沿用上一次成功查询的结果**（fail-closed），而不是视为"全部空闲"——否则系统高负载下 npu-smi 卡死时，所有外部占用的卡会被误判为空闲并重新分配，造成双占用。
+
+注意：外部进程与 neu-box 任务之间不存在内核级互斥，两者同时申请同一张卡时先到先得（例如任务分配后 vLLM 才 attach 到该卡）。共享节点上建议所有设备使用方都通过 neu-box 申请设备，使 worker 成为唯一的分配仲裁者。
+
 ## 从源码部署导入
 
 legacy 参数只允许在对应角色第一次 `install` 时使用，并且 `--role` 必须明确为一个角色。所有路径都必须是绝对路径。同一台机器原来同时运行 Master 和 Worker 时，先后执行两次带 `--no-start` 的单角色安装，分别导入各自数据，最后再统一启动新服务。
@@ -210,8 +218,8 @@ sudo ./neu-box-install install --role master --no-start \
 Worker 升级前应安排维护窗口，停止提交新任务并确认队列中没有必须保留的运行任务。安装器会停止服务，但不会替你等待业务任务排空。
 
 ```bash
-tar -xzf neu-box-0.2.0-linux-amd64.tar.gz
-cd neu-box-0.2.0-linux-amd64
+tar -xzf neu-box-0.2.2-linux-amd64.tar.gz
+cd neu-box-0.2.2-linux-amd64
 sudo ./neu-box-install upgrade --role worker
 ```
 

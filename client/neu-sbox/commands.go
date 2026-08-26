@@ -16,6 +16,7 @@ type acquireOptions struct {
 	deviceNum     int
 	cpu           int
 	memory        int
+	priority      int
 	pid           int
 	pidSet        bool
 	command       string
@@ -41,6 +42,7 @@ type commandRequest struct {
 	CPU       int            `json:"cpu"`
 	Memory    int            `json:"memory"`
 	MemUnit   string         `json:"mem_unit"`
+	Priority  int            `json:"priority"`
 	Target    *commandTarget `json:"target,omitempty"`
 }
 
@@ -64,6 +66,7 @@ type acquireResponse struct {
 type commandResponse struct {
 	TaskID   string `json:"task_id"`
 	Position int    `json:"position"`
+	Priority int    `json:"priority"`
 	Error    string `json:"error"`
 }
 
@@ -157,6 +160,15 @@ func parseAcquireOptions(args []string) (acquireOptions, error) {
 			options.container = strings.TrimSpace(raw)
 			if options.container == "" {
 				return options, errors.New("--container 不能为空")
+			}
+		case "--priority":
+			raw, err := value()
+			if err != nil {
+				return options, err
+			}
+			options.priority, err = nonNegativeInteger("--priority", raw)
+			if err != nil {
+				return options, err
 			}
 		case "--workdir":
 			raw, err := value()
@@ -258,6 +270,7 @@ func (a *app) runCommandAcquire(options acquireOptions) int {
 		CPU:       options.cpu,
 		Memory:    options.memory,
 		MemUnit:   "GB",
+		Priority:  options.priority,
 	}
 	if options.container != "" {
 		payload.Target = &commandTarget{
@@ -270,6 +283,9 @@ func (a *app) runCommandAcquire(options acquireOptions) int {
 	}
 
 	fmt.Fprintf(a.out, "[neu-sbox] 提交任务: device=%d cpu=%d mem=%dG\n", options.deviceNum, options.cpu, options.memory)
+	if options.priority > 0 {
+		fmt.Fprintf(a.out, "[neu-sbox] 优先级: %d（数值越大越靠前）\n", options.priority)
+	}
 	if len(options.deviceIDs) > 0 {
 		fmt.Fprintf(a.out, "[neu-sbox] 指定设备: %s\n", strings.Join(options.deviceIDs, ","))
 	}
@@ -296,7 +312,11 @@ func (a *app) runCommandAcquire(options acquireOptions) int {
 		fmt.Fprintln(a.errOut, err)
 		return 1
 	}
-	fmt.Fprintf(a.out, "\n✓ 任务已提交，ID=%s 队列位置 #%d\n", response.TaskID, response.Position)
+	positionNote := ""
+	if response.Priority > 0 {
+		positionNote = fmt.Sprintf("（priority=%d）", response.Priority)
+	}
+	fmt.Fprintf(a.out, "\n✓ 任务已提交，ID=%s 队列位置 #%d%s\n", response.TaskID, response.Position, positionNote)
 	fmt.Fprintf(a.out, "  查看日志: neu-sbox result %s\n", response.TaskID)
 	return 0
 }

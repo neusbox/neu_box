@@ -28,33 +28,43 @@ from neu_box.worker.executor.db import (
 
 
 @pytest.mark.parametrize(
-    ("package", "columns", "indexes"),
+    ("package", "columns", "indexes", "pending", "history"),
     [
-        (MASTER_MIGRATIONS, MASTER_COLUMNS, MASTER_INDEXES),
-        (WORKER_MIGRATIONS, WORKER_COLUMNS, WORKER_INDEXES),
+        (
+            MASTER_MIGRATIONS, MASTER_COLUMNS, MASTER_INDEXES,
+            (1,), [(1, "initial")],
+        ),
+        (
+            WORKER_MIGRATIONS, WORKER_COLUMNS, WORKER_INDEXES,
+            (1, 2, 3), [(1, "initial"), (2, "add_task_priority"),
+                        (3, "tighten_task_priority")],
+        ),
     ],
 )
-def test_fresh_database_migrates_to_current(tmp_path, package, columns, indexes):
+def test_fresh_database_migrates_to_current(
+    tmp_path, package, columns, indexes, pending, history,
+):
     database = tmp_path / "fresh.db"
 
     before = schema_status(database, package)
     assert before.state == "missing"
-    assert before.pending == (1,)
+    assert before.pending == pending
 
     after = migrate_database(database, package, columns, indexes)
 
     assert after.state == "current"
-    assert after.current == 1
+    assert after.current == history[-1][0]
     require_current_schema(database, package, columns, indexes)
     checked = check_database(database, package, columns, indexes)
     assert checked.state == "current"
 
     with sqlite3.connect(database) as conn:
-        row = conn.execute(
-            "SELECT version, name, checksum FROM schema_migrations"
-        ).fetchone()
-    assert row[0:2] == (1, "initial")
-    assert row[2].startswith("sha256:")
+        rows = conn.execute(
+            "SELECT version, name, checksum FROM schema_migrations "
+            "ORDER BY version"
+        ).fetchall()
+    assert [row[0:2] for row in rows] == history
+    assert all(row[2].startswith("sha256:") for row in rows)
 
 
 def test_known_existing_worker_database_is_baselined_without_data_loss(tmp_path):
@@ -93,11 +103,57 @@ def test_known_existing_worker_database_is_baselined_without_data_loss(tmp_path)
     )
 
     assert status.state == "current"
+    assert status.current == 3
     with sqlite3.connect(database) as conn:
         task = conn.execute(
-            "SELECT user_id, command FROM tasks WHERE task_id='keep-me'"
+            "SELECT user_id, command, priority FROM tasks "
+            "WHERE task_id='keep-me'"
         ).fetchone()
-    assert task == ("lab-user", "true")
+    # 旧数据保留，且 0002 给存量行补上 priority 默认值 0
+    assert task == ("lab-user", "true", 0)
+
+
+def test_tracked_worker_database_upgrades_from_v1_with_priority_backfill(tmp_path):
+    """已登记 schema v1 的 Worker 库升级到 v3：priority 列补 0，数据保留。"""
+    database = tmp_path / "worker-v1.db"
+    migrate_database(
+        database,
+        WORKER_MIGRATIONS,
+        WORKER_COLUMNS,
+        WORKER_INDEXES,
+    )
+    # 回滚到 v1 状态：模拟已部署的旧版本数据库
+    with sqlite3.connect(database) as conn:
+        conn.execute("DROP INDEX idx_tasks_priority")
+        conn.execute("ALTER TABLE tasks DROP COLUMN priority")
+        conn.execute("DELETE FROM schema_migrations WHERE version IN (2, 3)")
+        conn.execute(
+            "INSERT INTO tasks (task_id, user_id, command, status, "
+            "created_at, started_at) VALUES "
+            "('old-normal', 'lab-user', 'echo a', 'completed', 1, 1), "
+            "('old-rush', 'lab-user', 'echo b', 'queued', 2, NULL)"
+        )
+        conn.commit()
+
+    status = schema_status(database, WORKER_MIGRATIONS)
+    assert status.state == "pending"
+    assert status.current == 1
+    assert status.pending == (2, 3)
+
+    after = migrate_database(
+        database,
+        WORKER_MIGRATIONS,
+        WORKER_COLUMNS,
+        WORKER_INDEXES,
+    )
+    assert after.state == "current"
+    assert after.current == 3
+
+    with sqlite3.connect(database) as conn:
+        rows = conn.execute(
+            "SELECT task_id, priority FROM tasks ORDER BY task_id"
+        ).fetchall()
+    assert rows == [("old-normal", 0), ("old-rush", 0)]
 
 
 def test_unknown_existing_database_is_refused_without_mutation(tmp_path):

@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.1.2`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.2.2`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -86,6 +86,8 @@ curl --noproxy '*' -sS \
   "$WORKER/command/run"
 ```
 
+赶论文（高优先级）任务示例，加上 `"priority": 1` 即可。
+
 请求字段：
 
 | 字段 | 必填 | 默认值 | 含义 |
@@ -98,6 +100,7 @@ curl --noproxy '*' -sS \
 | `memory` | 否 | `0` | 内存数量，非负整数；`0` 表示不限制 |
 | `mem_unit` | 否 | `GB` | `GB` 或 `MB`，大小写不敏感 |
 | `est_time` | 否 | `0` | 预计运行分钟数，仅用于队列 ETA 展示，不是超时 |
+| `priority` | 否 | `0` | 队列优先级，取值 `0` 或 `1`（0=普通、1=赶论文）；数值越大越先执行（同级内按提交时间 FIFO）；超范围（<0、>1）或非整数由数据层拒绝，返回 400 |
 | `target` | 否 | `{"type":"host"}` | 执行目标，见“执行目标”一节 |
 
 成功响应：
@@ -110,6 +113,7 @@ HTTP/1.1 202 Accepted
 {
   "task_id": "7c65d5ac21f4",
   "position": 1,
+  "priority": 0,
   "target": {"type": "host"},
   "message": "任务已提交，队列位置 #1"
 }
@@ -198,6 +202,7 @@ curl --noproxy '*' -sS "$WORKER/command/queue"
       "command": "python train.py",
       "status": "queued",
       "position": 1,
+      "priority": 0,
       "cpu": 4,
       "est_time": 30,
       "eta": 0,
@@ -220,6 +225,10 @@ curl --noproxy '*' -sS "$WORKER/command/queue"
 `eta` 的单位是分钟，只在 queued 任务上计算；它是前方排队任务 `est_time` 的
 简单累加，不包含正在运行任务的剩余时间，因此只能用于展示，不能作为调度保证。
 
+排队顺序固定为 `priority` 降序 → `created_at` 升序：数值越大越先执行，
+当前 0=普通、1=赶论文，赶论文任务永远先于普通任务执行，同优先级内按
+提交时间 FIFO；`position` 是这一顺序下的全局排位。
+
 ### 查询单个任务
 
 ```http
@@ -240,6 +249,7 @@ curl --noproxy '*' -sS \
   "command": "python train.py",
   "status": "completed",
   "position": 1,
+  "priority": 0,
   "cpu": 4,
   "est_time": 30,
   "eta": null,
@@ -358,7 +368,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.1.2"}
+{"service":"neu-box-worker","version":"0.2.2"}
 ```
 
 ### 健康检查
@@ -371,7 +381,7 @@ GET /healthz
 {
   "status": "ok",
   "role": "worker",
-  "version": "0.1.2",
+  "version": "0.2.2",
   "schema_version": 1
 }
 ```

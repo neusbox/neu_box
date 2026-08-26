@@ -53,6 +53,11 @@ class SbxManager:
         # 线程安全
         self._lock = threading.RLock()
 
+        # 最近一次成功查到的外部占用设备集合；
+        # 设备状态脚本失败/超时/返回异常时沿用此值（fail-closed），
+        # 避免高负载下 npu-smi 卡死导致所有外部占用的卡被误判为空闲并重新分配。
+        self._last_external_busy: set = set()
+
         # 启动时恢复
         self._recover_on_startup()
 
@@ -115,27 +120,39 @@ class SbxManager:
         return allocated
 
     def _get_external_busy_devices(self) -> set[str]:
-        """调用配置的设备信息脚本，返回沙盒外已占用的设备。"""
+        """调用配置的设备信息脚本，返回沙盒外已占用的设备。
+
+        查询失败/超时/返回异常（如系统高负载下 npu-smi 卡死）时，
+        沿用上一次成功查询的结果（fail-closed），而不是返回空集——
+        返回空集会让所有外部占用的卡被误判为空闲并重新分配。
+        """
         managed = set(self._discover_device_nodes())
         path = env_text(
             "NEU_BOX_DEVICE_INFO_SCRIPT", legacy="dev_info_script_path"
         )
         if not path:
             logger.error('未配置 NEU_BOX_DEVICE_INFO_SCRIPT')
-            return set()
+            return set(self._last_external_busy)
         try:
             output = subprocess.check_output(
                 [path], timeout=10, stderr=subprocess.DEVNULL,
             )
             data = json.loads(output.decode())
-            busy_minors = {int(value) for value in data.get('busy_ids', [])}
+            # 有受管设备时脚本必须报出 total>0；否则视为查询失败（
+            # npu-smi 不可用时脚本会输出 {"total":0,...}）。
+            if not managed or int(data.get('total', 0)) > 0:
+                busy = {
+                    device for device in managed
+                    if int(device.split(':', 1)[1]) in {
+                        int(value) for value in data.get('busy_ids', [])
+                    }
+                }
+                self._last_external_busy = busy
+                return busy
+            logger.error('设备状态脚本返回 total=0，视为查询失败')
         except Exception as exc:
-            logger.error('设备状态脚本失败，忽略外部占用: %s', exc)
-            return set()
-        return {
-            device for device in managed
-            if int(device.split(':', 1)[1]) in busy_minors
-        }
+            logger.error('设备状态脚本失败: %s', exc)
+        return set(self._last_external_busy)
 
     def _list_sandbox_names(self) -> List[str]:
         """返回所有沙盒名称列表（兼容旧 SandboxDB.list_all 接口）。"""
