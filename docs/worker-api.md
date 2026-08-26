@@ -11,7 +11,7 @@ Neu Box `0.3.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/` | 查询服务名称和版本 |
-| `GET` | `/healthz` | 健康检查和数据库 schema 版本 |
+| `GET` | `/healthz` | 健康检查、API 版本和数据库 schema 版本 |
 | `GET` | `/status` | 查询 CPU、内存、设备和沙盒状态 |
 | `POST` | `/command/run` | 异步提交命令任务 |
 | `GET` | `/command/queue` | 查询队列和最近任务 |
@@ -28,7 +28,7 @@ Neu Box `0.3.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
 - Worker API 当前没有认证、签名和权限隔离，只能部署在可信内网。
 - Worker 服务以 root 运行。`user_id` 是任务的执行身份，不是认证凭据；调用方
   可以指定 Worker 宿主机上任意已存在的用户。
-- 直接调用 Worker 时不传 `node_id`。`node_id` 是 Master 转发请求时使用的字段，
+- 直接调用 Worker 时不传 `node_id`。`node_id` 是 WebUI 转发请求时使用的字段，
   不属于 Worker API。
 - 命令任务使用 `/command/*`，由 Worker 持久化并排队；终端沙盒使用
   `/sandbox/*`，立即申请资源，不进入任务队列。
@@ -389,8 +389,9 @@ GET /healthz
 {
   "status": "ok",
   "role": "worker",
-  "version": "0.2.2",
-  "schema_version": 1
+  "api_version": 1,
+  "version": "0.3.0",
+  "schema_version": 3
 }
 ```
 
@@ -412,7 +413,8 @@ GET /status
   "total_devices": 8,
   "idle_devices": 7,
   "dev_status": {"0": 1, "1": 0},
-  "active_sandboxes": 1
+  "active_sandboxes": 1,
+  "api_version": 1
 }
 ```
 
