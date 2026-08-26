@@ -74,7 +74,7 @@ neu-sbox release <sandbox_name>        # 释放
 neu-sbox check                         # worker 可达性 + API 版本兼容
 
 # 命令任务
-neu-sbox acquire --command "python train.py" --device-num 4 --priority 1
+neu-sbox submit --device-num 4 --priority 1 -- python train.py
 neu-sbox tasks                         # 队列
 neu-sbox result <task_id>              # 结果/日志
 ```

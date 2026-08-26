@@ -1252,7 +1252,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  neu-box-install install --role worker\n"
-            "  neu-box-install upgrade --role worker --source /tmp/neu-box-0.2.0\n"
+            "  neu-box-install upgrade --role worker --source /tmp/neu-box-0.3.0\n"
             "  neu-box-install rollback\n"
             "  neu-box-install status\n\n"
             "--root 和 --no-systemd 是发布测试选项，必须写在子命令之前。"

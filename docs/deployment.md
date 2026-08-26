@@ -39,10 +39,16 @@ submodule 指针（`thirds/webui/`、`thirds/goClient/`）表达：指针指向�
 ## 构建发布包
 
 ```bash
-uv sync                      # 安装依赖（含 build 组 PyInstaller）
-uv run pytest tests/unit     # 单测
-uv run deploy/build_release.py
+uv sync --frozen --all-groups             # 安装锁定依赖（含 PyInstaller）
+uv run --frozen pytest -q tests/unit       # 单测
+uv run --frozen --group build deploy/build_release.py
 # → dist/neu-box-<version>-linux-<arch>.tar.gz + .sha256
+
+# 验证并解包；版本和架构以实际产物为准
+cd dist
+sha256sum -c neu-box-<version>-linux-<arch>.tar.gz.sha256
+tar -xzf neu-box-<version>-linux-<arch>.tar.gz
+cd neu-box-<version>-linux-<arch>
 ```
 
 ## 首次安装

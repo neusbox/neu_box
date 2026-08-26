@@ -376,7 +376,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.2.2"}
+{"service":"neu-box-worker","version":"0.3.0"}
 ```
 
 ### 健康检查
