@@ -3,7 +3,8 @@
 设备状态脚本（npu-smi/gpu-info 封装）在高负载下可能超时或返回 total=0。
 若此时返回空集，所有外部占用的卡会被误判为空闲并重新分配（2026-08-24
 事故：fork 风暴期间 npu-smi 卡死 + vLLM 部署抖动，任务被分配到外部
-正在使用的卡上）。修复：查询失败时沿用上一次成功结果。
+正在使用的卡上）。修复：查询失败时沿用上一次成功结果；若启动后尚无
+成功结果，则把全部受管设备视为忙碌。
 """
 import subprocess
 import sys
@@ -20,7 +21,7 @@ class FakeMgmt(sm.SbxManager):
     """绕过 __init__（避免真实 DB / cgroup 恢复）的测试替身。"""
 
     def __init__(self):
-        self._last_external_busy = set()
+        self._last_external_busy = None
 
     def _discover_device_nodes(self):
         return ["235:0", "235:1", "235:2", "235:3"]
@@ -87,9 +88,15 @@ def test_recovery_refreshes_and_failure_uses_newest(fake_script):
     assert query(fake_script, mgr) == {"235:1"}
 
 
-def test_first_failure_without_history_returns_empty(fake_script):
+def test_first_failure_without_history_marks_all_managed_busy(fake_script):
     fake_script["exc"] = subprocess.TimeoutExpired("npu-smi", 10)
-    assert query(fake_script) == set()
+    assert query(fake_script) == {"235:0", "235:1", "235:2", "235:3"}
+
+
+def test_first_failure_without_history_leaves_no_free_devices(fake_script):
+    mgr = FakeMgmt()
+    fake_script["exc"] = subprocess.TimeoutExpired("npu-smi", 10)
+    assert sm.SbxManager._get_free_devices(mgr) == []
 
 
 def test_free_devices_excludes_sticky_busy_on_failure(fake_script):

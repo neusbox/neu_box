@@ -53,10 +53,10 @@ class SbxManager:
         # 线程安全
         self._lock = threading.RLock()
 
-        # 最近一次成功查到的外部占用设备集合；
-        # 设备状态脚本失败/超时/返回异常时沿用此值（fail-closed），
-        # 避免高负载下 npu-smi 卡死导致所有外部占用的卡被误判为空闲并重新分配。
-        self._last_external_busy: set = set()
+        # 最近一次成功查到的外部占用设备集合。None 表示尚无成功采样：
+        # 此时查询失败必须把全部受管设备视为忙碌，避免启动阶段 fail-open。
+        # 已有成功采样后，查询失败则沿用最近结果。
+        self._last_external_busy: set[str] | None = None
 
         # 启动时恢复
         self._recover_on_startup()
@@ -123,16 +123,21 @@ class SbxManager:
         """调用配置的设备信息脚本，返回沙盒外已占用的设备。
 
         查询失败/超时/返回异常（如系统高负载下 npu-smi 卡死）时，
-        沿用上一次成功查询的结果（fail-closed），而不是返回空集——
-        返回空集会让所有外部占用的卡被误判为空闲并重新分配。
+        若已有成功采样则沿用最近结果；若尚无成功采样，则把全部受管
+        设备视为忙碌。这样启动阶段也保持 fail-closed。
         """
         managed = set(self._discover_device_nodes())
+        fallback = (
+            managed
+            if self._last_external_busy is None
+            else self._last_external_busy
+        )
         path = env_text(
             "NEU_BOX_DEVICE_INFO_SCRIPT", legacy="dev_info_script_path"
         )
         if not path:
             logger.error('未配置 NEU_BOX_DEVICE_INFO_SCRIPT')
-            return set(self._last_external_busy)
+            return set(fallback)
         try:
             output = subprocess.check_output(
                 [path], timeout=10, stderr=subprocess.DEVNULL,
@@ -152,7 +157,7 @@ class SbxManager:
             logger.error('设备状态脚本返回 total=0，视为查询失败')
         except Exception as exc:
             logger.error('设备状态脚本失败: %s', exc)
-        return set(self._last_external_busy)
+        return set(fallback)
 
     def _list_sandbox_names(self) -> List[str]:
         """返回所有沙盒名称列表（兼容旧 SandboxDB.list_all 接口）。"""
