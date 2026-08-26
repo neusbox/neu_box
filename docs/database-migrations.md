@@ -1,9 +1,8 @@
 # 数据库迁移手册
 
-Master 和 Worker 各自拥有 SQLite 数据库及迁移序列：
+Worker 拥有独立的 SQLite 数据库及迁移序列（WebUI 的 master 数据库迁移由 neu_box_webui 仓库维护，机制相同）：
 
 ```text
-src/neu_box/master/migrations/
 src/neu_box/worker/migrations/
 ```
 
@@ -92,12 +91,11 @@ UV_CACHE_DIR=/tmp/neu-box-uv-cache uv run --frozen pytest -q
 ```bash
 neu-box-worker --config /path/to/worker.env db status
 neu-box-worker --config /path/to/worker.env db migrate
+Worker 数据库：
 neu-box-worker --config /path/to/worker.env db check
 neu-box-worker --config /path/to/worker.env db backup \
   --output-dir /path/to/backups
 ```
-
-Master 命令相同，只需把程序名替换为 `neu-box-master`。
 
 `serve` 只接受 `state=current` 且所需表、字段、索引完整的数据库。它不会为了“先启动起来”自动修表。
 

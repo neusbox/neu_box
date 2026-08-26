@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neu-box"
 dynamic = ["version"]
-description = "Lightweight multi-node accelerator resource management and sandbox isolation"
+description = "Neu Box worker: node-side accelerator device sandboxing and task execution"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -21,26 +21,11 @@ dependencies = [
     "Flask>=3.0,<4",
     "python-dotenv>=1.0,<2",
     "waitress>=3.0,<4",
-]
-
-[project.optional-dependencies]
-master = [
-    "bcrypt>=4.0,<6",
-    "requests>=2.28,<3",
-]
-worker = [
     "docker>=7,<8",
     "psutil>=5.9,<8",
-]
-all = [
-    "bcrypt>=4.0,<6",
-    "docker>=7,<8",
-    "psutil>=5.9,<8",
-    "requests>=2.28,<3",
 ]
 
 [project.scripts]
-neu-box-master = "neu_box.master.app:main"
 neu-box-worker = "neu_box.worker.app:main"
 
 [dependency-groups]
@@ -58,10 +43,6 @@ version = { attr = "neu_box.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"neu_box.master" = [
-    "migrations/*.sql",
-    "static/**/*",
-]
 "neu_box.worker" = [
     "migrations/*.sql",
     "resources/**/*",

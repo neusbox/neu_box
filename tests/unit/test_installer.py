@@ -57,10 +57,6 @@ def _fake_release(tmp_path: Path, version: str) -> Path:
         executable = role_dir / f"neu-box-{role}"
         executable.write_text(FAKE_ROLE, encoding="utf-8")
         executable.chmod(0o755)
-    client = release / "share" / "neu-box" / "client" / "neu-sbox"
-    client.parent.mkdir(parents=True)
-    client.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    client.chmod(0o755)
     info = release / "share" / "neu-box" / "info" / "gpu_info.sh"
     info.parent.mkdir(parents=True)
     info.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -73,18 +69,10 @@ def _fake_release(tmp_path: Path, version: str) -> Path:
     (sandbox / "device_block.o").write_bytes(b"fake-bpf-object")
     config = release / "config"
     config.mkdir()
-    (config / "master.env.example").write_text(
-        "NEU_BOX_DB_PATH=/var/lib/neu-box/master/master.db\n"
-        "NEU_BOX_PORT=25565\nSECRET_KEY=\n",
-        encoding="utf-8",
-    )
     (config / "worker.env.example").write_text(
         "NEU_BOX_DB_PATH=/var/lib/neu-box/worker/neu_box.db\n"
         "NEU_BOX_PORT=59075\n",
         encoding="utf-8",
-    )
-    (config / "nodes.json.example").write_text(
-        '{"nodes_pool": []}\n', encoding="utf-8"
     )
     systemd = release / "systemd"
     systemd.mkdir()
@@ -106,29 +94,19 @@ def _fake_release(tmp_path: Path, version: str) -> Path:
     return release
 
 
-def _deploy_role(
+def _deploy(
     root: Path,
     source: Path,
-    role: str,
     command: str = "install",
 ) -> int:
     return install.main([
         "--root", str(root),
         "--no-systemd",
         command,
-        "--role", role,
+        "--role", "worker",
         "--source", str(source),
         "--no-start",
     ])
-
-
-def _install_both_roles(root: Path, source: Path) -> None:
-    assert _deploy_role(root, source, "worker") == 0
-    assert _deploy_role(root, source, "master") == 0
-
-
-def _upgrade_installed_roles(root: Path, source: Path) -> int:
-    return _deploy_role(root, source, "worker", "upgrade")
 
 
 def test_staged_install_upgrade_and_database_rollback(tmp_path):
@@ -136,21 +114,18 @@ def test_staged_install_upgrade_and_database_rollback(tmp_path):
     release_one = _fake_release(tmp_path, "1.0.0")
     release_two = _fake_release(tmp_path, "1.1.0")
 
-    _install_both_roles(root, release_one)
+    assert _deploy(root, release_one) == 0
     layout = install.Layout(root)
-    assert (layout.bin / "neu-sbox").is_symlink()
-    assert (layout.bin / "neu-sbox").resolve().is_file()
-    master_db = install._role_database(layout, "master")
     worker_db = install._role_database(layout, "worker")
-    with sqlite3.connect(master_db) as conn:
+    with sqlite3.connect(worker_db) as conn:
         conn.execute("INSERT INTO payload VALUES ('before-upgrade')")
         conn.commit()
-    master_config_before = install._role_config(layout, "master").read_bytes()
+    worker_config_before = install._role_config(layout, "worker").read_bytes()
 
-    assert _upgrade_installed_roles(root, release_two) == 0
+    assert _deploy(root, release_two, "upgrade") == 0
     assert install._current_release(layout).name == "1.1.0"
-    assert install._role_config(layout, "master").read_bytes() == master_config_before
-    with sqlite3.connect(master_db) as conn:
+    assert install._role_config(layout, "worker").read_bytes() == worker_config_before
+    with sqlite3.connect(worker_db) as conn:
         assert conn.execute("SELECT version FROM release_marker").fetchone()[0] == "1.1.0"
         conn.execute("INSERT INTO payload VALUES ('after-upgrade')")
         conn.commit()
@@ -164,17 +139,16 @@ def test_staged_install_upgrade_and_database_rollback(tmp_path):
     ]) == 0
 
     assert install._current_release(layout).name == "1.0.0"
-    with sqlite3.connect(master_db) as conn:
+    with sqlite3.connect(worker_db) as conn:
         values = [row[0] for row in conn.execute("SELECT value FROM payload")]
         marker = conn.execute("SELECT version FROM release_marker").fetchone()[0]
     assert values == ["before-upgrade"]
     assert marker == "1.0.0"
-    assert worker_db.is_file()
 
 
 def test_release_checksum_tampering_is_rejected(tmp_path):
     release = _fake_release(tmp_path, "1.0.0")
-    (release / "config" / "master.env.example").write_text(
+    (release / "config" / "worker.env.example").write_text(
         "tampered\n", encoding="utf-8"
     )
 
@@ -233,65 +207,56 @@ def test_first_install_imports_legacy_data_without_old_source_paths(tmp_path):
         assert conn.execute("SELECT value FROM payload").fetchone()[0] == "preserved"
 
 
-def test_each_role_can_import_legacy_data_when_first_added(tmp_path):
+def test_legacy_import_only_allowed_on_first_install(tmp_path):
     root = tmp_path / "root"
     release = _fake_release(tmp_path, "1.0.0")
-    databases = {}
-    for role in install.ROLES:
-        database = tmp_path / f"old-{role}.db"
-        with sqlite3.connect(database) as conn:
-            conn.execute("CREATE TABLE payload (value TEXT)")
-            conn.execute("INSERT INTO payload VALUES (?)", (f"old-{role}",))
-            conn.commit()
-        databases[role] = database
+    legacy = tmp_path / "old-worker"
+    legacy.mkdir()
+    legacy_database = legacy / "neu_box.db"
+    with sqlite3.connect(legacy_database) as conn:
+        conn.execute("CREATE TABLE payload (value TEXT)")
+        conn.commit()
+    legacy_config = legacy / ".env"
+    legacy_config.write_text("port=60000\n", encoding="utf-8")
 
-    for role in install.ROLES:
-        assert install.main([
-            "--root", str(root),
-            "--no-systemd",
-            "install",
-            "--role", role,
-            "--source", str(release),
-            "--legacy-database", str(databases[role]),
-            "--no-start",
-        ]) == 0
-
-    layout = install.Layout(root)
-    state = json.loads(layout.state_file.read_text(encoding="utf-8"))
-    assert state["installed_roles"] == ["master", "worker"]
-    for role in install.ROLES:
-        with sqlite3.connect(install._role_database(layout, role)) as conn:
-            assert conn.execute("SELECT value FROM payload").fetchone()[0] == (
-                f"old-{role}"
-            )
+    assert _deploy(root, release) == 0
+    result = install.main([
+        "--root", str(root),
+        "--no-systemd",
+        "install",
+        "--role", "worker",
+        "--source", str(release),
+        "--legacy-config", str(legacy_config),
+        "--legacy-database", str(legacy_database),
+        "--no-start",
+    ])
+    assert result == 1
 
 
-def test_failed_upgrade_restores_program_database_client_and_state(
+def test_failed_upgrade_restores_program_database_and_state(
     tmp_path,
     monkeypatch,
 ):
     root = tmp_path / "root"
     release_one = _fake_release(tmp_path / "one", "1.0.0")
     release_two = _fake_release(tmp_path / "two", "1.1.0")
-    _install_both_roles(root, release_one)
+    assert _deploy(root, release_one) == 0
 
     layout = install.Layout(root)
     database = install._role_database(layout, "worker")
     state_before = layout.state_file.read_bytes()
-    client_target_before = (layout.bin / "neu-sbox").readlink()
     with sqlite3.connect(database) as conn:
         conn.execute("INSERT INTO payload VALUES ('must-survive')")
         conn.commit()
 
-    def fail_client(_layout):
-        raise install.InstallError("simulated client installation failure")
+    def fail_migrate(_layout, _release, _roles):
+        raise install.InstallError("simulated migration failure")
 
-    monkeypatch.setattr(install, "_install_worker_client", fail_client)
-    assert _upgrade_installed_roles(root, release_two) == 1
+    monkeypatch.setattr(install, "_migrate_live", fail_migrate)
+    assert _deploy(root, release_two, "upgrade") == 1
 
     assert install._current_release(layout).name == "1.0.0"
     assert layout.state_file.read_bytes() == state_before
-    assert (layout.bin / "neu-sbox").readlink() == client_target_before
     with sqlite3.connect(database) as conn:
         marker = conn.execute("SELECT version FROM release_marker").fetchone()[0]
         payload = conn.execute("SELECT value FROM payload").fetchall()
@@ -299,24 +264,19 @@ def test_failed_upgrade_restores_program_database_client_and_state(
     assert payload == [("must-survive",)]
 
 
-def test_failed_first_install_restores_preexisting_client(tmp_path, monkeypatch):
+def test_failed_first_install_leaves_clean_state(tmp_path, monkeypatch):
     root = tmp_path / "root"
     release = _fake_release(tmp_path, "1.0.0")
     layout = install.Layout(root)
-    old_client = layout.bin / "neu-sbox"
-    old_client.parent.mkdir(parents=True)
-    old_client.write_bytes(b"old-lab-client\n")
-    old_client.chmod(0o755)
 
-    def fail_client(_layout):
-        raise install.InstallError("simulated client installation failure")
+    def fail_migrate(_layout, _release, _roles):
+        raise install.InstallError("simulated migration failure")
 
-    monkeypatch.setattr(install, "_install_worker_client", fail_client)
-    assert _deploy_role(root, release, "worker") == 1
+    monkeypatch.setattr(install, "_migrate_live", fail_migrate)
+    assert _deploy(root, release) == 1
 
     assert not layout.current.exists()
     assert not layout.current.is_symlink()
-    assert old_client.read_bytes() == b"old-lab-client\n"
     assert not layout.state_file.exists()
 
 
@@ -331,8 +291,8 @@ def test_same_version_with_different_contents_is_rejected(tmp_path):
     )
     _write_checksums(release_two)
 
-    _install_both_roles(root, release_one)
-    assert _upgrade_installed_roles(root, release_two) == 1
+    assert _deploy(root, release_one) == 0
+    assert _deploy(root, release_two, "upgrade") == 1
     assert install._current_release(install.Layout(root)).name == "1.0.0"
 
 
@@ -342,9 +302,9 @@ def test_install_and_upgrade_commands_have_distinct_lifecycle(tmp_path):
     empty_root = tmp_path / "empty-root"
     installed_root = tmp_path / "installed-root"
 
-    assert _deploy_role(empty_root, release_two, "worker", "upgrade") == 1
-    assert _deploy_role(installed_root, release_one, "worker", "install") == 0
-    assert _deploy_role(installed_root, release_two, "worker", "install") == 1
+    assert _deploy(empty_root, release_two, "upgrade") == 1
+    assert _deploy(installed_root, release_one) == 0
+    assert _deploy(installed_root, release_two) == 1
     assert install._current_release(install.Layout(installed_root)).name == "1.0.0"
 
 
@@ -417,7 +377,7 @@ def test_enforcing_selinux_requires_restorecon(tmp_path, monkeypatch):
 
 
 def test_atomic_rewrite_preserves_existing_owner(tmp_path, monkeypatch):
-    target = tmp_path / "master.env"
+    target = tmp_path / "worker.env"
     target.write_text("before\n", encoding="utf-8")
     metadata = target.stat()
     chowns = []

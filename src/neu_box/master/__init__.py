@@ -1,2 +1,0 @@
-"""Neu Box Master service."""
-

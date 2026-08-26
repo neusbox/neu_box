@@ -1,252 +1,108 @@
 # Neu Box — 轻量多节点资源管理与沙盒隔离
 
-## 架构
+**本仓库 = worker（核心）+ 聚合**。
+
+Neu Box 在 GPU/NPU 节点上提供：
+
+- **终端沙盒**：把当前 shell（或 Docker 容器终端）迁入 cgroup 沙盒，
+  独占指定设备（BPF 拦截 + cgroup 设备白名单），其他进程看不到这些卡
+- **命令任务**：异步提交命令任务，按优先级排队（0=普通，1=赶论文），
+  自动分配设备、隔离执行、保留日志
+- **设备仲裁**：实时感知沙盒外占用（vLLM 等），空闲设备 = 受管 −
+  沙盒分配 − 外部占用
+
+## 三仓库结构
+
+| 仓库 | 角色 | 版本 | 说明 |
+|---|---|---|---|
+| **neu_box**（本仓库） | worker + 聚合 | 0.3.0+ | 节点侧全部逻辑；e2e 测试；用 submodule 钉住配套版本 |
+| [neu_box_webui](https://github.com/nihaopeng/neu_box_webui) | WebUI（原 master） | 0.0.1+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
+| [neu_box_goClient](https://github.com/nihaopeng/neu_box_goClient) | `neu-sbox` CLI | 0.0.1+ | Go 静态二进制，直连 worker |
+
+三个仓库**代码零依赖**，只通过 HTTP 契约相交：
 
 ```
-浏览器 ──→ Master (Flask) ──→ Worker (Flask) ──→ Host / 已有 Docker 容器
-              │                      │
-              │ 节点发现/请求转发      │ cgroup v2 + eBPF 沙盒
-              │ 每60s轮询节点状态      │ 命令队列 / 日志文件
-          master.env + nodes.json      worker.env
-                 （均位于 /etc/neu-box）
+浏览器 ──session──▶ WebUI :25565 ──转发──▶ worker :59075 ──▶ 沙盒/设备
+neu-sbox ─────────────────────────────────▶ worker :59075（直连）
 ```
 
-**WEB工作模式：**
+兼容矩阵由本仓库的 submodule 指针表达：
 
-- **命令模式**：Master 转发命令到 Worker，Worker 维护 FIFO 任务队列，在沙盒中执行 Host 或已有 Docker 容器命令。日志实时写入文件，前端全量拉取 + 进度条
+```
+webui/     → neu_box_webui@<commit>    # 与当前 worker 版本配套验证过的 WebUI
+goClient/  → neu_box_goClient@<commit> # 与当前 worker 版本配套验证过的客户端
+```
 
-**CLI工作模式：**
-
-- **当前终端**：把当前 shell 加入独占设备沙盒。
-- **Host 命令**：提交一次性 Host 命令并查询结果。
-- **已有容器命令**：通过 `docker_existing` 在运行中的容器内执行命令，不改变容器生命周期。
-
-## 部署与运行
-
-项目发布为四个自包含 Linux 程序：
-
-- `neu-box-master`：Master 服务与 Master 数据库管理命令；
-- `neu-box-worker`：Worker 服务与 Worker 数据库管理命令；
-- `neu-box-install`：安装、升级、备份、迁移、健康检查和回滚入口；
-- `neu-sbox`：可挂载进容器的静态 Go 客户端。
-
-Master 和 Worker 发布程序包含 Python 解释器及 Python 依赖，目标机器不需要安装 Python、pip 或 uv。Worker 仍依赖宿主机的 cgroup v2、systemd、Bash、`bpftool`、`busctl` 和设备驱动；Docker 执行目标还需要 Docker daemon。
-
-构建依赖、测试命令、打包流程和跨架构限制见 [构建发布包](docs/deployment.md#构建发布包)。
+更新配套版本：
 
 ```bash
-# 校验并解压；版本和架构以实际产物为准
-cd dist
-sha256sum -c neu-box-0.2.2-linux-arm64.tar.gz.sha256
-tar -xzf neu-box-0.2.2-linux-arm64.tar.gz
-cd neu-box-0.2.2-linux-arm64
-
-# 计算节点安装 Worker；默认安装后立即启动
-sudo ./neu-box-install install --role worker
-
-# Master 节点安装 Master；Master 和 Worker 可以安装在同一台机器
-sudo ./neu-box-install install --role master
+git -C webui fetch && git -C webui checkout v0.0.2
+git add webui && git commit -m "chore: bump webui to v0.0.2"
 ```
 
-需要先修改配置时，安装命令添加 `--no-start`，修改 `/etc/neu-box/*.env` 后再通过 systemd 启动。每次命令只安装一个明确角色。
+## worker 部署与运行
+
+发布包：`neu-box-<version>-linux-<arch>.tar.gz`（PyInstaller，含安装器）。
 
 ```bash
-# 服务管理
-sudo systemctl start neu-box-master neu-box-worker
-sudo systemctl stop neu-box-master neu-box-worker
-systemctl status neu-box-master neu-box-worker
-journalctl -u neu-box-worker -f
-
-# 使用新发布包升级对应角色
-sudo ./neu-box-install upgrade --role worker
-sudo ./neu-box-install upgrade --role master
-
-# 查看安装状态或回滚程序和升级前数据库
-sudo neu-box-install status
-sudo neu-box-install rollback
+tar -xzf neu-box-0.3.0-linux-arm64.tar.gz && cd neu-box-0.3.0-linux-arm64
+sha256sum -c ../neu-box-0.3.0-linux-arm64.tar.gz.sha256
+sudo ./neu-box-install install --role worker      # 首次安装
+sudo ./neu-box-install upgrade --role worker      # 升级
+sudo ./neu-box-install rollback                   # 回滚
 ```
 
-安装器会校验发布包、备份 SQLite、在数据库副本上试跑迁移、切换版本、启动服务并检查 `/healthz`。`neu-sbox` 随 Worker 安装，是不依赖 Bash、curl、Python 或目标容器 glibc 的静态二进制。
+详见 [docs/deployment.md](docs/deployment.md)；API 契约见
+[docs/worker-api.md](docs/worker-api.md)（含 `api_version` 语义）；
+迁移机制见 [docs/database-migrations.md](docs/database-migrations.md)。
 
-完整的打包、首次安装、旧部署导入、NPU/GPU 配置、升级和回滚流程见 [部署与升级手册](docs/deployment.md)。数据库迁移规则见 [数据库迁移手册](docs/database-migrations.md)。第三方系统不依赖 `neu-sbox` 直接接入任务队列时，参阅 [Worker HTTP API](docs/worker-api.md)。
+## CLI（neu-sbox，来自 goClient 仓库）
+
+```bash
+# 沙盒（终端隔离）
+neu-sbox acquire --device-num 2        # 当前 shell 独占 2 张卡
+neu-sbox release <sandbox_name>        # 释放
+neu-sbox check                         # worker 可达性 + API 版本兼容
+
+# 命令任务
+neu-sbox acquire --command "python train.py" --device-num 4 --priority 1
+neu-sbox tasks                         # 队列
+neu-sbox result <task_id>              # 结果/日志
+```
+
+完整用法见 [neu_box_goClient README](https://github.com/nihaopeng/neu_box_goClient)。
 
 ## 开发流程
 
-本项目的开发机器同时承担生产服务，因此不支持从源码启动 Master 或 Worker。源码工作区只用于修改代码、运行无特权单元测试和构建发布包；服务、数据库和硬件调试统一使用安装后的版本化二进制。
-
-```text
-修改源码
-  → 运行 pytest
-  → 提升为未使用过的版本号
-  → 构建并校验发布包
-  → neu-box-install install/upgrade
-  → 在真实服务上验证
-  → 失败则 rollback，修复后构建下一个版本
-```
-
-- 不执行 `uv run neu-box-master serve` 或 `uv run neu-box-worker serve`；源码进程可能读取生产 `/etc/neu-box` 配置。
-- 不并行启动第二个 Worker；所有 Worker 实例共享宿主机的 `/sys/fs/cgroup`、`/sys/fs/bpf` 和真实设备。
-- 单元测试和构建可以在生产服务运行时执行；需要 sudo 或真实硬件的集成测试必须进入维护窗口，并针对已安装的发布包运行。
-- 已经构建用于部署调试的版本号不得复用，避免同一 release 路径出现不同内容。
-
-## CLI用法
-
-管理当前 shell 的独占沙盒，或提交 Host、已有容器命令。Host 终端通过 `/proc/<pid>/status` 校验 PID 归属；容器终端通过 Docker 身份、PID namespace 和 `NSpid` 映射到宿主机进程。
-
 ```bash
-# neu-box-install 安装 Worker 时创建 /usr/local/bin/neu-sbox
+uv sync
+uv run pytest tests/unit          # 单测（worker + 迁移引擎 + 安装器）
+uv run deploy/build_release.py    # 构建发布包
 
-# ── 沙盒（终端隔离） ──
-neu-sbox acquire 1              # 申请 1 个 NPU，加入当前 shell
-neu-sbox acquire 2 4 8          # 申请 2 NPU + 4 核 CPU + 8G 内存
-neu-sbox acquire --devices 1,3  # 指定卡 1、3，加入当前 shell
-neu-sbox acquire --devices 1 --pid 12345  # 将指定进程加入新沙盒
-neu-sbox status                 # 查看当前 shell 是否在沙盒中
-neu-sbox join sbx_pengyt_12345.slice  # 将当前 shell 加入已有沙盒（需归属校验）
-neu-sbox list                   # 列出我的沙盒（显示设备卡号、CPU、内存）
-neu-sbox release <name>         # 释放指定沙盒
-# Host 终端重复 acquire 会覆盖旧沙盒；容器终端需先 release
-
-# ── 命令任务（一次性执行，类似前端命令模式） ──
-neu-sbox acquire 1 2 4 "npu-smi info"     # 1 NPU + 2 核 + 4G 执行 Host 命令
-neu-sbox acquire 0 4 8 "python train.py"  # 0 NPU + 4 核 + 8G 跑训练
-neu-sbox acquire --device-num 1 --priority 1 --command "python train.py"  # 赶论文（优先级 1，先于普通任务）
-neu-sbox tasks                              # 查看任务队列
-neu-sbox result <task_id>                   # 查看任务结果和日志
-
-# ── 已有容器命令 ──
-neu-sbox acquire --devices 1 --container training-01 \
-  --workdir /workspace --command "python train.py"
-# 支持 --env、--workdir、--container-user
-# 目标容器需已挂载所申请的 /dev/davinciN 或 /dev/nvidiaN
-
-# ── 已有容器中的交互终端 ──
-# 在 Host 创建容器；保留原有镜像和设备挂载参数
-docker run --name training-01 \
-  --add-host host.docker.internal:host-gateway \
-  -e NEU_BOX_URL=http://host.docker.internal:59075 \
-  -e NEU_BOX_CONTAINER=training-01 \
-  -e NEU_BOX_USER="$(id -un)" \
-  -v "$(readlink -f /usr/local/bin/neu-sbox):/usr/local/bin/neu-sbox:ro" \
-  YOUR_IMAGE bash
-
-# 在容器交互 shell 中
-neu-sbox acquire --device-num 1
-neu-sbox status
-neu-sbox release <name>
-
-# 未设置 NEU_BOX_CONTAINER 时，也可在 acquire 时显式指定；客户端会为
-# 随后的 release 在 /tmp 记录该 sandbox 对应的容器名
-neu-sbox acquire --container training-01 --device-num 1
-
-# ── 远程 Worker ──
-export NEU_BOX_URL=http://<worker_ip>:59075
-neu-sbox acquire 1
+# e2e（需要已部署的 worker + WebUI）
+NEU_BOX_TEST_MASTER=http://<master>:25565 NEU_BOX_TEST_PASS='...' \
+  uv run pytest tests/test_queue.py
 ```
 
-## 配置
-
-安装 Worker 后、启动服务前，编辑 `/etc/neu-box/worker.env`。Worker 不自动
-判断设备厂商，按节点类型选择下面一组配套配置：
-
-```dotenv
-# Ascend NPU
-NEU_BOX_DEVICE_FILTER=davinci[0-9]+
-NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/npu_info.sh
-
-# NVIDIA GPU
-NEU_BOX_DEVICE_FILTER=nvidia[0-9]+
-NEU_BOX_DEVICE_INFO_SCRIPT=/opt/neu-box/current/share/neu-box/info/gpu_info.sh
-```
-
-其余配置可使用默认值；完整的 Master/Worker 环境变量和节点列表说明见 [配置参考](docs/deployment.md#配置参考)。
-
-## 数据流
-
-### Web 命令模式
+## 仓库布局
 
 ```
-POST /command/run {node_id, user_id, command, cpu, memory, device_num, target}
-  │
-  Master ──→ Worker /command/run
-               │
-               └─ TaskQueue.submit() → 持久化到 SQLite → 返回 {task_id, position}
-  │
-TaskQueue 后台消费线程:
-  ├─ 取队首任务
-  ├─ SbxManager.allocate_sandbox(...)  → 分配设备并创建 sandbox
-  ├─ host → Popen('bash -i -c <cmd>', ...) → 交互模式（自动source ~/.bashrc）
-  ├─ docker_existing → 暂停 Docker Exec → host PID 加入 cgroup → 继续执行
-  ├─ 后台线程逐块 read() stdout        → 实时写入 {NEU_BOX_TASK_LOG_DIR}/{task_id}.log
-  ├─ 进程结束                          → DB 更新状态/返回码
-  └─ SbxManager.destroy_sandbox()      → cgroup.freeze → cgroup.kill → 销毁
-
-日志存储: 文件系统（非 SQLite），前端通过 XHR + 进度条全量拉取
-GET /command/result/<id>/log?raw=1  → 纯文本日志 + Content-Length 头
+src/neu_box/
+├── config.py, logging_config.py, database/   共享框架（webui 仓库有同源副本）
+└── worker/
+    ├── app.py               Flask 应用 + /healthz (api_version)
+    ├── executor/            任务队列、沙盒管理、设备分配、状态上报
+    ├── migrations/          0001..0003（版本钉死，只增不改）
+    └── resources/           sandbox.sh、BPF、设备状态脚本
+deploy/                      构建、安装器（保留）、spec、配置、systemd
+tests/unit/                  单测
+tests/test_queue.py          e2e 集成（依赖部署环境）
+webui/, goClient/            submodule（配套版本指针）
+docs/                        worker API 契约 + 部署 + 迁移手册
 ```
 
-### 终端沙盒模式 (`neu-sbox`)
+## 版本规则
 
-```
-POST /sandbox/acquire {username, pid, device_num, cpu, memory [, container]}
-  ├─ Host → /proc/<pid>/status 校验归属 → host PID 加入 sandbox
-  └─ container=<name> → Docker + NSpid 映射 host PID
-       → 校验设备节点 → host PID 加入 sandbox
-POST /sandbox/join {username, pid, sandbox_name}
-  → /proc/<pid>/status 校验 PID 归属 → sandbox 名称校验 owner → 加入目标 cgroup
-POST /command/run {user_id, command, device_ids/device_num, target}
-  → TaskQueue 持久化并排队 → 创建 sandbox cgroup
-  → target=host → 在 Host 执行命令
-  → target=docker_existing → 暂停 Docker Exec → host PID 移入 sandbox → 继续执行
-  → 保存日志、状态和退出码 → 销毁 sandbox
-POST /sandbox/release {sandbox_name [, container, pid, client_pid]}
-  ├─ Host → 直接 destroy_sandbox()
-  └─ container → shell 和 HTTP 客户端迁回原 Docker cgroup
-       → destroy_sandbox() 清理其余子进程 → 设备归还
-GET  /sandbox/list
-  → 返回活跃 sandbox 及其设备和进程
-```
-
-容器不需要 `--pid=host` 或共享 Host PID namespace。被迁移的 shell 仍保留原来的 mount、network、PID 等 namespace；之后正常 fork/exec 的子进程会继承 sandbox cgroup。容器创建时必须已经挂载可能申请的设备节点，Neu Box 只改变 cgroup 设备权限，不会向运行中的容器热添加 `/dev` 节点。容器内客户端自身不需要 Bash、curl、Python 或动态链接库。
-
-### 沙盒销毁流程
-
-```
-destroy_sandbox(name)
-  └─ sandbox.sh destroy
-       ├─ cgroup.freeze = 1    冻结 cgroup 内所有进程
-       ├─ cgroup.kill = 1      内核全杀（无竞态）
-       ├─ rmdir 整棵 cgroup；失败则保留数据库记录
-       └─ 删除仍属于当前 cgroup 的 BPF 独占条目
-```
-
-## Master 用户系统
-
-Master 内置统一的用户登录认证。首次启动自动创建管理员账号（默认 `admin`/`admin`，通过 `ADMIN_USER` / `ADMIN_PASS` 环境变量修改）。
-
-- 登录后可为每个节点保存命令任务用户名，选中节点时自动填入
-- 未登录无法调用任何写操作 API（命令提交、实验管理、节点增删等）
-- 节点状态查询等只读接口保持公开，前端无需登录即可看到节点列表
-- `neu-sbox` CLI 直连 Worker，完全不受 Master 认证影响
-
-## 公网暴露安全注意事项
-
-如需将 Master 暴露到公网，建议以下防护措施：
-
-- TLS 终止（Nginx/Caddy 反代 + Let's Encrypt 证书）
-- 登录接口速率限制（`limit_req` 防暴力破解）
-- `SECRET_KEY` 设为强随机值（`python -c "import secrets; print(secrets.token_hex(32))"`）
-- Session cookie 配置 `secure=True, httponly=True, samesite=Strict`
-- Worker 节点仅监听内网地址，不对外暴露端口
-- Master ↔ Worker 之间走 VPN/内网专线（如 WireGuard、Tailscale）
-- **推荐方案**：不直接暴露 Master，改用 VPN 接入内网后访问
-
-## 前端功能
-
-| 功能 | 说明 |
-|------|------|
-| 日志查看 | XHR 全量拉取 + 进度条，自动滚底，`\r` 进度条处理 |
-| 任务重跑 | Host 任务右侧 `↻` 按钮，确认后以原参数重新提交 |
-| 执行目标 | 支持 Host 和已有 Docker 容器 |
-| 实验记录 | 保存时复制日志副本（>500KB 截断），展开时懒加载；`\r` 处理 |
-| 节点管理 | 前端 UI 增删节点，60s 自动轮询 |
+- 版本号：`src/neu_box/__init__.py` 的 `__version__`
+- `API_VERSION`：worker HTTP API 版本，仅破坏性变更时 +1
+- 同一版本号不得重构建复用（安装器按 SHA256SUMS 钉死，拒绝覆盖）

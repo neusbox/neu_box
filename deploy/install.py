@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ROLES = ("master", "worker")
+ROLES = ("worker",)
 STATE_FORMAT = 1
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
@@ -232,12 +232,8 @@ def verify_release(source: Path) -> dict:
         raise InstallError("发布包缺少文件: " + ", ".join(sorted(missing)))
     required_files = [
         ("neu-box-install", True),
-        ("config/master.env.example", False),
         ("config/worker.env.example", False),
-        ("config/nodes.json.example", False),
-        ("systemd/neu-box-master.service", False),
         ("systemd/neu-box-worker.service", False),
-        ("share/neu-box/client/neu-sbox", True),
         ("share/neu-box/info/gpu_info.sh", True),
         ("share/neu-box/sandbox/v2/sandbox.sh", True),
         ("share/neu-box/sandbox/v2/device_block.o", False),
@@ -385,20 +381,6 @@ def _switch_current(layout: Layout, release: Path) -> None:
         temporary.unlink()
     temporary.symlink_to(release)
     os.replace(temporary, layout.current)
-
-
-def _install_worker_client(layout: Layout) -> None:
-    source = layout.current / "share" / "neu-box" / "client" / "neu-sbox"
-    if not source.is_file() or not os.access(source, os.X_OK):
-        raise InstallError(f"发布包缺少 neu-sbox 客户端: {source}")
-    layout.bin.mkdir(parents=True, exist_ok=True)
-    destination = layout.bin / "neu-sbox"
-    temporary = layout.bin / f".neu-sbox-{os.getpid()}"
-    if temporary.exists() or temporary.is_symlink():
-        temporary.unlink()
-    relative_target = os.path.relpath(source, start=layout.bin)
-    temporary.symlink_to(relative_target)
-    os.replace(temporary, destination)
 
 
 def _current_release(layout: Layout) -> Path | None:
@@ -1029,7 +1011,7 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
     ):
         raise InstallError(
             "legacy 导入只允许该角色首次 install，"
-            "且 --role 必须明确为 master 或 worker"
+            "且 --role 必须明确为 worker"
         )
     if (current is None) != (previous_version is None):
         raise InstallError("current 符号链接与安装状态记录不一致")
@@ -1068,8 +1050,6 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
     switched = False
     try:
         snapshot_dir = backup_set / "replaced-files"
-        if "worker" in roles:
-            snapshots.append(_snapshot_path(layout.bin / "neu-sbox", snapshot_dir))
         if systemd:
             for role in roles:
                 snapshots.append(_snapshot_path(
@@ -1100,12 +1080,9 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
         _enable_and_start(affected, systemd, not args.no_start)
         if systemd and not args.no_start:
             _healthcheck(layout, affected, version)
-        if "worker" in roles:
-            _install_worker_client(layout)
         if layout.root == Path("/"):
             _install_self(layout, release)
         _restore_selinux_contexts(layout, [
-            layout.bin / "neu-sbox",
             layout.sbin / "neu-box-install",
         ])
 
@@ -1185,8 +1162,6 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
     services_touched = False
     try:
         snapshot_dir = backup_set / "replaced-files"
-        if "worker" in roles:
-            snapshots.append(_snapshot_path(layout.bin / "neu-sbox", snapshot_dir))
         if systemd:
             for role in roles:
                 snapshots.append(_snapshot_path(
@@ -1215,8 +1190,6 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
         _enable_and_start(affected, systemd, not args.no_start)
         if systemd and not args.no_start:
             _healthcheck(layout, affected, str(manifest["version"]))
-        if "worker" in roles:
-            _install_worker_client(layout)
         if layout.root == Path("/"):
             _install_self(layout, previous_release)
 
@@ -1292,7 +1265,7 @@ def _parser() -> argparse.ArgumentParser:
             "--role",
             choices=ROLES,
             required=True,
-            help="本次安装的角色：master 或 worker",
+            help="本次安装的角色：worker",
         )
         command.add_argument(
             "--source",

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Build a versioned, checksummed Neu Box deployment archive."""
+"""Build a versioned, checksummed Neu Box worker deployment archive.
+
+2026-08-25 起本构建只产出 worker 角色（WebUI 见 neu_box_webui 仓库，
+Go 客户端见 neu_box_goClient 仓库，均独立发版）。
+
+产物: dist/neu-box-<version>-linux-<arch>.tar.gz
+包含: worker/  (PyInstaller) + neu-box-install (安装器)
+      + config/worker.env.example + systemd/neu-box-worker.service
+      + share/neu-box/{sandbox,info} (沙盒脚本/设备状态脚本/BPF)
+      + docs/ + manifest.json + SHA256SUMS
+"""
 
 from __future__ import annotations
 
@@ -80,11 +90,7 @@ def main() -> int:
     pyi_work = work_root / "pyinstaller-work"
     generated = work_root / "generated"
     generated.mkdir(parents=True, exist_ok=True)
-    go = shutil.which("go")
-    if not go:
-        raise SystemExit(
-            "missing Go toolchain: install Go to build the static neu-sbox client"
-        )
+
     bpf_object = generated / "device_block.o"
     _run([
         "clang", "-O2", "-g", "-target", "bpf", "-c",
@@ -101,34 +107,12 @@ def main() -> int:
         "-o", str(bpf_object),
     ])
 
-    go_client = generated / "neu-sbox"
-    go_environment = os.environ.copy()
-    go_environment.update({
-        "CGO_ENABLED": "0",
-        "GOOS": "linux",
-        "GOARCH": architecture,
-        "GOTOOLCHAIN": "local",
-        "GOCACHE": str(work_root / "go-cache"),
-        "GOMODCACHE": str(work_root / "go-mod-cache"),
-    })
-    _run([
-        go,
-        "build",
-        "-trimpath",
-        "-buildvcs=false",
-        "-tags=netgo,osusergo",
-        "-ldflags",
-        f"-s -w -X main.version={version}",
-        "-o",
-        str(go_client),
-        ".",
-    ], env=go_environment, cwd=ROOT / "client" / "neu-sbox")
     if not args.skip_pyinstaller:
         shutil.rmtree(pyi_dist, ignore_errors=True)
         shutil.rmtree(pyi_work, ignore_errors=True)
         build_environment = os.environ.copy()
         build_environment["NEU_BOX_BUILD_BPF_OBJECT"] = str(bpf_object)
-        for role in ("master", "worker", "installer"):
+        for role in ("worker", "installer"):
             _run([
                 sys.executable,
                 "-m",
@@ -143,9 +127,8 @@ def main() -> int:
                 str(ROOT / "deploy" / "pyinstaller" / f"{role}.spec"),
             ], env=build_environment)
 
-    for role in ("master", "worker"):
-        if not (pyi_dist / f"neu-box-{role}").is_dir():
-            raise SystemExit(f"missing PyInstaller output for {role}")
+    if not (pyi_dist / "neu-box-worker").is_dir():
+        raise SystemExit("missing PyInstaller output for worker")
     if not (pyi_dist / "neu-box-install").is_file():
         raise SystemExit("missing PyInstaller output for installer")
 
@@ -153,7 +136,6 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="neu-box-release-") as raw_temp:
         staging = Path(raw_temp) / archive_name
         staging.mkdir()
-        _copy_tree(pyi_dist / "neu-box-master", staging / "master")
         _copy_tree(pyi_dist / "neu-box-worker", staging / "worker")
         shutil.copy2(pyi_dist / "neu-box-install", staging / "neu-box-install")
         os.chmod(staging / "neu-box-install", 0o755)
@@ -163,15 +145,9 @@ def main() -> int:
             ROOT / "src" / "neu_box" / "worker" / "resources",
             staging / "share" / "neu-box",
         )
-        client_destination = (
-            staging / "share" / "neu-box" / "client" / "neu-sbox"
-        )
-        client_destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(go_client, client_destination)
-        os.chmod(client_destination, 0o755)
         bpf_source = staging / "share" / "neu-box" / "sandbox" / "v2" / "device_block.bpf.c"
-        bpf_object = bpf_source.with_suffix("").with_suffix(".o")
-        shutil.copy2(generated / "device_block.o", bpf_object)
+        bpf_out = bpf_source.with_suffix("").with_suffix(".o")
+        shutil.copy2(generated / "device_block.o", bpf_out)
         shutil.copy2(ROOT / "LICENSE", staging / "LICENSE")
         shutil.copy2(ROOT / "README.md", staging / "README.md")
         _copy_tree(ROOT / "docs", staging / "docs")

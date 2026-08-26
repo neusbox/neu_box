@@ -1,2 +1,0 @@
-"""Master HTTP API blueprints."""
-

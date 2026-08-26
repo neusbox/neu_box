@@ -1,2 +1,0 @@
-"""Versioned Master database migrations."""
-

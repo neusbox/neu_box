@@ -1,0 +1,6 @@
+[submodule "webui"]
+	path = webui
+	url = /home/pengyt/projects/neu_box_webui
+[submodule "goClient"]
+	path = goClient
+	url = /home/pengyt/projects/neu_box_goClient

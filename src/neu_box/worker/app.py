@@ -9,7 +9,7 @@ import sys
 import flask
 from waitress import serve as waitress_serve
 
-from neu_box import __version__
+from neu_box import API_VERSION, __version__
 from neu_box.config import (
     ConfigError,
     env_int,
@@ -57,6 +57,7 @@ def create_app() -> flask.Flask:
         return {
             "status": "ok",
             "role": "worker",
+            "api_version": API_VERSION,
             "version": __version__,
             "schema_version": status.current,
         }, 200

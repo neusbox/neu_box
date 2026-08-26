@@ -15,11 +15,6 @@ from neu_box.database.migrations import (
     require_current_schema,
     schema_status,
 )
-from neu_box.master.services.db import (
-    MIGRATIONS_PACKAGE as MASTER_MIGRATIONS,
-    REQUIRED_COLUMNS as MASTER_COLUMNS,
-    REQUIRED_INDEXES as MASTER_INDEXES,
-)
 from neu_box.worker.executor.db import (
     MIGRATIONS_PACKAGE as WORKER_MIGRATIONS,
     REQUIRED_COLUMNS as WORKER_COLUMNS,
@@ -30,10 +25,6 @@ from neu_box.worker.executor.db import (
 @pytest.mark.parametrize(
     ("package", "columns", "indexes", "pending", "history"),
     [
-        (
-            MASTER_MIGRATIONS, MASTER_COLUMNS, MASTER_INDEXES,
-            (1,), [(1, "initial")],
-        ),
         (
             WORKER_MIGRATIONS, WORKER_COLUMNS, WORKER_INDEXES,
             (1, 2, 3), [(1, "initial"), (2, "add_task_priority"),

@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.2.2`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.3.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -43,6 +43,14 @@ WORKER=http://127.0.0.1:59075
 
 如果机器配置了 HTTP 代理，访问内网 Worker 时应绕过代理，例如使用
 `curl --noproxy '*'`。
+
+## API 版本
+
+`/healthz` 与 `/status` 均返回 `api_version`（当前 `1`）：
+
+- 仅破坏性变更（删除字段、改变语义）时 +1；新增字段/端点不升版本
+- 接入方应对 `api_version < 1` 的连接降级处理或拒绝
+- 旧版 worker（< 0.3.0）不上报该字段，接入方应将其视为 best-effort
 
 ## 队列接入流程
 

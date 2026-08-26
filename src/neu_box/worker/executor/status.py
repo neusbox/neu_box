@@ -3,6 +3,8 @@
 import psutil
 from flask import Blueprint
 
+from neu_box import API_VERSION
+
 status_bp = Blueprint('status', __name__)
 
 class Node_Manager:
@@ -97,6 +99,7 @@ class Node_Manager:
             'idle_devices': dev['idle'],
             'dev_status': dev.get('dev_status', {}),
             'active_sandboxes': sandboxes,
+            'api_version': API_VERSION,
         }
 
 
