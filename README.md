@@ -16,8 +16,8 @@ Neu Box 在 GPU/NPU 节点上提供：
 | 仓库 | 角色 | 版本 | 说明 |
 |---|---|---|---|
 | **neu_box**（本仓库） | worker + 聚合 | 0.3.0+ | 节点侧全部逻辑；e2e 测试；用 submodule 钉住配套版本 |
-| [neu_box_webui](https://github.com/nihaopeng/neu_box_webui) | WebUI（原 master） | 0.0.1+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
-| [neu_box_goClient](https://github.com/nihaopeng/neu_box_goClient) | `neu-sbox` CLI | 0.0.1+ | Go 静态二进制，直连 worker |
+| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI（原 master） | 0.0.1+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
+| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` CLI | 0.0.1+ | Go 静态二进制，直连 worker |
 
 三个仓库**代码零依赖**，只通过 HTTP 契约相交：
 
@@ -29,15 +29,15 @@ neu-sbox ───────────────────────�
 兼容矩阵由本仓库的 submodule 指针表达：
 
 ```
-webui/     → neu_box_webui@<commit>    # 与当前 worker 版本配套验证过的 WebUI
-goClient/  → neu_box_goClient@<commit> # 与当前 worker 版本配套验证过的客户端
+thirds/webui/     → neu_box_webui@<commit>    # 与当前 worker 版本配套验证过的 WebUI
+thirds/goClient/  → neu_box_goClient@<commit> # 与当前 worker 版本配套验证过的客户端
 ```
 
 更新配套版本：
 
 ```bash
-git -C webui fetch && git -C webui checkout v0.0.2
-git add webui && git commit -m "chore: bump webui to v0.0.2"
+git -C thirds/webui fetch && git -C thirds/webui checkout v0.0.2
+git add thirds/webui && git commit -m "chore: bump webui to v0.0.2"
 ```
 
 ## worker 部署与运行
@@ -50,6 +50,15 @@ sha256sum -c ../neu-box-0.3.0-linux-arm64.tar.gz.sha256
 sudo ./neu-box-install install --role worker      # 首次安装
 sudo ./neu-box-install upgrade --role worker      # 升级
 sudo ./neu-box-install rollback                   # 回滚
+```
+
+也可以运行发布包中的交互管理入口，一处完成安装、升级、回滚、服务管理
+和日志查看：
+
+```bash
+./run.sh                    # 发布目录或源码仓库中打开菜单
+neu-box                     # 首次安装后可直接打开菜单
+neu-box status              # 也支持非交互子命令
 ```
 
 详见 [docs/deployment.md](docs/deployment.md)；API 契约见
@@ -70,7 +79,7 @@ neu-sbox tasks                         # 队列
 neu-sbox result <task_id>              # 结果/日志
 ```
 
-完整用法见 [neu_box_goClient README](https://github.com/nihaopeng/neu_box_goClient)。
+完整用法见 [neu_box_goClient README](https://github.com/neusbox/neu_box_goClient)。
 
 ## 开发流程
 
@@ -78,6 +87,7 @@ neu-sbox result <task_id>              # 结果/日志
 uv sync
 uv run pytest tests/unit          # 单测（worker + 迁移引擎 + 安装器）
 uv run deploy/build_release.py    # 构建发布包
+# 或使用统一入口：./run.sh test / ./run.sh build
 
 # e2e（需要已部署的 worker + WebUI）
 NEU_BOX_TEST_MASTER=http://<master>:25565 NEU_BOX_TEST_PASS='...' \
@@ -95,9 +105,10 @@ src/neu_box/
     ├── migrations/          0001..0003（版本钉死，只增不改）
     └── resources/           sandbox.sh、BPF、设备状态脚本
 deploy/                      构建、安装器（保留）、spec、配置、systemd
+run.sh                       交互式安装、升级、回滚与服务管理入口
 tests/unit/                  单测
 tests/test_queue.py          e2e 集成（依赖部署环境）
-webui/, goClient/            submodule（配套版本指针）
+thirds/webui/, thirds/goClient/ submodule（配套版本指针）
 docs/                        worker API 契约 + 部署 + 迁移手册
 ```
 

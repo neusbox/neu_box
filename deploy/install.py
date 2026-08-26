@@ -674,6 +674,9 @@ def _install_self(layout: Layout, release: Path) -> None:
     if not source.is_file() or not os.access(source, os.X_OK):
         raise InstallError(f"发布包缺少安装器: {source}")
     _atomic_copy(source, layout.sbin / "neu-box-install", 0o755)
+    launcher = release / "run.sh"
+    if launcher.is_file() and os.access(launcher, os.X_OK):
+        _atomic_copy(launcher, layout.sbin / "neu-box", 0o755)
 
 
 def _systemd_available(layout: Layout, no_systemd: bool) -> bool:
@@ -1061,6 +1064,10 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
                 layout.sbin / "neu-box-install",
                 snapshot_dir,
             ))
+            snapshots.append(_snapshot_path(
+                layout.sbin / "neu-box",
+                snapshot_dir,
+            ))
         service_states = _capture_service_states(affected, systemd)
         services_touched = True
         _stop_services(affected, systemd)
@@ -1084,6 +1091,7 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
             _install_self(layout, release)
         _restore_selinux_contexts(layout, [
             layout.sbin / "neu-box-install",
+            layout.sbin / "neu-box",
         ])
 
         previous = state.get("previous")
@@ -1171,6 +1179,10 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
         if layout.root == Path("/"):
             snapshots.append(_snapshot_path(
                 layout.sbin / "neu-box-install",
+                snapshot_dir,
+            ))
+            snapshots.append(_snapshot_path(
+                layout.sbin / "neu-box",
                 snapshot_dir,
             ))
         service_states = _capture_service_states(affected, systemd)

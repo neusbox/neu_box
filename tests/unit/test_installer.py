@@ -146,6 +146,24 @@ def test_staged_install_upgrade_and_database_rollback(tmp_path):
     assert marker == "1.0.0"
 
 
+def test_install_self_copies_optional_management_launcher(tmp_path):
+    release = tmp_path / "release"
+    release.mkdir()
+    installer = release / "neu-box-install"
+    installer.write_text("installer", encoding="utf-8")
+    installer.chmod(0o755)
+    launcher = release / "run.sh"
+    launcher.write_text("launcher", encoding="utf-8")
+    launcher.chmod(0o755)
+    layout = install.Layout(tmp_path / "root")
+
+    install._install_self(layout, release)
+
+    assert (layout.sbin / "neu-box-install").read_text() == "installer"
+    assert (layout.sbin / "neu-box").read_text() == "launcher"
+    assert (layout.sbin / "neu-box").stat().st_mode & 0o111
+
+
 def test_release_checksum_tampering_is_rejected(tmp_path):
     release = _fake_release(tmp_path, "1.0.0")
     (release / "config" / "worker.env.example").write_text(

@@ -6,6 +6,7 @@ Go 客户端见 neu_box_goClient 仓库，均独立发版）。
 
 产物: dist/neu-box-<version>-linux-<arch>.tar.gz
 包含: worker/  (PyInstaller) + neu-box-install (安装器)
+      + run.sh（交互式安装、升级、回滚与服务管理入口）
       + config/worker.env.example + systemd/neu-box-worker.service
       + share/neu-box/{sandbox,info} (沙盒脚本/设备状态脚本/BPF)
       + docs/ + manifest.json + SHA256SUMS
@@ -139,6 +140,8 @@ def main() -> int:
         _copy_tree(pyi_dist / "neu-box-worker", staging / "worker")
         shutil.copy2(pyi_dist / "neu-box-install", staging / "neu-box-install")
         os.chmod(staging / "neu-box-install", 0o755)
+        shutil.copy2(ROOT / "run.sh", staging / "run.sh")
+        os.chmod(staging / "run.sh", 0o755)
         _copy_tree(ROOT / "deploy" / "config", staging / "config")
         _copy_tree(ROOT / "deploy" / "systemd", staging / "systemd")
         _copy_tree(

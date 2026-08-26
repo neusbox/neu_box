@@ -7,18 +7,19 @@
 | 仓库 | 角色 | 版本 | 部署 |
 |---|---|---|---|
 | **neu_box**（本仓库） | worker：节点侧设备沙盒 + 任务执行 | 0.3.0+ | `/opt/neu-box/releases/<v>` + `current`（安装器 `neu-box-install`） |
-| [neu_box_webui](https://github.com/nihaopeng/neu_box_webui) | WebUI：节点池 / 转发 / 实验记录 | 0.0.1+ | `/opt/neu-box/webui/releases/<v>`（install.sh，无安装器） |
-| [neu_box_goClient](https://github.com/nihaopeng/neu_box_goClient) | `neu-sbox` Go 客户端（直连 worker） | 0.0.1+ | `/usr/local/bin/neu-sbox`（install.sh，静态二进制） |
+| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI：节点池 / 转发 / 实验记录 | 0.0.1+ | Python 3.11+ 源码运行（`uv sync`，不打包） |
+| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` Go 客户端（直连 worker） | 0.0.1+ | `/usr/local/bin/neu-sbox`（install.sh，静态二进制） |
 
 三者只通过 HTTP 契约相交（worker API 见 [worker-api.md](worker-api.md)，
 WebUI API 见 webui 仓库 docs/master-api.md）。兼容矩阵用本仓库的
-submodule 指针（`webui/`、`goClient/`）表达：指针指向的提交即该版本
+submodule 指针（`thirds/webui/`、`thirds/goClient/`）表达：指针指向的提交即该版本
 已验证的配套版本。
 
 ## 发布模型
 
 - 发布包：`neu-box-<version>-linux-<arch>.tar.gz` + `.sha256`
 - 包内容：`worker/`（PyInstaller 可执行目录）、`neu-box-install`（安装器）、
+  `run.sh`（交互管理入口）、
   `config/worker.env.example`、`systemd/neu-box-worker.service`、
   `share/neu-box/{sandbox,info}`（沙盒脚本/设备状态脚本/BPF 对象）、
   `docs/`、`manifest.json`、`SHA256SUMS`（逐文件校验和）
@@ -52,6 +53,16 @@ cd neu-box-<v>-linux-<arch>
 sha256sum -c neu-box-<v>-linux-<arch>.tar.gz.sha256   # 从远端下载后
 sudo ./neu-box-install install --role worker
 ```
+
+也可以直接打开管理菜单：
+
+```bash
+./run.sh
+```
+
+菜单提供安装、升级、回滚、服务启停/状态、日志、构建和单测。首次安装后
+入口同时安装为 `/usr/local/sbin/neu-box`，可随时执行 `neu-box` 打开；
+也支持 `neu-box status`、`neu-box restart` 等非交互子命令。
 
 安装器：校验 SHA256SUMS → 释放到 `/opt/neu-box/releases/<v>/` → 链
 `current` → 生成 `/etc/neu-box/worker.env`（已存在则保留）→ 安装
