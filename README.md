@@ -1,134 +1,232 @@
-# Neu Box — 轻量多节点资源管理与沙盒隔离
+<p align="center">
+  <img src="docs/neu_box.png" alt="Neu Box Logo" width="168">
+</p>
 
-**本仓库 = worker（核心）+ 聚合**。
+<h1 align="center">Neu Box</h1>
 
-Neu Box 在 GPU/NPU 节点上提供：
+<p align="center">
+  面向 Linux 异构计算节点的轻量级设备资源仲裁、沙盒隔离与任务执行系统
+</p>
 
-- **终端沙盒**：把当前 shell（或 Docker 容器终端）迁入 cgroup 沙盒，
-  独占指定设备（BPF 拦截 + cgroup 设备白名单），其他进程看不到这些卡
-- **命令任务**：异步提交命令任务，按优先级排队（0=普通，1=赶论文），
-  自动分配设备、隔离执行、保留日志
-- **设备仲裁**：实时感知沙盒外占用（vLLM 等），空闲设备 = 受管 −
-  沙盒分配 − 外部占用
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux-2d333b">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776ab">
+  <img alt="Worker API" src="https://img.shields.io/badge/Worker%20API-v2-50d1b2">
+  <a href="https://github.com/neusbox/neu_box/releases"><img alt="Releases" src="https://img.shields.io/github/v/release/neusbox/neu_box?display_name=tag&sort=semver"></a>
+</p>
 
-## 三仓库结构
+Neu Box 为 GPU、NPU 等异构设备节点提供统一的资源入口。它将设备分配、
+cgroup v2 进程隔离、eBPF 访问控制、异步任务队列和发布运维组合为一个节点侧
+Worker，同时提供 WebUI、命令行客户端和面向 Agent 的标准 HTTP 使用方式。
 
-| 仓库 | 角色 | 版本 | 说明 |
-|---|---|---|---|
-| **neu_box**（本仓库） | worker + 聚合 | 0.4.0+ | 节点侧全部逻辑；e2e 测试；用 submodule 钉住配套版本 |
-| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI（原 master） | 0.1.0+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
-| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` CLI | 0.2.0+ | Go 静态二进制，直连 worker |
+本仓库是 Neu Box 的核心 Worker，也是三个独立仓库的聚合与兼容性验证仓库。
 
-三个仓库**代码零依赖**，只通过 HTTP 契约相交：
+## 核心能力
 
+| 能力 | 说明 |
+|---|---|
+| 终端沙盒 | 将宿主机或现有 Docker 容器中的终端进程迁入 cgroup，独占指定设备 |
+| 命令任务 | 异步提交、优先级排队、自动分配资源、隔离执行并持久化任务日志 |
+| 设备仲裁 | 综合 Neu Box 分配记录与驱动侧外部占用信息，避免把忙碌设备重复分配 |
+| 内核访问控制 | 通过 cgroup v2 与 eBPF 限制未获授权进程后续打开已预留设备 |
+| 生命周期管理 | 支持版本化安装、在线/离线升级、数据库迁移、健康检查和失败回滚 |
+| Agent 接入 | Worker API v2 可直接通过 `curl` 使用；`neu-sbox` 提供可选的确定性 helper 与内置 skill |
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    Browser[浏览器] --> WebUI[Neu Box WebUI<br/>:25565]
+    WebUI --> Worker[Neu Box Worker API<br/>:59075]
+    CLI[neu-sbox CLI] --> Worker
+    Agent[Agent / curl] --> Worker
+    Worker --> Queue[任务队列与日志]
+    Worker --> Sandbox[cgroup v2 / eBPF 沙盒]
+    Sandbox --> Device[GPU / NPU 设备]
 ```
-浏览器 ──session──▶ WebUI :25565 ──转发──▶ worker :59075 ──▶ 沙盒/设备
-neu-sbox ─────────────────────────────────▶ worker :59075（直连）
-```
 
-兼容矩阵由本仓库的 submodule 指针表达：
+Neu Box 由三个独立维护、独立发版的仓库组成。它们不共享运行时代码，仅通过
+HTTP 契约协作：
 
-```
-thirds/webui/     → neu_box_webui@<commit>    # 与当前 worker 版本配套验证过的 WebUI
-thirds/goClient/  → neu_box_goClient@<commit> # 与当前 worker 版本配套验证过的客户端
-```
+| 仓库 | 职责 | 部署方式 |
+|---|---|---|
+| **[neu_box](https://github.com/neusbox/neu_box)** | Worker、设备沙盒、任务执行、安装器与聚合测试 | 版本化 Linux 发布包 |
+| **[neu_box_webui](https://github.com/neusbox/neu_box_webui)** | 节点池、任务转发、实验记录与 Web 界面 | Python 3.11+ 源码运行 |
+| **[neu_box_goClient](https://github.com/neusbox/neu_box_goClient)** | `neu-sbox` CLI 与 Agent skill | Go 静态二进制 |
 
-更新配套版本：
+本仓库通过 `thirds/webui` 和 `thirds/goClient` submodule 固定已验证的配套提交，
+作为跨仓库兼容矩阵。
+
+## 快速开始
+
+### 环境要求
+
+- Linux `amd64` 或 `arm64`，使用 systemd 与 cgroup v2
+- root 或可用的 `sudo`（安装、设备隔离与服务管理需要）
+- `bash`、`bpftool`、`busctl`
+- 对应厂商的设备驱动和状态工具，例如 `nvidia-smi` 或 `npu-smi`
+- Docker 仅在使用现有容器执行目标时需要
+
+### 安装 Worker
+
+从 [GitHub Releases](https://github.com/neusbox/neu_box/releases) 下载与目标机器
+架构匹配的发布包及其 `.sha256` 文件：
 
 ```bash
-git -C thirds/webui fetch && git -C thirds/webui checkout v0.0.2
-git add thirds/webui && git commit -m "chore: bump webui to v0.0.2"
+VERSION=0.4.0
+ARCH=arm64  # 或 amd64
+PACKAGE="neu-box-${VERSION}-linux-${ARCH}.tar.gz"
+
+curl -fLO "https://github.com/neusbox/neu_box/releases/download/v${VERSION}/${PACKAGE}"
+curl -fLO "https://github.com/neusbox/neu_box/releases/download/v${VERSION}/${PACKAGE}.sha256"
+sha256sum -c "${PACKAGE}.sha256"
+
+tar -xzf "$PACKAGE"
+cd "${PACKAGE%.tar.gz}"
+sudo ./neu-box-install install --role worker
 ```
 
-## worker 部署与运行
+安装完成后，Worker 默认监听 `0.0.0.0:59075`，管理入口安装为
+`/usr/local/sbin/neu-box`。
 
-发布包：`neu-box-<version>-linux-<arch>.tar.gz`（PyInstaller，含安装器）。
+### 日常管理
 
 ```bash
-tar -xzf neu-box-0.4.0-linux-arm64.tar.gz && cd neu-box-0.4.0-linux-arm64
-sha256sum -c ../neu-box-0.4.0-linux-arm64.tar.gz.sha256
-sudo ./neu-box-install install --role worker      # 首次安装
-sudo ./neu-box-install upgrade --role worker      # 升级
-sudo ./neu-box-install rollback                   # 回滚
+neu-box                 # 打开交互式管理菜单
+neu-box status          # 查看安装版本与回滚状态
+neu-box service-status  # 查看 systemd 服务状态
+neu-box logs            # 跟踪 Worker 日志
+neu-box check-update    # 检查 GitHub latest Release
+neu-box update          # 在线下载、校验并升级
+neu-box rollback        # 回滚程序和升级前数据库
 ```
 
-也可以运行发布包中的交互管理入口，一处完成安装、升级、回滚、服务管理
-和日志查看：
+在线更新会自动选择本机架构，执行外层 SHA256 与包内文件校验，并复用安装器已有的
+数据库备份、迁移预检、健康检查和失败恢复。无法访问 GitHub 时，仍可使用：
 
 ```bash
-./run.sh                    # 发布目录或源码仓库中打开菜单
-neu-box                     # 首次安装后可直接打开菜单
-neu-box status              # 也支持非交互子命令
-neu-box check-update        # 检查 GitHub latest Release
-neu-box update              # 下载、校验并在线更新（交互确认）
-neu-box update --yes        # 非交互更新
+neu-box upgrade /path/to/extracted-release
 ```
 
-在线更新默认读取 `neusbox/neu_box` 的 GitHub Release，根据本机自动选择
-`amd64` 或 `arm64` 产物。菜单中也可选择“从 GitHub Release 在线更新”。指定版本
-可使用 `neu-box update --version 0.4.1`；本地发布目录升级仍保留为离线兜底。
+完整的安装、升级、回滚、目录权限和 Release 资产规范见
+[部署与升级手册](docs/deployment.md)。
 
-详见 [docs/deployment.md](docs/deployment.md)；API 契约见
-[docs/worker-api.md](docs/worker-api.md)（含 `api_version` 语义）；
-迁移机制见 [docs/database-migrations.md](docs/database-migrations.md)。
+## 使用 `neu-sbox`
 
-## CLI（neu-sbox，来自 goClient 仓库）
+`neu-sbox` 直连 Worker，不经过 WebUI：
 
 ```bash
-# 沙盒（终端隔离）
-neu-sbox acquire --device-num 2        # 当前 shell 独占 2 张卡
-neu-sbox release <sandbox_name>        # 释放
-neu-sbox check                         # worker 可达性 + API 版本兼容
+# 检查 Worker 和 API 兼容性
+neu-sbox check
 
-# 命令任务
+# 当前终端独占两张设备卡
+neu-sbox acquire --device-num 2
+neu-sbox release <sandbox_name>
+
+# 提交四卡任务并增量跟踪日志
 neu-sbox submit --device-num 4 --priority 1 -- python train.py
-neu-sbox tasks                         # 队列
-neu-sbox result <task_id>              # 结果/日志
+neu-sbox wait <task_id>
+
+# 将内置 Agent skill 安装到指定技能根目录
+neu-sbox skill install ~/.codex/skills
 ```
 
-完整用法见 [neu_box_goClient README](https://github.com/neusbox/neu_box_goClient)。
+安装与完整参数说明见
+[neu_box_goClient](https://github.com/neusbox/neu_box_goClient)。
 
-## 开发流程
+## HTTP API
+
+Worker API v2 的基础地址默认为 `http://<worker-host>:59075`：
 
 ```bash
-uv sync
-uv run pytest tests/unit          # 单测（worker + 迁移引擎 + 安装器）
-uv run deploy/build_release.py    # 构建发布包
-# 或使用统一入口：./run.sh test / ./run.sh build
+curl http://127.0.0.1:59075/healthz
+curl http://127.0.0.1:59075/status
+```
 
-# 已部署 Worker 一键实机验收（API、任务、设备分配/释放、Reaper）
+主要资源：
+
+| 接口 | 用途 |
+|---|---|
+| `POST /tasks` | 提交异步任务 |
+| `GET /tasks/<task_id>` | 查询任务状态与结果 |
+| `GET /tasks/<task_id>/log` | 分段或完整读取任务日志 |
+| `DELETE /tasks` | 删除或取消任务 |
+| `POST /sandbox/acquire` | 为 Worker 宿主机 PID 分配终端沙盒 |
+| `POST /sandbox/release` | 释放终端沙盒与设备 |
+| `GET /sandbox/list` | 查询沙盒、设备与 PID 快照 |
+
+请求格式、状态码、日志轮询方式和容器身份模型见
+[Worker HTTP API](docs/worker-api.md)。
+
+## 兼容性
+
+| 组件 | 当前系列 | 兼容要求 |
+|---|---|---|
+| Worker | `0.4.x` | `api_version = 2` |
+| WebUI | `0.1.x` | Worker `>= 0.4.0` |
+| `neu-sbox` | `0.2.x` | Worker `>= 0.4.0` |
+
+`API_VERSION` 只在发生破坏性 HTTP 契约变更时递增。部署前可使用
+`neu-sbox check` 或 `/healthz` 验证兼容性。
+
+## 隔离边界
+
+- eBPF 策略限制的是设备文件的后续打开，不会主动终止在设备预留前已经持有访问的进程。
+- Worker 在每次分配前检测沙盒外设备占用；共享节点仍建议所有使用方统一通过 Neu Box 申请设备。
+- Reaper 以内核 cgroup 的递归进程状态为准；只有沙盒内最后一个进程退出后才释放设备。
+- Neu Box 提供节点内资源仲裁与隔离，不替代集群级身份认证、网络边界或厂商驱动安全机制。
+
+## 开发与测试
+
+```bash
+git clone --recurse-submodules https://github.com/neusbox/neu_box.git
+cd neu_box
+
+uv sync --frozen --all-groups
+uv run --frozen pytest -q tests/unit
+
+# 构建当前架构发布包
+uv run --frozen --group build deploy/build_release.py
+
+# 对已部署 Worker 执行真实 API、任务、设备和 Reaper 验收
 ./run.sh deployment-test
-# 也可在 ./run.sh 的交互菜单中选择 12
-
-# 发布到 GitHub Release 时，tag 使用 v<version>，并同时上传这两个文件：
-# neu-box-<version>-linux-<arch>.tar.gz
-# neu-box-<version>-linux-<arch>.tar.gz.sha256
-
-# e2e（需要已部署的 worker + WebUI）
-NEU_BOX_TEST_MASTER=http://<master>:25565 NEU_BOX_TEST_PASS='...' \
-  uv run pytest tests/test_queue.py
 ```
 
-## 仓库布局
+单元测试默认不访问生产服务；实机验收会创建真实任务并短暂占用设备，应在维护
+窗口执行。测试范围与参数见 [tests/README.md](tests/README.md)。
 
-```
-src/neu_box/
-├── config.py, logging_config.py, database/   共享框架（webui 仓库有同源副本）
-└── worker/
-    ├── app.py               Flask 应用 + /healthz (api_version)
-    ├── executor/            任务队列、沙盒管理、设备分配、状态上报
-    ├── migrations/          0001..0003（版本钉死，只增不改）
-    └── resources/           sandbox.sh、BPF、设备状态脚本
-deploy/                      构建、安装器（保留）、spec、配置、systemd
-run.sh                       交互式安装、升级、回滚与服务管理入口
-tests/unit/                  单测
-tests/test_queue.py          e2e 集成（依赖部署环境）
-thirds/webui/, thirds/goClient/ submodule（配套版本指针）
-docs/                        worker API 契约 + 部署 + 迁移手册
+## 仓库结构
+
+```text
+src/neu_box/worker/   Worker 应用、任务执行、沙盒与设备管理
+deploy/               发布构建、安装器、配置和 systemd unit
+docs/                 API、部署与数据库迁移文档
+tests/                单元测试、跨仓库集成测试与实机验收
+thirds/               WebUI 与 Go Client 的兼容性 submodule
+run.sh                安装、升级、运维、测试和构建统一入口
 ```
 
-## 版本规则
+## 文档
 
-- 版本号：`src/neu_box/__init__.py` 的 `__version__`
-- `API_VERSION`：worker HTTP API 版本，仅破坏性变更时 +1
-- 同一版本号不得重构建复用（安装器按 SHA256SUMS 钉死，拒绝覆盖）
+| 文档 | 内容 |
+|---|---|
+| [部署与升级手册](docs/deployment.md) | 安装、在线/离线升级、回滚、配置、权限与日志 |
+| [Worker HTTP API](docs/worker-api.md) | API v2 契约、任务、日志和终端沙盒 |
+| [数据库迁移手册](docs/database-migrations.md) | Schema 版本、迁移开发、部署与回滚 |
+| [测试说明](tests/README.md) | 单元测试、集成测试与实机验收 |
+
+## 版本与发布
+
+- Worker 版本定义在 `src/neu_box/__init__.py`
+- 同一版本号不得以不同内容重新构建；安装器会按 `SHA256SUMS` 拒绝原地覆盖
+- GitHub Release 使用 `v<version>` tag，并为每种架构同时上传 `.tar.gz` 与
+  `.tar.gz.sha256`
+
+## 参与项目
+
+问题与功能建议请提交到 [GitHub Issues](https://github.com/neusbox/neu_box/issues)。
+提交代码前请运行单元测试，并同步更新相关 API 或部署文档。
+
+## License
+
+许可条款见 [LICENSE](LICENSE)。
