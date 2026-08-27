@@ -219,7 +219,7 @@ resolve_release_tag() {
     local requested_version="$1"
     local base_url="${RELEASE_BASE_URL%/}"
     local repository="$RELEASE_REPOSITORY"
-    local effective tag
+    local effective tag tag_prefix
     local -a protocol_args=()
 
     if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -249,9 +249,18 @@ resolve_release_tag() {
         fi
         effective="${effective%%\?*}"
         effective="${effective%/}"
-        tag="${effective##*/}"
-        if [[ "$tag" == 'latest' ]]; then
-            echo "error: GitHub latest Release 没有重定向到具体版本" >&2
+        tag_prefix="$base_url/$repository/releases/tag/"
+        if [[ "$effective" == "$base_url/$repository/releases" ]]; then
+            echo "error: GitHub 仓库没有已发布的 latest Release: $repository" >&2
+            return 1
+        fi
+        if [[ "$effective" != "$tag_prefix"* ]]; then
+            echo "error: GitHub latest Release 重定向地址无效: $effective" >&2
+            return 1
+        fi
+        tag="${effective#"$tag_prefix"}"
+        if [[ -z "$tag" || "$tag" == */* ]]; then
+            echo "error: GitHub latest Release tag 路径无效: $effective" >&2
             return 1
         fi
     fi
@@ -269,6 +278,15 @@ verify_download_checksum() {
     local asset_name="$3"
     local -a lines=()
     local expected listed extra actual ignored
+
+    if [[ ! -f "$archive" ]]; then
+        echo "error: Release 压缩包不存在: $archive" >&2
+        return 1
+    fi
+    if [[ ! -f "$checksum_file" ]]; then
+        echo "error: Release checksum 文件不存在: $checksum_file" >&2
+        return 1
+    fi
 
     mapfile -t lines < <(sed '/^[[:space:]]*$/d' "$checksum_file")
     if ((${#lines[@]} != 1)); then
@@ -371,14 +389,20 @@ online_update() (
         esac
     done
 
-    require_command curl
-    require_command tar
-    require_command sha256sum
-    require_command sed
-    require_command sort
-    installer="$(installed_installer)"
-    current="$(installed_version "$installer")"
-    tag="$(resolve_release_tag "$requested_version")"
+    require_command curl || return $?
+    require_command tar || return $?
+    require_command sha256sum || return $?
+    require_command sed || return $?
+    require_command sort || return $?
+    if ! installer="$(installed_installer)"; then
+        return 1
+    fi
+    if ! current="$(installed_version "$installer")"; then
+        return 1
+    fi
+    if ! tag="$(resolve_release_tag "$requested_version")"; then
+        return 1
+    fi
     version="${tag#v}"
     if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
         echo "error: 无效的 Release 版本: $version" >&2
@@ -412,12 +436,17 @@ online_update() (
         esac
     fi
 
-    architecture="$(release_architecture)"
+    if ! architecture="$(release_architecture)"; then
+        return 1
+    fi
     asset_name="neu-box-$version-linux-$architecture.tar.gz"
     checksum_name="$asset_name.sha256"
     base_url="${RELEASE_BASE_URL%/}"
     release_url="$base_url/$RELEASE_REPOSITORY/releases/download/$tag"
-    update_tmp="$(mktemp -d "${TMPDIR:-/tmp}/neu-box-update.XXXXXX")"
+    if ! update_tmp="$(mktemp -d "${TMPDIR:-/tmp}/neu-box-update.XXXXXX")"; then
+        echo "error: 无法创建在线更新临时目录" >&2
+        return 1
+    fi
     trap 'rm -rf -- "$update_tmp"' EXIT
     archive="$update_tmp/$asset_name"
     checksum_file="$update_tmp/$checksum_name"
@@ -427,24 +456,45 @@ online_update() (
     fi
 
     printf '正在下载 %s...\n' "$asset_name"
-    curl --fail --silent --show-error --location \
+    if ! curl --fail --silent --show-error --location \
         --connect-timeout 10 --max-time 1800 --retry 2 --retry-delay 1 \
         "${protocol_args[@]}" --output "$archive" \
-        "$release_url/$asset_name"
-    curl --fail --silent --show-error --location \
+        "$release_url/$asset_name"; then
+        echo "error: 下载 Release 压缩包失败: $asset_name" >&2
+        return 1
+    fi
+    if ! curl --fail --silent --show-error --location \
         --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 \
         "${protocol_args[@]}" --output "$checksum_file" \
-        "$release_url/$checksum_name"
-    verify_download_checksum "$archive" "$checksum_file" "$asset_name"
+        "$release_url/$checksum_name"; then
+        echo "error: 下载 Release checksum 失败: $checksum_name" >&2
+        return 1
+    fi
+    if ! verify_download_checksum "$archive" "$checksum_file" "$asset_name"; then
+        return 1
+    fi
 
     release_root="neu-box-$version-linux-$architecture"
-    extract_release_safely "$archive" "$update_tmp/extracted" "$release_root"
-    release_dir="$(resolve_release_source "$update_tmp/extracted/$release_root")"
+    if ! extract_release_safely \
+        "$archive" "$update_tmp/extracted" "$release_root"; then
+        return 1
+    fi
+    if ! release_dir="$(
+        resolve_release_source "$update_tmp/extracted/$release_root"
+    )"; then
+        return 1
+    fi
     printf '发布包已验证，开始执行升级: %s\n' "$release_dir"
     # 使用本机已安装且受信任的安装器先验证发布目录，再执行迁移与切换；
     # 新包内的安装器只会在整个升级成功后由旧安装器原子替换。
-    as_root "$installer" \
-        upgrade --role worker --source "$release_dir"
+    if as_root "$installer" \
+        upgrade --role worker --source "$release_dir"; then
+        :
+    else
+        local exit_code=$?
+        echo "error: Neu Box 在线升级失败（exit=$exit_code）" >&2
+        return "$exit_code"
+    fi
     printf '在线更新完成: %s -> %s\n' "$current" "$version"
 )
 

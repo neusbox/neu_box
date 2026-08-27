@@ -107,10 +107,16 @@ while (($#)); do
 done
 if ((head_request)); then
     printf 'HEAD %s\\n' "$url" >>"$NEU_BOX_FAKE_REQUEST_LOG"
-    printf '%s/%s/releases/tag/%s' \
-        "${NEU_BOX_RELEASE_BASE_URL%/}" \
-        "$NEU_BOX_RELEASE_REPOSITORY" \
-        "$NEU_BOX_FAKE_RELEASE_TAG"
+    if [[ "$NEU_BOX_FAKE_RELEASE_TAG" == '__NO_RELEASE__' ]]; then
+        printf '%s/%s/releases' \
+            "${NEU_BOX_RELEASE_BASE_URL%/}" \
+            "$NEU_BOX_RELEASE_REPOSITORY"
+    else
+        printf '%s/%s/releases/tag/%s' \
+            "${NEU_BOX_RELEASE_BASE_URL%/}" \
+            "$NEU_BOX_RELEASE_REPOSITORY" \
+            "$NEU_BOX_FAKE_RELEASE_TAG"
+    fi
 else
     printf 'GET %s\\n' "$url" >>"$NEU_BOX_FAKE_REQUEST_LOG"
     name="${url##*/}"
@@ -138,7 +144,11 @@ source "$1"
 INSTALLED_INSTALLER="$2"
 as_root() { "$@"; }
 shift 2
-online_update "$@"
+if online_update "$@"; then
+    exit 0
+else
+    exit "$?"
+fi
 """
     environment = os.environ.copy()
     environment.update({
@@ -219,6 +229,39 @@ def test_check_update_same_version_does_not_download_assets(tmp_path):
     assert "无需更新" in result.stdout
     assert not record.exists()
     assert not any(line.startswith("GET ") for line in requests)
+
+
+def test_latest_without_published_release_stops_before_download(tmp_path):
+    _tag, assets = _release_assets(tmp_path, "1.1.0")
+    result, record, requests = _run_online_update(
+        tmp_path, "1.0.0", "__NO_RELEASE__", assets, "--yes"
+    )
+
+    assert result.returncode != 0
+    assert "没有已发布的 latest Release" in result.stderr
+    assert "目标版本" not in result.stdout
+    assert "发布包已验证" not in result.stdout
+    assert not record.exists()
+    assert not any(line.startswith("GET ") for line in requests)
+
+
+def test_asset_download_failure_stops_in_menu_condition(tmp_path):
+    tag, assets = _release_assets(tmp_path, "1.1.0")
+    asset_name = next(name for name in assets if name.endswith(".tar.gz"))
+    del assets[asset_name]
+
+    result, record, requests = _run_online_update(
+        tmp_path, "1.0.0", tag, assets, "--yes"
+    )
+
+    assert result.returncode != 0
+    assert "下载 Release 压缩包失败" in result.stderr
+    assert "checksum" not in result.stderr
+    assert "发布包已验证" not in result.stdout
+    assert "在线更新完成" not in result.stdout
+    assert not record.exists()
+    assert sum(line.startswith("GET ") for line in requests) == 1
+    assert not list(tmp_path.glob("neu-box-update.*"))
 
 
 def test_online_update_rejects_corrupt_checksum(tmp_path):
