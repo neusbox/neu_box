@@ -26,6 +26,8 @@ from typing import Iterable
 
 
 ROLES = ("worker",)
+LEGACY_SPLIT_ROLES = ("master",)
+_LEGACY_ROLES_STATE_KEY = "_legacy_split_roles"
 STATE_FORMAT = 1
 VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
@@ -278,12 +280,24 @@ def _read_state(layout: Layout) -> dict:
     if state.get("format") != STATE_FORMAT:
         raise InstallError("不支持的安装状态格式")
     roles = state.get("installed_roles")
+    accepted_roles = ROLES + LEGACY_SPLIT_ROLES
     if (
         not isinstance(roles, list)
-        or any(role not in ROLES for role in roles)
+        or any(
+            not isinstance(role, str) or role not in accepted_roles
+            for role in roles
+        )
         or len(roles) != len(set(roles))
     ):
         raise InstallError("安装状态中的 installed_roles 无效")
+    # 0.3.0 起 Master 已拆分到 neu_box_webui 仓库。旧的单仓安装状态
+    # 可能同时记录 master 和 worker；worker-only 安装器只接管 worker，
+    # 但保留这一瞬态标记，以便命令向操作者说明旧 Master 不会被升级。
+    state.pop(_LEGACY_ROLES_STATE_KEY, None)
+    legacy_roles = [role for role in roles if role in LEGACY_SPLIT_ROLES]
+    state["installed_roles"] = [role for role in roles if role in ROLES]
+    if legacy_roles:
+        state[_LEGACY_ROLES_STATE_KEY] = legacy_roles
     current_version = state.get("current_version")
     if current_version is not None and not _valid_version(current_version):
         raise InstallError("安装状态中的 current_version 无效")
@@ -292,6 +306,23 @@ def _read_state(layout: Layout) -> dict:
         if not isinstance(previous, dict) or not _valid_version(previous.get("version")):
             raise InstallError("安装状态中的 previous 记录无效")
     return state
+
+
+def _pop_legacy_split_roles(state: dict) -> list[str]:
+    roles = state.pop(_LEGACY_ROLES_STATE_KEY, [])
+    return list(roles) if isinstance(roles, list) else []
+
+
+def _log_legacy_split_roles(roles: Iterable[str]) -> None:
+    retired = sorted(set(roles))
+    if not retired:
+        return
+    _log(
+        "检测到旧版安装角色 " + ",".join(retired)
+        + "；当前发布包只升级 worker。旧 Master 的配置、数据库和 systemd "
+        "unit 会保留，但不再由本安装器管理；切换版本后请使用 "
+        "neu_box_webui 仓库启动 WebUI。"
+    )
 
 
 def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
@@ -996,6 +1027,8 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
     version = str(manifest["version"])
     requested = {args.role}
     state = _read_state(layout)
+    legacy_split_roles = _pop_legacy_split_roles(state)
+    _log_legacy_split_roles(legacy_split_roles)
     installed_roles = set(state.get("installed_roles") or [])
     roles = installed_roles | requested
     systemd = _systemd_available(layout, args.no_systemd)
@@ -1129,6 +1162,8 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
 
 def rollback(args: argparse.Namespace, layout: Layout) -> int:
     state = _read_state(layout)
+    legacy_split_roles = _pop_legacy_split_roles(state)
+    _log_legacy_split_roles(legacy_split_roles)
     roles = set(state.get("installed_roles") or [])
     previous = state.get("previous")
     if not roles or not previous:
@@ -1234,8 +1269,11 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
 
 def status(layout: Layout) -> int:
     state = _read_state(layout)
+    legacy_split_roles = _pop_legacy_split_roles(state)
     current = _current_release(layout)
     result = dict(state)
+    if legacy_split_roles:
+        result["legacy_split_roles"] = sorted(legacy_split_roles)
     result["current_path"] = str(current) if current else None
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1252,7 +1290,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  neu-box-install install --role worker\n"
-            "  neu-box-install upgrade --role worker --source /tmp/neu-box-0.3.1\n"
+            "  neu-box-install upgrade --role worker --source /tmp/neu-box-0.3.2\n"
             "  neu-box-install rollback\n"
             "  neu-box-install status\n\n"
             "--root 和 --no-systemd 是发布测试选项，必须写在子命令之前。"

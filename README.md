@@ -45,8 +45,8 @@ git add thirds/webui && git commit -m "chore: bump webui to v0.0.2"
 发布包：`neu-box-<version>-linux-<arch>.tar.gz`（PyInstaller，含安装器）。
 
 ```bash
-tar -xzf neu-box-0.3.1-linux-arm64.tar.gz && cd neu-box-0.3.1-linux-arm64
-sha256sum -c ../neu-box-0.3.1-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.3.2-linux-arm64.tar.gz && cd neu-box-0.3.2-linux-arm64
+sha256sum -c ../neu-box-0.3.2-linux-arm64.tar.gz.sha256
 sudo ./neu-box-install install --role worker      # 首次安装
 sudo ./neu-box-install upgrade --role worker      # 升级
 sudo ./neu-box-install rollback                   # 回滚

@@ -326,6 +326,49 @@ def test_install_and_upgrade_commands_have_distinct_lifecycle(tmp_path):
     assert install._current_release(install.Layout(installed_root)).name == "1.0.0"
 
 
+def test_upgrade_normalizes_roles_from_legacy_monorepo_state(tmp_path):
+    root = tmp_path / "root"
+    release_one = _fake_release(tmp_path / "one", "1.0.0")
+    release_two = _fake_release(tmp_path / "two", "1.1.0")
+    assert _deploy(root, release_one) == 0
+
+    layout = install.Layout(root)
+    state = json.loads(layout.state_file.read_text(encoding="utf-8"))
+    state["installed_roles"] = ["master", "worker"]
+    layout.state_file.write_text(json.dumps(state), encoding="utf-8")
+    legacy_config = layout.config / "master.env"
+    legacy_database = layout.data / "master" / "master.db"
+    legacy_config.write_text("LEGACY=yes\n", encoding="utf-8")
+    legacy_database.parent.mkdir(parents=True)
+    legacy_database.write_bytes(b"legacy-master-data")
+
+    assert _deploy(root, release_two, "upgrade") == 0
+
+    upgraded_state = json.loads(layout.state_file.read_text(encoding="utf-8"))
+    assert upgraded_state["installed_roles"] == ["worker"]
+    assert install._current_release(layout).name == "1.1.0"
+    assert legacy_config.read_text(encoding="utf-8") == "LEGACY=yes\n"
+    assert legacy_database.read_bytes() == b"legacy-master-data"
+
+
+def test_unknown_role_in_install_state_is_still_rejected(tmp_path):
+    layout = install.Layout(tmp_path / "root")
+    layout.state_file.parent.mkdir(parents=True)
+    layout.state_file.write_text(json.dumps({
+        "format": install.STATE_FORMAT,
+        "installed_roles": ["worker", "unknown"],
+        "current_version": "1.0.0",
+        "previous": None,
+    }), encoding="utf-8")
+
+    try:
+        install._read_state(layout)
+    except install.InstallError as exc:
+        assert "installed_roles" in str(exc)
+    else:
+        raise AssertionError("unknown install role was accepted")
+
+
 def test_staged_absolute_path_cannot_escape_root(tmp_path):
     layout = install.Layout(tmp_path / "root")
     try:
