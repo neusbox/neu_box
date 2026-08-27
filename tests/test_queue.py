@@ -4,7 +4,7 @@
 import sys
 import time
 from common import (
-    get, post, assert_ok, assert_gt, run_tests, get_devnode_id,
+    delete, get, post, assert_ok, assert_gt, run_tests, get_devnode_id,
 )
 
 QUICK = "--quick" in sys.argv
@@ -35,7 +35,7 @@ def test_concurrency():
     for i in range(TASK_COUNT):
         user = TEST_USERS[i % len(TEST_USERS)]
         s = sleep_times[i]
-        _, d = post("/command/run", {
+        _, d = post("/tasks", {
             "node_id": gpu_id, "user_id": user,
             "command": f"echo '[{user}] T{i+1}({s}s) start'; sleep {s}; echo 'T{i+1} done'",
             "cpu": CPU_PER_TASK, "memory": MEM_PER_TASK,
@@ -52,7 +52,7 @@ def test_concurrency():
     start = time.time()
 
     while done_count < len(task_ids) and (time.time() - start) < timeout:
-        _, data = get(f"/command/queue?node_id={gpu_id}")
+        _, data = get(f"/tasks?node_id={gpu_id}")
         # 只统计本测试提交的任务（共享节点队列里有大量历史任务）
         by_id = {t["task_id"]: t for t in data.get("queue", [])}
         running_tasks = [by_id[tid] for tid in task_ids
@@ -90,7 +90,7 @@ def test_fifo_order():
     """先提交的任务先完成（用设备强制串行）。"""
     node_id = get_devnode_id()
 
-    _, d1 = post("/command/run", {
+    _, d1 = post("/tasks", {
         "node_id": node_id, "user_id": "pengyt",
         "command": "echo FIFO_1; sleep 2",
         "cpu": 1, "memory": 1, "mem_unit": "GB", "device_num": 1,
@@ -98,7 +98,7 @@ def test_fifo_order():
     assert_ok(_, f"任务1 失败: {d1}")
     time.sleep(0.3)
 
-    _, d2 = post("/command/run", {
+    _, d2 = post("/tasks", {
         "node_id": node_id, "user_id": "lipz",
         "command": "echo FIFO_2; sleep 2",
         "cpu": 1, "memory": 1, "mem_unit": "GB", "device_num": 1,
@@ -116,7 +116,7 @@ def test_batch_delete():
 
     ids = []
     for i in range(3):
-        _, d = post("/command/run", {
+        _, d = post("/tasks", {
             "node_id": gpu_id, "user_id": "pengyt",
             "command": f"sleep {1+i}; echo batch_{i}",
             "cpu": 1, "memory": 1, "mem_unit": "GB", "device_num": 0,
@@ -126,7 +126,7 @@ def test_batch_delete():
 
     time.sleep(3)
 
-    _, d = post("/command/tasks/delete", {"node_id": gpu_id, "task_ids": ids})
+    _, d = delete("/tasks", {"node_id": gpu_id, "task_ids": ids})
     if not (200 <= _ < 300):
         # Worker 可能还没重启，新路由未生效
         print(f"    跳过: Worker 未更新 (HTTP {_} {d.get('error','')[:60]})", flush=True)
@@ -136,7 +136,7 @@ def test_batch_delete():
     assert_gt(deleted, 0, "至少应删除已完成任务")
 
     # 验证已删除的不在队列中
-    _, data = get(f"/command/queue?node_id={gpu_id}")
+    _, data = get(f"/tasks?node_id={gpu_id}")
     queue_ids = {t["task_id"] for t in data.get("queue", [])}
     remaining = [tid for tid in ids if tid in queue_ids]
     print(f"    剩余: {len(remaining)} 个 (可能是 running)", flush=True)
@@ -165,7 +165,7 @@ def test_priority_preemption():
         }
         if priority is not None:
             body["priority"] = priority
-        _, d = post("/command/run", body)
+        _, d = post("/tasks", body)
         assert_ok(_, f"提交失败: {d.get('error', _)}")
         return d
 
@@ -188,7 +188,7 @@ def test_priority_preemption():
 
     # 位置号以全部提交后的当前队列为准（响应里的 position 是各自提交时刻的快照）
     time.sleep(0.3)
-    _, q = get(f"/command/queue?node_id={node_id}")
+    _, q = get(f"/tasks?node_id={node_id}")
     pos = {t["task_id"]: t["position"] for t in q.get("queue", [])}
     assert pos.get(r1, 99) < pos.get(r2, 99) < pos.get(n2, 99), \
         f"赶论文任务应排在普通任务前: R1=#{pos.get(r1)} R2=#{pos.get(r2)} N2=#{pos.get(n2)}"
@@ -196,7 +196,7 @@ def test_priority_preemption():
     # 等三个任务都跑完
     deadline = time.time() + 40
     while time.time() < deadline:
-        _, q = get(f"/command/queue?node_id={node_id}")
+        _, q = get(f"/tasks?node_id={node_id}")
         states = {
             tid: next((t.get("status") for t in q.get("queue", [])
                        if t["task_id"] == tid), None)
@@ -209,7 +209,7 @@ def test_priority_preemption():
         raise AssertionError(f"等待任务完成超时: {states}")
 
     def started_at(tid):
-        _, d = get(f"/command/result/{tid}?node_id={node_id}")
+        _, d = get(f"/tasks/{tid}?node_id={node_id}")
         assert_ok(_, f"查结果失败 {tid}: {d}")
         return d.get("started_at")
 
@@ -220,7 +220,7 @@ def test_priority_preemption():
         f"启动顺序必须为 R1 < R2 < N2，实际 R1={s_r1} R2={s_r2} N2={s_n2}"
 
     # 非法 priority（负数）应被数据层拒绝并返回 400
-    status, d = post("/command/run", {
+    status, d = post("/tasks", {
         "node_id": node_id, "user_id": "pengyt",
         "command": "echo bad", "device_num": 0, "priority": -1,
     })
@@ -228,7 +228,7 @@ def test_priority_preemption():
         f"非法 priority 应被拒绝: HTTP {status} {d}"
 
     # 超范围 priority（>1，当前仅支持 0=普通、1=赶论文）同样被拒绝
-    status, d = post("/command/run", {
+    status, d = post("/tasks", {
         "node_id": node_id, "user_id": "pengyt",
         "command": "echo bad", "device_num": 0, "priority": 2,
     })

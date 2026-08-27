@@ -8,7 +8,10 @@
 """
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -106,3 +109,188 @@ def test_free_devices_excludes_sticky_busy_on_failure(fake_script):
     assert sm.SbxManager._get_free_devices(mgr) == ["235:0", "235:1"]
     fake_script["exc"] = subprocess.TimeoutExpired("npu-smi", 10)
     assert sm.SbxManager._get_free_devices(mgr) == ["235:0", "235:1"]
+
+
+class _ReaperDB:
+    def __init__(self, pids=None):
+        self.records = {
+            'sbx_user_task.slice': {
+                'name': 'sbx_user_task.slice',
+                'pids': list(pids or []),
+                'devices': ['235:0'],
+                'created_at': time.time() - 3600,
+            },
+        }
+        self.pid_updates = []
+
+    def list_sandboxes(self):
+        return [dict(record) for record in self.records.values()]
+
+    def get_sandbox(self, name):
+        record = self.records.get(name)
+        return dict(record) if record else None
+
+    def update_sandbox_pids(self, name, pids):
+        self.records[name]['pids'] = list(pids)
+        self.pid_updates.append((name, list(pids)))
+
+    def delete_sandbox(self, name):
+        self.records.pop(name, None)
+
+
+class _ReaperManager(sm.SbxManager):
+    def __init__(self, snapshots, pids=None, destroy_results=None):
+        self.db = _ReaperDB(pids)
+        self._lock = threading.RLock()
+        self.snapshots = list(snapshots)
+        self.last_snapshot = None
+        self.destroy_results = list(destroy_results or [True])
+        self.destroy_attempts = []
+
+    def _read_cgroup_snapshot(self, _name):
+        if self.snapshots:
+            value = self.snapshots.pop(0)
+            if not isinstance(value, BaseException):
+                self.last_snapshot = value
+        else:
+            value = self.last_snapshot
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def destroy_sandbox(self, name):
+        self.destroy_attempts.append(name)
+        result = self.destroy_results.pop(0) if self.destroy_results else True
+        if result:
+            self.db.delete_sandbox(name)
+        return result
+
+    def list_sandboxes_via_script(self):
+        return []
+
+
+def test_reaper_ignores_reused_historical_pid_and_reclaims_device(monkeypatch):
+    """历史 PID 即使被复用且存活，也不能阻止空 cgroup 释放卡。"""
+    manager = _ReaperManager(
+        snapshots=[([], False), ([], False)],
+        pids=[4242],
+    )
+
+    def forbidden_kill(*_args):
+        raise AssertionError('Reaper 不应再用 kill(pid, 0) 判断 cgroup 归属')
+
+    monkeypatch.setattr(sm.os, 'kill', forbidden_kill)
+    assert manager.cleanup_orphaned() == 1
+    assert manager.destroy_attempts == ['sbx_user_task.slice']
+    assert manager.db.records == {}
+
+
+def test_reaper_keeps_populated_hierarchy_even_when_pid_snapshot_is_empty():
+    """populated 会递归覆盖子 cgroup，不能因一次 PID 扫描为空误收尸。"""
+    manager = _ReaperManager(
+        snapshots=[([], True)],
+        pids=[111],
+    )
+    assert manager.cleanup_orphaned() == 0
+    assert manager.destroy_attempts == []
+    assert manager.db.records['sbx_user_task.slice']['pids'] == []
+
+
+def test_reaper_retries_read_failure_then_reclaims_empty_sandbox():
+    manager = _ReaperManager(
+        snapshots=[
+            OSError('temporary cgroup read failure'),
+            ([], False),
+            ([], False),
+        ],
+        pids=[111],
+    )
+    assert manager.cleanup_orphaned() == 0
+    assert manager.db.records
+    assert manager.cleanup_orphaned() == 1
+    assert manager.db.records == {}
+
+
+def test_reaper_retries_failed_destroy_until_ebpf_cleanup_succeeds():
+    manager = _ReaperManager(
+        snapshots=[([], False), ([], False)],
+        pids=[111],
+        destroy_results=[False, True],
+    )
+    assert manager.cleanup_orphaned() == 0
+    assert manager.db.records
+    assert manager.cleanup_orphaned() == 1
+    assert manager.destroy_attempts == [
+        'sbx_user_task.slice',
+        'sbx_user_task.slice',
+    ]
+
+
+def test_reaper_missing_cgroup_still_runs_destroy_for_ebpf_cleanup():
+    manager = _ReaperManager(
+        snapshots=[None],
+        pids=[111],
+    )
+    assert manager.cleanup_orphaned() == 1
+    assert manager.destroy_attempts == ['sbx_user_task.slice']
+
+
+def test_cgroup_snapshot_recursively_reads_child_processes(tmp_path):
+    cgroup = tmp_path / 'sandbox_sbx_user_task.slice'
+    child = cgroup / 'container-child'
+    child.mkdir(parents=True)
+    (cgroup / 'cgroup.procs').write_text('101\n', encoding='utf-8')
+    (child / 'cgroup.procs').write_text('202\n', encoding='utf-8')
+    (cgroup / 'cgroup.events').write_text(
+        'populated 1\nfrozen 0\n', encoding='utf-8'
+    )
+    manager = object.__new__(sm.SbxManager)
+    manager._cg_path = lambda _name: str(cgroup)
+
+    assert manager._read_cgroup_snapshot('sbx_user_task.slice') == (
+        [101, 202],
+        True,
+    )
+
+
+def test_cgroup_snapshot_populated_zero_discards_exited_pid(tmp_path):
+    cgroup = tmp_path / 'sandbox_sbx_user_task.slice'
+    cgroup.mkdir()
+    (cgroup / 'cgroup.procs').write_text('303\n', encoding='utf-8')
+    (cgroup / 'cgroup.events').write_text('populated 0\n', encoding='utf-8')
+    manager = object.__new__(sm.SbxManager)
+    manager._cg_path = lambda _name: str(cgroup)
+
+    assert manager._read_cgroup_snapshot('sbx_user_task.slice') == (
+        [],
+        False,
+    )
+
+
+def test_join_replaces_db_pid_history_with_cgroup_snapshot():
+    manager = object.__new__(sm.SbxManager)
+    manager.db = _ReaperDB(pids=[10, 11, 12])
+    manager._lock = threading.RLock()
+    manager._run_script = lambda *_args: SimpleNamespace(
+        returncode=0,
+        stdout='',
+        stderr='',
+    )
+    manager._read_cgroup_snapshot = lambda _name: ([22, 23], True)
+
+    assert manager.join_sandbox('sbx_user_task.slice', 22)
+    assert manager.db.records['sbx_user_task.slice']['pids'] == [22, 23]
+
+
+def test_destroy_timeout_keeps_record_for_next_reaper_scan(tmp_path):
+    manager = object.__new__(sm.SbxManager)
+    manager.db = _ReaperDB(pids=[])
+    manager._lock = threading.RLock()
+    manager._cg_path = lambda _name: str(tmp_path / 'missing-cgroup')
+
+    def timeout(*_args):
+        raise subprocess.TimeoutExpired('sandbox.sh destroy', 30)
+
+    manager._run_script = timeout
+    assert not manager.destroy_sandbox('sbx_user_task.slice')
+    assert 'sbx_user_task.slice' in manager.db.records

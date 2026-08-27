@@ -13,7 +13,7 @@ class _FakeSandboxManager:
 
 def _command_client() -> Flask:
     app = Flask(__name__)
-    app.register_blueprint(command_module.command_bp, url_prefix="/command")
+    app.register_blueprint(command_module.command_bp, url_prefix="/tasks")
     return app
 
 
@@ -21,7 +21,7 @@ def test_submit_rejects_unknown_system_user():
     client = _command_client().test_client()
     username = "__neu_box_missing_user__"
 
-    response = client.post("/command/run", json={
+    response = client.post("/tasks", json={
         "user_id": username,
         "command": "true",
     })
@@ -78,7 +78,7 @@ def test_host_shell_errors_are_returned_in_task_log(
     assert message in result["stdout"]
 
     response = _command_client().test_client().get(
-        f"/command/result/{task_id}/log?raw=1"
+        f"/tasks/{task_id}/log?raw=1"
     )
     assert response.status_code == 200
     assert message in response.get_data(as_text=True)

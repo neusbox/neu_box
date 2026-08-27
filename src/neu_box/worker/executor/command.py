@@ -4,9 +4,11 @@
   TaskQueue (FIFO)  →  sandbox 设备分配  →  Host / Docker Exec
 
 API:
-  POST /command/run           提交命令（异步），返回 task_id
-  GET  /command/queue         查看所有任务队列（公开元数据，不含日志）
-  GET  /command/result/<id>   查看自己的任务结果（含日志，需 user_id 匹配）
+  POST   /tasks              提交命令（异步），返回 task_id
+  GET    /tasks              查看任务队列（公开元数据，不含日志）
+  GET    /tasks/<id>         查看任务结果
+  GET    /tasks/<id>/log     增量读取任务日志
+  DELETE /tasks              批量删除或取消任务
 """
 
 import logging
@@ -734,8 +736,8 @@ class TaskQueue:
                         self._cv.notify()
                 time.sleep(1)
 
-@command_bp.route('/run', methods=['POST'])
-def run_command():
+@command_bp.route('', methods=['POST'])
+def create_task():
     """提交 Host 或现有 Docker 容器命令。"""
     body = request.get_json(silent=True) or {}
     command = (body.get('command') or '').strip()
@@ -838,7 +840,7 @@ def run_command():
     }, 202
 
 
-@command_bp.route('/tasks/delete', methods=['POST'])
+@command_bp.route('', methods=['DELETE'])
 def delete_tasks():
     """批量删除任务；运行中任务转为异步取消并保留结果/日志。
 
@@ -855,8 +857,8 @@ def delete_tasks():
     return {'deleted': deleted, 'message': f'已删除 {deleted} 个任务'}, 200
 
 
-@command_bp.route('/queue', methods=['GET'])
-def get_queue():
+@command_bp.route('', methods=['GET'])
+def list_tasks():
     """查看当前任务队列（所有用户的待执行 + 正在执行的任务，不含日志）。
 
     响应: { "queue": [...], "running": {...} }
@@ -868,8 +870,8 @@ def get_queue():
     }, 200
 
 
-@command_bp.route('/result/<task_id>', methods=['GET'])
-def get_result(task_id: str):
+@command_bp.route('/<task_id>', methods=['GET'])
+def get_task(task_id: str):
     """查看任务结果元数据（状态、返回码等，不含日志内容）。"""
     tq = TaskQueue.get_instance()
     result = tq.get_result(task_id)
@@ -878,8 +880,8 @@ def get_result(task_id: str):
     return result, 200
 
 
-@command_bp.route('/result/<task_id>/log', methods=['GET'])
-def get_result_log(task_id: str):
+@command_bp.route('/<task_id>/log', methods=['GET'])
+def get_task_log(task_id: str):
     """获取任务日志文件内容。
 
     Query params:

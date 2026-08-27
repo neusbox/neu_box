@@ -15,9 +15,9 @@ Neu Box 在 GPU/NPU 节点上提供：
 
 | 仓库 | 角色 | 版本 | 说明 |
 |---|---|---|---|
-| **neu_box**（本仓库） | worker + 聚合 | 0.3.0+ | 节点侧全部逻辑；e2e 测试；用 submodule 钉住配套版本 |
-| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI（原 master） | 0.0.1+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
-| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` CLI | 0.0.1+ | Go 静态二进制，直连 worker |
+| **neu_box**（本仓库） | worker + 聚合 | 0.4.0+ | 节点侧全部逻辑；e2e 测试；用 submodule 钉住配套版本 |
+| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI（原 master） | 0.1.0+ | 节点池、任务转发、实验记录、Web 界面；独立部署 |
+| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` CLI | 0.2.0+ | Go 静态二进制，直连 worker |
 
 三个仓库**代码零依赖**，只通过 HTTP 契约相交：
 
@@ -45,8 +45,8 @@ git add thirds/webui && git commit -m "chore: bump webui to v0.0.2"
 发布包：`neu-box-<version>-linux-<arch>.tar.gz`（PyInstaller，含安装器）。
 
 ```bash
-tar -xzf neu-box-0.3.3-linux-arm64.tar.gz && cd neu-box-0.3.3-linux-arm64
-sha256sum -c ../neu-box-0.3.3-linux-arm64.tar.gz.sha256
+tar -xzf neu-box-0.4.0-linux-arm64.tar.gz && cd neu-box-0.4.0-linux-arm64
+sha256sum -c ../neu-box-0.4.0-linux-arm64.tar.gz.sha256
 sudo ./neu-box-install install --role worker      # 首次安装
 sudo ./neu-box-install upgrade --role worker      # 升级
 sudo ./neu-box-install rollback                   # 回滚

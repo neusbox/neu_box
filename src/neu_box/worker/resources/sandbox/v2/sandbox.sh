@@ -94,6 +94,37 @@ _cg_kickall() {
     # 旧名保留，内部转发到 _cg_kill_all
     _cg_kill_all "$@"
 }
+_cg_all_procs() {
+    # cgroup.procs 只列当前层级；递归读取，避免容器创建子 cgroup 后漏杀。
+    local name="$1" cg procs_file
+    cg=$(_cg "$name")
+    [ -d "$cg" ] || return 0
+    while IFS= read -r procs_file; do
+        cat "$procs_file" 2>/dev/null || true
+    done < <(find "$cg" -type f -name cgroup.procs 2>/dev/null)
+}
+_cg_is_populated() {
+    local name="$1" cg value
+    cg=$(_cg "$name")
+    [ -d "$cg" ] || { echo 0; return; }
+    value=$(awk '$1 == "populated" {print $2}' "$cg/cgroup.events" 2>/dev/null || true)
+    if [ -n "$value" ]; then
+        echo "$value"
+    elif [ -n "$(_cg_all_procs "$name")" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+_cg_remove_children() {
+    # 最深层优先删除空的子 cgroup，否则主目录会永久 rmdir 失败。
+    local name="$1" cg child
+    cg=$(_cg "$name")
+    [ -d "$cg" ] || return 0
+    while IFS= read -r child; do
+        rmdir "$child" 2>/dev/null || true
+    done < <(find "$cg" -mindepth 1 -depth -type d 2>/dev/null)
+}
 _cg_kill_all() {
     # 可靠地杀死 cgroup 内所有进程，确保 destroy 时不残留。
     # 流程: freeze → cgroup.kill → 等待清空 → kill -9 兜底 → 迁回根 cgroup
@@ -119,29 +150,27 @@ _cg_kill_all() {
         echo 1 > "$cg/cgroup.kill" 2>/dev/null || true
         waited=0
         while [ $waited -lt 50 ]; do
-            procs=$(cat "$cg/cgroup.procs" 2>/dev/null || true)
-            [ -z "$procs" ] && break
+            [ "$(_cg_is_populated "$name")" = "0" ] && break
             sleep 0.1
             waited=$((waited + 1))
         done
     fi
 
     # 3. 兜底: kill -9 残留进程（cgroup.kill 可能因内核版本问题未生效）
-    procs=$(cat "$cg/cgroup.procs" 2>/dev/null || true)
+    procs=$(_cg_all_procs "$name")
     for p in $procs; do
         kill -9 "$p" 2>/dev/null || true
     done
     # 再等一等让进程被 reaped
     waited=0
     while [ $waited -lt 20 ]; do
-        procs=$(cat "$cg/cgroup.procs" 2>/dev/null || true)
-        [ -z "$procs" ] && break
+        [ "$(_cg_is_populated "$name")" = "0" ] && break
         sleep 0.1
         waited=$((waited + 1))
     done
 
     # 4. Fallback: 如果有残留，迁回根 cgroup 以免 rmdir 失败
-    procs=$(cat "$cg/cgroup.procs" 2>/dev/null || true)
+    procs=$(_cg_all_procs "$name")
     for p in $procs; do
         echo "$p" > "$(_cg_root_procs)" 2>/dev/null || true
     done
@@ -194,8 +223,15 @@ _cg_id() {
 _cleanup_device_entries() {
     local name="$1" cgid="$2"
     local device_file="/tmp/neu_box_devices_${name}"
-    [ -f "$device_file" ] || return 0
-    local seen_majors=""
+    local cgid_file="/tmp/neu_box_cgid_${name}"
+    if [ -z "$cgid" ] && [ -f "$cgid_file" ]; then
+        cgid=$(cat "$cgid_file" 2>/dev/null || true)
+    fi
+    if [ ! -f "$device_file" ]; then
+        rm -f "$cgid_file"
+        return 0
+    fi
+    local seen_majors="" failed=0
     while read dev; do
         [ -z "$dev" ] && continue
         local major minor; read -r major minor <<< "$(parse_device "$dev")"
@@ -206,16 +242,37 @@ _cleanup_device_entries() {
         local key_hex; key_hex=$(printf '%02x %02x %02x %02x %02x %02x %02x %02x' \
             $(( major & 0xFF )) $(( (major >> 8) & 0xFF )) 0 0 \
             $(( minor_num & 0xFF )) $(( (minor_num >> 8) & 0xFF )) 0 0)
-        bpftool map delete pinned "$MAP_RESERVED_PIN" \
-            key hex $key_hex 2>/dev/null || true
+        if [ -e "$MAP_RESERVED_PIN" ]; then
+            if ! bpftool map show pinned "$MAP_RESERVED_PIN" >/dev/null 2>&1; then
+                failed=1
+            elif bpftool map lookup pinned "$MAP_RESERVED_PIN" \
+                key hex $key_hex >/dev/null 2>&1; then
+                # 只有确认 key 存在时才删除；删除失败必须保留元数据重试。
+                bpftool map delete pinned "$MAP_RESERVED_PIN" \
+                    key hex $key_hex 2>/dev/null || failed=1
+            fi
+        fi
         # major 条目（需要 cgid，无 cgid 时跳过但不影响设备释放）
         if [ -n "$cgid" ] && [[ " $seen_majors " != *" $major "* ]]; then
-            bpftool map delete pinned "$MAP_MAJORS_PIN" \
-                key hex $(_u64_hex "$cgid") $(_u32_hex "$major") 00 00 00 00 2>/dev/null || true
+            local major_key
+            major_key="$(_u64_hex "$cgid") $(_u32_hex "$major") 00 00 00 00"
+            if [ -e "$MAP_MAJORS_PIN" ]; then
+                if ! bpftool map show pinned "$MAP_MAJORS_PIN" >/dev/null 2>&1; then
+                    failed=1
+                elif bpftool map lookup pinned "$MAP_MAJORS_PIN" \
+                    key hex $major_key >/dev/null 2>&1; then
+                    bpftool map delete pinned "$MAP_MAJORS_PIN" \
+                        key hex $major_key 2>/dev/null || failed=1
+                fi
+            fi
             seen_majors="$seen_majors $major"
         fi
     done < "$device_file"
-    rm -f "$device_file"
+    if [ "$failed" -ne 0 ]; then
+        echo "错误: eBPF 设备预留清理失败，保留 $device_file 供重试" >&2
+        return 1
+    fi
+    rm -f "$device_file" "$cgid_file"
 }
 
 # 自动检测 bpftool 支持的 cgroup device attach type
@@ -342,6 +399,7 @@ cmd_create() {
     # 获取 cgroup ID（内核级唯一标识，与 bpf_get_current_cgroup_id 对应）
     local cgid; cgid=$(_cg_id "$name")
     [ -n "$cgid" ] || die "无法获取 cgroup ID"
+    echo "$cgid" > "/tmp/neu_box_cgid_${name}"
 
     [ "$cpu" != "0" ] && echo "  CPU: ${cpu} 核"     || echo "  CPU: 不限"
     [ "$mem_bytes" != "0" ] && echo "  内存: ${mem}" || echo "  内存: 不限"
@@ -459,6 +517,7 @@ cmd_destroy() {
     if [ -d "$(_cg "$name")" ]; then
         _unregister_systemd_slice "$name"
         _cg_kickall "$name"
+        _cg_remove_children "$name"
         _cg_rmdir "$name"
     fi
 
@@ -534,7 +593,7 @@ cmd_cleanup() {
     _bpf_detach
     _bpf_unload
 
-    rm -f /tmp/neu_box_devices_* 2>/dev/null || true
+    rm -f /tmp/neu_box_devices_* /tmp/neu_box_cgid_* 2>/dev/null || true
 
     # ===== 验证清理结果 =====
     local remaining=0

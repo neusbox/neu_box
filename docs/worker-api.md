@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.3.3`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.4.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -13,11 +13,11 @@ Neu Box `0.3.3`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
 | `GET` | `/` | 查询服务名称和版本 |
 | `GET` | `/healthz` | 健康检查、API 版本和数据库 schema 版本 |
 | `GET` | `/status` | 查询 CPU、内存、设备和沙盒状态 |
-| `POST` | `/command/run` | 异步提交命令任务 |
-| `GET` | `/command/queue` | 查询队列和最近任务 |
-| `GET` | `/command/result/<task_id>` | 查询任务状态和退出结果 |
-| `GET` | `/command/result/<task_id>/log` | 读取实时任务日志 |
-| `POST` | `/command/tasks/delete` | 删除或取消任务 |
+| `POST` | `/tasks` | 异步提交命令任务 |
+| `GET` | `/tasks` | 查询队列和最近任务 |
+| `GET` | `/tasks/<task_id>` | 查询任务状态和退出结果 |
+| `GET` | `/tasks/<task_id>/log` | 读取实时任务日志 |
+| `DELETE` | `/tasks` | 删除或取消任务 |
 | `POST` | `/sandbox/acquire` | 为现有进程立即申请终端沙盒 |
 | `POST` | `/sandbox/release` | 释放终端沙盒 |
 | `POST` | `/sandbox/join` | 将 Host PID 加入已有沙盒 |
@@ -30,7 +30,7 @@ Neu Box `0.3.3`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
   可以指定 Worker 宿主机上任意已存在的用户。
 - 直接调用 Worker 时不传 `node_id`。`node_id` 是 WebUI 转发请求时使用的字段，
   不属于 Worker API。
-- 命令任务使用 `/command/*`，由 Worker 持久化并排队；终端沙盒使用
+- 命令任务使用 `/tasks` 资源接口，由 Worker 持久化并排队；终端沙盒使用
   `/sandbox/*`，立即申请资源，不进入任务队列。
 - 当前没有 API 版本前缀、幂等键、回调或 Webhook。接入方应记录 `task_id` 并
   轮询结果；不要在响应不确定时盲目重试提交，否则可能产生重复任务。
@@ -46,11 +46,11 @@ WORKER=http://127.0.0.1:59075
 
 ## API 版本
 
-`/healthz` 与 `/status` 均返回 `api_version`（当前 `1`）：
+`/healthz` 与 `/status` 均返回 `api_version`（当前 `2`）：
 
 - 仅破坏性变更（删除字段、改变语义）时 +1；新增字段/端点不升版本
-- 接入方应对 `api_version < 1` 的连接降级处理或拒绝
-- 旧版 worker（< 0.3.0）不上报该字段，接入方应将其视为 best-effort
+- 接入方应拒绝 `api_version < 2` 的连接；v1 使用的 `/command/*` 路径已移除
+- 旧版 worker 不上报该字段；由于缺少 `/tasks`，接入方应拒绝连接
 
 ## 队列接入流程
 
@@ -58,10 +58,10 @@ WORKER=http://127.0.0.1:59075
 
 ```text
 GET /healthz
-  → POST /command/run
+  → POST /tasks
   → 持久化响应中的 task_id
-  → GET /command/result/<task_id> 轮询状态
-  → completed/failed 后读取 /command/result/<task_id>/log
+  → GET /tasks/<task_id> 轮询状态
+  → completed/failed 后读取 /tasks/<task_id>/log
 ```
 
 任务提交接口只负责入队，正常返回 HTTP `202`，不会等待命令执行完成。因此 HTTP
@@ -72,7 +72,7 @@ GET /healthz
 ### 提交任务
 
 ```http
-POST /command/run
+POST /tasks
 Content-Type: application/json
 ```
 
@@ -91,7 +91,7 @@ curl --noproxy '*' -sS \
     "est_time": 30,
     "target": {"type": "host"}
   }' \
-  "$WORKER/command/run"
+  "$WORKER/tasks"
 ```
 
 赶论文（高优先级）任务示例，加上 `"priority": 1` 即可。
@@ -198,11 +198,11 @@ Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误�
 ### 查询队列
 
 ```http
-GET /command/queue
+GET /tasks
 ```
 
 ```bash
-curl --noproxy '*' -sS "$WORKER/command/queue"
+curl --noproxy '*' -sS "$WORKER/tasks"
 ```
 
 响应示例：
@@ -246,12 +246,12 @@ curl --noproxy '*' -sS "$WORKER/command/queue"
 ### 查询单个任务
 
 ```http
-GET /command/result/<task_id>
+GET /tasks/<task_id>
 ```
 
 ```bash
 curl --noproxy '*' -sS \
-  "$WORKER/command/result/7c65d5ac21f4"
+  "$WORKER/tasks/7c65d5ac21f4"
 ```
 
 完成后的响应示例：
@@ -297,7 +297,7 @@ curl --noproxy '*' -sS \
 ### 读取任务日志
 
 ```http
-GET /command/result/<task_id>/log
+GET /tasks/<task_id>/log
 ```
 
 日志在任务运行期间持续写入，可以边运行边读取。
@@ -312,15 +312,15 @@ GET /command/result/<task_id>/log
 ```bash
 # 完整 JSON
 curl --noproxy '*' -sS \
-  "$WORKER/command/result/7c65d5ac21f4/log"
+  "$WORKER/tasks/7c65d5ac21f4/log"
 
 # 末尾 4096 字节纯文本
 curl --noproxy '*' -sS \
-  "$WORKER/command/result/7c65d5ac21f4/log?tail=4096&raw=1"
+  "$WORKER/tasks/7c65d5ac21f4/log?tail=4096&raw=1"
 
 # 分段读取
 curl --noproxy '*' -sS \
-  "$WORKER/command/result/7c65d5ac21f4/log?offset=0&limit=65536"
+  "$WORKER/tasks/7c65d5ac21f4/log?offset=0&limit=65536"
 ```
 
 JSON 响应：
@@ -339,15 +339,16 @@ JSON 响应：
 ### 删除或取消任务
 
 ```http
-POST /command/tasks/delete
+DELETE /tasks
 Content-Type: application/json
 ```
 
 ```bash
 curl --noproxy '*' -sS \
+  -X DELETE \
   -H 'Content-Type: application/json' \
   -d '{"task_ids":["7c65d5ac21f4","1d835e5f721a"]}' \
-  "$WORKER/command/tasks/delete"
+  "$WORKER/tasks"
 ```
 
 ```json
@@ -382,7 +383,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.3.3"}
+{"service":"neu-box-worker","version":"0.4.0"}
 ```
 
 ### 健康检查
@@ -395,8 +396,8 @@ GET /healthz
 {
   "status": "ok",
   "role": "worker",
-  "api_version": 1,
-  "version": "0.3.3",
+  "api_version": 2,
+  "version": "0.4.0",
   "schema_version": 3
 }
 ```
@@ -420,7 +421,7 @@ GET /status
   "idle_devices": 7,
   "dev_status": {"0": 1, "1": 0},
   "active_sandboxes": 1,
-  "api_version": 1
+  "api_version": 2
 }
 ```
 
@@ -430,7 +431,7 @@ GET /status
 ## 终端沙盒 API
 
 这些接口用于把已经存在的进程加入设备沙盒，不经过命令队列。第三方任务调度系统
-一般只需使用 `/command/*`。
+一般只需使用 `/tasks`。
 
 ### 申请终端沙盒
 
@@ -580,7 +581,7 @@ Docker 终端错误还可能包含机器可读的 `code`：
 | `500` | cgroup、进程迁移、日志读取或沙盒销毁失败 |
 | `503` | 即时沙盒资源不足，或 Docker 服务不可用 |
 
-对于 `/command/run`，HTTP `202` 只代表成功入队。执行阶段的非零退出码、超时、
+对于 `POST /tasks`，HTTP `202` 只代表成功入队。执行阶段的非零退出码、超时、
 Docker 错误和清理错误都通过任务的 `status=failed`、`result.returncode` 和
 `result.error` 报告。
 
@@ -599,7 +600,7 @@ session = requests.Session()
 session.trust_env = False
 
 response = session.post(
-    f"{worker}/command/run",
+    f"{worker}/tasks",
     json={
         "user_id": "yuxd",
         "command": "python train.py",
@@ -616,7 +617,7 @@ task_id = response.json()["task_id"]
 
 while True:
     response = session.get(
-        f"{worker}/command/result/{task_id}",
+        f"{worker}/tasks/{task_id}",
         timeout=10,
     )
     response.raise_for_status()
@@ -626,7 +627,7 @@ while True:
     time.sleep(2)
 
 log = session.get(
-    f"{worker}/command/result/{task_id}/log",
+    f"{worker}/tasks/{task_id}/log",
     params={"raw": 1},
     timeout=10,
 )

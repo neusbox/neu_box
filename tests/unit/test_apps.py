@@ -26,13 +26,19 @@ def test_worker_app_creation_does_not_start_background_threads(tmp_path, monkeyp
     from neu_box.worker.executor.command import TaskQueue
 
     TaskQueue._instance = None
-    client = create_app().test_client()
+    app = create_app()
+    client = app.test_client()
     health = client.get("/healthz")
     assert health.status_code == 200
     assert health.json["role"] == "worker"
     assert health.json["version"] == __version__
     assert health.json["api_version"] == API_VERSION
     assert TaskQueue._instance is None
+    rules = {(rule.rule, frozenset(rule.methods)) for rule in app.url_map.iter_rules()}
+    assert any(path == '/tasks' and 'POST' in methods for path, methods in rules)
+    assert any(path == '/tasks' and 'GET' in methods for path, methods in rules)
+    assert any(path == '/tasks' and 'DELETE' in methods for path, methods in rules)
+    assert not any(path.startswith('/command/') for path, _methods in rules)
 
 
 def test_worker_status_reports_api_version(tmp_path, monkeypatch):

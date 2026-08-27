@@ -3,7 +3,8 @@
 
 import time
 from common import (
-    get, post, assert_ok, assert_eq, assert_gt, assert_in, run_tests, get_gpunode_id,
+    delete, get, post, assert_ok, assert_eq, assert_gt, assert_in, run_tests,
+    get_gpunode_id,
 )
 
 
@@ -12,20 +13,20 @@ def test_submit_validation():
     gpu_id = get_gpunode_id()
 
     # 缺 node_id
-    s, d = post("/command/run", {"user_id": "test", "command": "echo hi"})
+    s, d = post("/tasks", {"user_id": "test", "command": "echo hi"})
     assert not (200 <= s < 300), "缺少 node_id 应该失败"
     assert "error" in d
 
     # 缺 user_id
-    s, d = post("/command/run", {"node_id": gpu_id, "command": "echo hi"})
+    s, d = post("/tasks", {"node_id": gpu_id, "command": "echo hi"})
     assert not (200 <= s < 300), "缺少 user_id 应该失败"
 
     # 缺 command
-    s, d = post("/command/run", {"node_id": gpu_id, "user_id": "test"})
+    s, d = post("/tasks", {"node_id": gpu_id, "user_id": "test"})
     assert not (200 <= s < 300), "缺少 command 应该失败"
 
     # 正常
-    s, d = post("/command/run", {
+    s, d = post("/tasks", {
         "node_id": gpu_id, "user_id": "pengyt",
         "command": "echo ok", "cpu": 1, "memory": 1,
         "mem_unit": "GB", "device_num": 0,
@@ -40,7 +41,7 @@ def test_result_stdout_stderr():
     gpu_id = get_gpunode_id()
     marker = f"MARK_{int(time.time())}"
 
-    _, d = post("/command/run", {
+    _, d = post("/tasks", {
         "node_id": gpu_id, "user_id": "pengyt",
         "command": f"echo OUT:{marker}; echo ERR:{marker} >&2",
         "cpu": 1, "memory": 1, "mem_unit": "GB", "device_num": 0,
@@ -50,7 +51,7 @@ def test_result_stdout_stderr():
 
     # 等待完成（最长等 60s，每秒查一次）
     for _ in range(60):
-        _, data = get(f"/command/result/{task_id}?node_id={gpu_id}")
+        _, data = get(f"/tasks/{task_id}?node_id={gpu_id}")
         if data.get("status") in ("completed", "failed"):
             break
         time.sleep(1)
@@ -73,7 +74,7 @@ def test_resource_configs():
 
     ids = []
     for cfg in configs:
-        _, d = post("/command/run", {
+        _, d = post("/tasks", {
             "node_id": gpu_id, "user_id": "pengyt",
             "command": f"echo '{cfg['label']} OK'; sleep 2",
             "cpu": cfg["cpu"], "memory": cfg["memory"],
@@ -85,7 +86,7 @@ def test_resource_configs():
 
     time.sleep(5)
     if ids:
-        post("/command/tasks/delete", {"node_id": gpu_id, "task_ids": ids})
+        delete("/tasks", {"node_id": gpu_id, "task_ids": ids})
     print(f"    {len(configs)} 种配置完成", flush=True)
 
 

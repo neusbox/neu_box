@@ -6,9 +6,9 @@
 
 | 仓库 | 角色 | 版本 | 部署 |
 |---|---|---|---|
-| **neu_box**（本仓库） | worker：节点侧设备沙盒 + 任务执行 | 0.3.0+ | `/opt/neu-box/releases/<v>` + `current`（安装器 `neu-box-install`） |
-| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI：节点池 / 转发 / 实验记录 | 0.0.1+ | Python 3.11+ 源码运行（`uv sync`，不打包） |
-| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` Go 客户端（直连 worker） | 0.0.1+ | `/usr/local/bin/neu-sbox`（install.sh，静态二进制） |
+| **neu_box**（本仓库） | worker：节点侧设备沙盒 + 任务执行 | 0.4.0+ | `/opt/neu-box/releases/<v>` + `current`（安装器 `neu-box-install`） |
+| [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI：节点池 / 转发 / 实验记录 | 0.1.0+ | Python 3.11+ 源码运行（`uv sync`，不打包） |
+| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` Go 客户端（直连 worker） | 0.2.0+ | `/usr/local/bin/neu-sbox`（install.sh，静态二进制） |
 
 三者只通过 HTTP 契约相交（worker API 见 [worker-api.md](worker-api.md)，
 WebUI API 见 webui 仓库 docs/master-api.md）。兼容矩阵用本仓库的
@@ -107,6 +107,17 @@ npu-smi 卡死时，所有外部占用的卡会被误判为空闲并重新分配
 注意：外部进程与 neu-box 任务之间不存在内核级互斥，两者同时申请同一张卡
 时先到先得。共享节点上建议所有设备使用方都通过 neu-box 申请设备。
 
+### 沙盒收尸与设备回收
+
+Reaper 每隔 `NEU_BOX_SANDBOX_REAPER_INTERVAL` 秒扫描一次。存活状态以内核
+`cgroup.events` 的递归 `populated` 状态和整个子层级的 `cgroup.procs` 为准；数据库
+中的 `pids` 仅是最新快照，不参与存活判断。因此历史 PID 被系统复用不会阻止空
+沙盒回收，子 cgroup 中的进程也不会被漏掉。
+
+空 cgroup 会在创建保护期后经过两次确认再销毁。销毁会递归处理子 cgroup，并同时
+清理 eBPF 设备预留；任一步失败都会保留数据库和设备元数据，下个周期继续重试，
+不会把“脚本已返回”误记成“设备已释放”。
+
 ## 从旧源码部署导入
 
 legacy 参数只允许在 worker 第一次 `install` 时使用：
@@ -151,7 +162,7 @@ sudo ./neu-box-install rollback --yes    # 非交互
 
 ## API 版本
 
-`/healthz` 与 `/status` 上报 `api_version`（当前 `1`）。仅破坏性变更
+`/healthz` 与 `/status` 上报 `api_version`（当前 `2`）。仅破坏性变更
 （删字段、改语义）时 +1；新增字段/端点不升版本。WebUI 与 Go 客户端
 据此做兼容性检查（见各自仓库文档）。
 

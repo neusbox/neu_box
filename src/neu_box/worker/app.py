@@ -40,7 +40,7 @@ def create_app() -> flask.Flask:
     from neu_box.worker.executor.sandbox_api import sandbox_bp
     from neu_box.worker.executor.status import status_bp
 
-    app.register_blueprint(command_bp, url_prefix="/command")
+    app.register_blueprint(command_bp, url_prefix="/tasks")
     app.register_blueprint(sandbox_bp, url_prefix="/sandbox")
     app.register_blueprint(status_bp)
 

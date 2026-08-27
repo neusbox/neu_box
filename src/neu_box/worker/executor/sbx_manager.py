@@ -163,6 +163,101 @@ class SbxManager:
         """返回所有沙盒名称列表（兼容旧 SandboxDB.list_all 接口）。"""
         return [s['name'] for s in self.db.list_sandboxes()]
 
+    def _read_cgroup_snapshot(
+        self,
+        name: str,
+    ) -> Optional[tuple[List[int], bool]]:
+        """读取 cgroup 中真实的进程快照和递归 populated 状态。
+
+        ``cgroup.procs`` 是 PID 归属的权威来源，DB 只保存最近一次快照。
+        同时读取所有子 cgroup，避免容器或用户创建子层级后漏掉进程；根
+        cgroup 的 ``cgroup.events: populated`` 会递归统计整个层级，用于
+        覆盖扫描过程中发生的 fork/exit 竞态。
+
+        Returns:
+            ``(pids, populated)``；cgroup 已不存在时返回 ``None``。
+
+        Raises:
+            OSError: cgroup 仍存在，但无法可靠读取其进程状态。
+        """
+        cgroup_path = self._cg_path(name)
+        if not os.path.isdir(cgroup_path):
+            return None
+
+        def read_pids() -> List[int]:
+            pids: set[int] = set()
+
+            def raise_walk_error(exc: OSError):
+                raise exc
+
+            for root, _dirs, _files in os.walk(
+                cgroup_path,
+                onerror=raise_walk_error,
+            ):
+                procs_path = os.path.join(root, 'cgroup.procs')
+                try:
+                    with open(procs_path, encoding='utf-8') as stream:
+                        lines = stream.read().splitlines()
+                except FileNotFoundError:
+                    # 子 cgroup 可以在扫描期间消失；根目录消失则由调用方
+                    # 按“不存在”处理，仍存在的目录缺少控制文件属于异常。
+                    if not os.path.isdir(cgroup_path):
+                        return []
+                    if not os.path.isdir(root):
+                        continue
+                    raise
+                for raw in lines:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        pid = int(raw)
+                    except ValueError as exc:
+                        raise OSError(
+                            f'{procs_path} 包含非法 PID: {raw!r}'
+                        ) from exc
+                    if pid > 0:
+                        pids.add(pid)
+            return sorted(pids)
+
+        pids = read_pids()
+        if not os.path.isdir(cgroup_path):
+            return None
+
+        populated = bool(pids)
+        events_path = os.path.join(cgroup_path, 'cgroup.events')
+        try:
+            with open(events_path, encoding='utf-8') as stream:
+                events = {
+                    parts[0]: parts[1]
+                    for line in stream
+                    if len(parts := line.split()) == 2
+                }
+            if 'populated' in events:
+                if events['populated'] not in {'0', '1'}:
+                    raise OSError(
+                        f'{events_path} 包含非法 populated 值: '
+                        f'{events["populated"]!r}'
+                    )
+                populated = events['populated'] == '1'
+        except FileNotFoundError:
+            if not os.path.isdir(cgroup_path):
+                return None
+            # cgroup v2 应提供 cgroup.events；旧内核或测试替身缺失时，
+            # 已递归读取的 cgroup.procs 仍可作为可靠后备。
+
+        if populated:
+            # 进程可能在第一次扫描结束后刚加入；再读一次，使 DB 快照
+            # 尽量与当前 cgroup.procs 对齐。存活判断仍以 populated 为准。
+            pids = read_pids()
+            if not os.path.isdir(cgroup_path):
+                return None
+        else:
+            # events 在 PID 扫描之后读取；populated=0 表示此刻整个层级
+            # 已空，清除扫描早期可能读到、随后退出的 PID。
+            pids = []
+        return pids, populated
+
     def _get_free_devices(self) -> List[str]:
         """返回未分配给 sandbox 的设备节点，按 minor 排序。"""
         all_devices = set(self._discover_device_nodes())
@@ -179,8 +274,17 @@ class SbxManager:
         """重启后核对 DB 与 cgroup 实际状态，清理已不存在的沙盒记录。"""
         for name in self._list_sandbox_names():
             if not os.path.isdir(self._cg_path(name)):
-                logger.warning("恢复: 沙盒 '%s' 的 cgroup 已不存在，清理 DB 记录", name)
-                self.db.delete_sandbox(name)
+                logger.warning(
+                    "恢复: 沙盒 '%s' 的 cgroup 已不存在，清理设备预留",
+                    name,
+                )
+                # 仍需经过 destroy 脚本清理 eBPF map，不能只删 DB，否则
+                # reserved_devices 中的卡会一直保持预留状态。
+                if not self.destroy_sandbox(name):
+                    logger.error(
+                        "恢复: 沙盒 '%s' 清理失败，保留记录等待 Reaper 重试",
+                        name,
+                    )
             else:
                 logger.info("恢复: 沙盒 '%s' 仍存活", name)
 
@@ -244,12 +348,19 @@ class SbxManager:
                 logger.error("加入 PID %s 到 '%s' 失败: %s", pid, name, result.stderr.strip())
                 return False
 
-            # 更新 DB
-            pids = record.get('pids', [])
-            if pid not in pids:
-                pids.append(pid)
-                record['pids'] = pids
-                self.db.update_sandbox_pids(name, pids)
+            # DB 只保存 cgroup.procs 的当前快照，不累积历史 PID。读取
+            # 失败时至少用本次已成功加入的 PID 覆盖旧快照，Reaper 会在
+            # 下一轮重新同步；DB 从不参与存活判断。
+            try:
+                snapshot = self._read_cgroup_snapshot(name)
+                pids = snapshot[0] if snapshot is not None else []
+            except OSError as exc:
+                logger.warning(
+                    "读取沙盒 '%s' PID 快照失败，暂存 PID %s: %s",
+                    name, pid, exc,
+                )
+                pids = [pid]
+            self.db.update_sandbox_pids(name, pids)
 
             logger.warning("✓ PID %s 已加入沙盒 '%s'", pid, name)
             return True
@@ -313,15 +424,22 @@ class SbxManager:
             True 表示销毁成功（或沙盒本来就不存在）。
         """
         with self._lock:
-            if not os.path.isdir(self._cg_path(name)):
-                self.db.delete_sandbox(name)
+            record = self.db.get_sandbox(name)
+            if not os.path.isdir(self._cg_path(name)) and not record:
                 return True
 
-            result = self._run_script('destroy', name)
+            # 即使 cgroup 目录已经消失也必须调用脚本：脚本会根据持久化
+            # 的设备清单删除 eBPF reserved_devices 条目。只有脚本成功且
+            # cgroup 确认消失后才能删 DB，否则保留记录供 Reaper 重试。
+            try:
+                result = self._run_script('destroy', name)
+            except (OSError, subprocess.SubprocessError) as exc:
+                # 单个沙盒脚本超时/启动失败不能打断整个 Reaper 扫描，
+                # 保留 DB 和设备元数据供下一轮继续尝试。
+                logger.error("销毁沙盒 '%s' 执行失败: %s", name, exc)
+                return False
             if result.returncode != 0:
                 logger.error("销毁沙盒 '%s' 失败: %s", name, result.stderr.strip())
-                if not os.path.isdir(self._cg_path(name)):
-                    self.db.delete_sandbox(name)
                 return False
 
             # 脚本返回成功 ≠ cgroup 目录已消失（systemd slice 可能阻止 rmdir）
@@ -348,7 +466,11 @@ class SbxManager:
 
     def list_sandboxes_via_script(self) -> List[str]:
         """通过 sandbox.sh list 获取 cgroup 中实际存在的沙盒名称列表。"""
-        result = self._run_script('list')
+        try:
+            result = self._run_script('list')
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error("sandbox.sh list 执行失败: %s", exc)
+            return []
         if result.returncode != 0:
             logger.error("sandbox.sh list 失败: %s", result.stderr.strip())
             return []
@@ -418,82 +540,96 @@ class SbxManager:
             清理的沙盒数量。
         """
         cleaned = 0
-        sandbox_names = self._list_sandbox_names()
-        logger.debug("共 %s 个沙盒待检查", len(sandbox_names))
-        for name in sandbox_names:
-            record = self.db.get_sandbox(name)
-            if not record:
-                continue
+        interval = max(
+            1,
+            env_int(
+                "NEU_BOX_SANDBOX_REAPER_INTERVAL",
+                30,
+                "sandbox_reaper_interval",
+            ),
+        )
+        # 与 create/join/destroy/allocate 共用同一把锁，避免 Neu Box 在
+        # “确认空”与 destroy 之间把新进程加入刚被判定为空的沙盒。
+        with self._lock:
+            sandbox_names = self._list_sandbox_names()
+            logger.debug("共 %s 个沙盒待检查", len(sandbox_names))
+            for name in sandbox_names:
+                record = self.db.get_sandbox(name)
+                if not record:
+                    continue
 
-            pids = record.get('pids', [])
-            if not pids:
-                created_at = float(record.get('created_at') or 0)
-                interval = max(
-                    1,
-                    env_int(
-                        "NEU_BOX_SANDBOX_REAPER_INTERVAL",
-                        30,
-                        "sandbox_reaper_interval",
-                    ),
-                )
+                try:
+                    snapshot = self._read_cgroup_snapshot(name)
+                except OSError as exc:
+                    # 无法确认时保留资源并在下一轮重试；不能把读取错误当空，
+                    # 否则可能杀掉仍在运行的任务。
+                    logger.error(
+                        "收尸无法读取沙盒 '%s' 的 cgroup 状态，将重试: %s",
+                        name, exc,
+                    )
+                    continue
+
+                if snapshot is None:
+                    logger.warning(
+                        "清理残留沙盒记录 '%s' (cgroup 已不存在)", name
+                    )
+                    if self.destroy_sandbox(name):
+                        cleaned += 1
+                    continue
+
+                pids, populated = snapshot
+                if record.get('pids', []) != pids:
+                    self.db.update_sandbox_pids(name, pids)
+                if populated:
+                    continue
+
+                # create 和首次 join 之间允许一个 Reaper 周期，避免刚创建
+                # 的空 cgroup 被后台线程提前回收。
+                try:
+                    created_at = float(record.get('created_at') or 0)
+                except (TypeError, ValueError):
+                    created_at = 0
                 if time.time() - created_at < interval:
                     continue
-                # 没有进程记录的沙盒：检查 cgroup.procs 是否为空
-                procs_file = os.path.join(self._cg_path(name), 'cgroup.procs')
-                try:
-                    with open(procs_file) as f:
-                        content = f.read().strip()
-                    if not content:
-                        logger.warning("清理空沙盒 '%s' (无进程)", name)
-                        self.destroy_sandbox(name)
-                        cleaned += 1
-                except (OSError, IOError):
-                    # cgroup 目录可能已不存在
-                    self.db.delete_sandbox(name)
-                    cleaned += 1
-                continue
 
-            # 检查记录的 PID 是否还活着
-            all_dead = True
-            for pid in pids:
+                # 销毁前再次读取，覆盖第一次读取后刚发生的 join/fork/exit。
                 try:
-                    os.kill(pid, 0)
-                    all_dead = False
-                    break
-                except (OSError, TypeError):
-                    # TypeError: pids 字段异常（非整数），当作已死
-                    pass
-
-            if all_dead:
-                # 二次确认：读 cgroup.procs，真正的权威来源
-                procs_file = os.path.join(self._cg_path(name), 'cgroup.procs')
-                cgroup_empty = False
-                try:
-                    with open(procs_file) as f:
-                        cgroup_empty = not f.read().strip()
-                except (OSError, IOError):
-                    cgroup_empty = True  # 目录消失 = 空
-                if not cgroup_empty:
-                    logger.debug("沙盒 '%s' DB pid 已死但 cgroup.procs 非空，跳过", name)
+                    confirmation = self._read_cgroup_snapshot(name)
+                except OSError as exc:
+                    logger.error(
+                        "收尸二次确认沙盒 '%s' 失败，将重试: %s",
+                        name, exc,
+                    )
                     continue
+                if confirmation is not None:
+                    confirmed_pids, confirmed_populated = confirmation
+                    if confirmed_pids != pids:
+                        self.db.update_sandbox_pids(name, confirmed_pids)
+                    if confirmed_populated:
+                        continue
 
-                logger.warning("清理孤儿沙盒 '%s' (所有 PID 已退出)", name)
-                self.destroy_sandbox(name)
-                cleaned += 1
+                logger.warning("清理空沙盒 '%s' (cgroup 层级无进程)", name)
+                if self.destroy_sandbox(name):
+                    cleaned += 1
 
-        # 补充：文件系统孤儿扫描（cgroup 目录存在但 DB 无记录）
-        db_names = set(self._list_sandbox_names())
-        fs_names = set(self.list_sandboxes_via_script())
-        orphans = fs_names - db_names
-        for name in orphans:
-            logger.warning("清理文件系统孤儿沙盒 '%s' (DB 无记录)", name)
-            try:
-                self._run_script('destroy', name)
-            except Exception as e:
-                logger.warning("孤儿沙盒 '%s' 清理失败: %s", name, e)
-            cleaned += 1
-        if orphans:
-            logger.warning("文件系统孤儿清理完成: %s 个 (%s)", len(orphans), sorted(orphans))
+            # 补充：文件系统孤儿扫描（cgroup 目录存在但 DB 无记录）。
+            # destroy_sandbox 会验证 cgroup 与 eBPF 清理结果；失败不计为
+            # cleaned，下一轮仍会从文件系统再次发现并重试。
+            db_names = set(self._list_sandbox_names())
+            fs_names = set(self.list_sandboxes_via_script())
+            orphans = fs_names - db_names
+            orphan_cleaned = []
+            for name in orphans:
+                logger.warning("清理文件系统孤儿沙盒 '%s' (DB 无记录)", name)
+                if self.destroy_sandbox(name):
+                    cleaned += 1
+                    orphan_cleaned.append(name)
+            if orphans:
+                logger.warning(
+                    "文件系统孤儿清理完成: 成功=%s, 待重试=%s",
+                    sorted(orphan_cleaned),
+                    sorted(orphans - set(orphan_cleaned)),
+                )
 
         return cleaned
 
