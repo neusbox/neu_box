@@ -97,7 +97,7 @@ neu-box status          # 查看安装版本与回滚状态
 neu-box service-status  # 查看 systemd 服务状态
 neu-box logs            # 跟踪 Worker 日志
 neu-box check-update    # 检查 GitHub latest Release
-neu-box update          # 在线下载、校验并升级
+neu-box update          # 在线下载、校验、解压并升级
 neu-box rollback        # 回滚程序和升级前数据库
 ```
 
@@ -106,7 +106,10 @@ neu-box rollback        # 回滚程序和升级前数据库
 
 ```bash
 neu-box upgrade /path/to/extracted-release
+neu-box upgrade /path/to/neu-box-<version>-linux-<arch>.tar.gz
 ```
+
+本地 `.tar.gz` 发布包会解压到临时目录，升级结束后自动清理，不需要手工解包。
 
 完整的安装、升级、回滚、目录权限和 Release 资产规范见
 [部署与升级手册](docs/deployment.md)。

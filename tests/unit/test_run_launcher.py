@@ -177,6 +177,31 @@ fi
     return result, record, requests
 
 
+def _run_local_deployment(
+    tmp_path: Path,
+    source: Path,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    record = tmp_path / "local-deploy-arguments"
+    command = """
+source "$1"
+as_root() { printf '%s\\n' "$@" >"$NEU_BOX_DEPLOY_RECORD"; }
+deploy_release upgrade "$2"
+"""
+    environment = os.environ.copy()
+    environment.update({
+        "NEU_BOX_DEPLOY_RECORD": str(record),
+        "TMPDIR": str(tmp_path),
+    })
+    result = subprocess.run(
+        ["bash", "-c", command, "bash", str(RUN_SH), str(source)],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
+    return result, record
+
+
 def test_installed_version_reads_public_current_manifest_without_status(tmp_path):
     manifest = tmp_path / "manifest.json"
     manifest.write_text('{"version": "2.3.4"}\n', encoding="utf-8")
@@ -198,6 +223,49 @@ def test_installed_version_reads_public_current_manifest_without_status(tmp_path
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "2.3.4\n"
+
+
+def test_local_upgrade_accepts_archive_extracts_and_cleans_temp(tmp_path):
+    _tag, assets = _release_assets(tmp_path, "1.1.0")
+    asset_name = next(name for name in assets if name.endswith(".tar.gz"))
+    archive = tmp_path / asset_name
+
+    result, record = _run_local_deployment(tmp_path, archive)
+
+    assert result.returncode == 0, result.stderr
+    arguments = record.read_text(encoding="utf-8").splitlines()
+    assert arguments[1:4] == ["upgrade", "--role", "worker"]
+    assert arguments[4] == "--source"
+    source = Path(arguments[5])
+    assert source.name == asset_name.removesuffix(".tar.gz")
+    assert not source.exists(), "本地发布包解压临时目录没有被清理"
+    assert "正在解压本地发布包" in result.stdout
+    assert not list(tmp_path.glob("neu-box-release.*"))
+
+
+def test_local_upgrade_still_accepts_extracted_directory(tmp_path):
+    _release_assets(tmp_path, "1.1.0")
+
+    result, record = _run_local_deployment(tmp_path, tmp_path / "release")
+
+    assert result.returncode == 0, result.stderr
+    arguments = record.read_text(encoding="utf-8").splitlines()
+    assert Path(arguments[5]) == (tmp_path / "release").resolve()
+    assert "正在解压" not in result.stdout
+
+
+def test_local_upgrade_rejects_unexpected_archive_root(tmp_path):
+    _tag, assets = _release_assets(
+        tmp_path, "1.1.0", archive_root="unexpected-root"
+    )
+    asset_name = next(name for name in assets if name.endswith(".tar.gz"))
+
+    result, record = _run_local_deployment(tmp_path, tmp_path / asset_name)
+
+    assert result.returncode != 0
+    assert "非预期顶层路径" in result.stderr
+    assert not record.exists()
+    assert not list(tmp_path.glob("neu-box-release.*"))
 
 
 def test_online_update_downloads_verifies_extracts_and_runs_new_installer(tmp_path):

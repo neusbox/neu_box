@@ -93,13 +93,20 @@ neu-box update --version 0.4.0 --force  # 显式允许更新到较旧版本
 2. 根据 `uname -m` 选择 `linux-amd64` 或 `linux-arm64` 产物；
 3. 在当前用户的私有临时目录下载 `.tar.gz` 与 `.tar.gz.sha256`；
 4. 校验外层 SHA256，拒绝非预期顶层目录和越界路径；
-5. 使用本机已经安装的可信 `neu-box-install` 再校验包内 manifest、架构和
+5. 自动解压到临时目录，使用本机已经安装的可信 `neu-box-install` 再校验包内 manifest、架构和
    `SHA256SUMS`，然后执行与离线升级完全相同的数据库备份、迁移、切换、
    健康检查与失败回滚；
 6. 无论成功失败都清理下载和解压临时目录。
 
 同版本直接返回，不重复停服和迁移。数值版本低于当前版本时默认拒绝，必须显式
-增加 `--force`。离线升级入口 `neu-box upgrade <发布目录>` 保持不变。
+增加 `--force`。离线升级既接受解压目录，也接受未解压的标准发布包：
+
+```bash
+neu-box upgrade /path/to/extracted-release
+neu-box upgrade /path/to/neu-box-<version>-linux-<arch>.tar.gz
+```
+
+使用 `.tar.gz` 时会自动解压到临时目录，并在升级结束后清理。
 
 如使用 GitHub Enterprise 或镜像，可以覆盖下载源：
 
@@ -175,9 +182,11 @@ sudo ./neu-box-install install --role worker --no-start \
 ## 升级
 
 ```bash
-cd 解包目录
-sudo ./neu-box-install upgrade --role worker
+neu-box upgrade /path/to/neu-box-<version>-linux-<arch>.tar.gz
 ```
+
+也可以传入已经解压的发布目录；在发布目录中仍可直接执行
+`sudo ./neu-box-install upgrade --role worker`。
 
 流程：校验 → 释放新版本 → 备份数据库/配置/被替换文件 → 停服务 →
 运行迁移 → 切 `current` → 装 unit → 启动 → 健康检查。任一步失败自动

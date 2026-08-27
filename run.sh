@@ -16,8 +16,8 @@ usage() {
 
 命令:
   menu                         打开交互菜单
-  install [发布目录]           首次安装 worker
-  upgrade [发布目录]           升级到指定发布目录
+  install [发布目录或包]       首次安装 worker
+  upgrade [发布目录或包]       升级到指定发布目录或 .tar.gz 包
   update [选项]                从 GitHub Release 在线更新
   check-update                 检查 GitHub Release 最新版本
   rollback                     回滚程序和数据库（保留二次确认）
@@ -30,7 +30,8 @@ usage() {
   deployment-test [测试选项]  一键验收已部署的 worker（源码仓库）
   -h, --help                   显示帮助
 
-发布目录必须是已解压、包含 manifest.json 和 neu-box-install 的目录。
+发布来源可以是已解压的发布目录，也可以是标准的 neu-box-*.tar.gz 发布包。
+发布包会自动解压到临时目录，安装或升级结束后自动清理。
 在发布目录中运行本脚本时，install/upgrade 默认使用当前目录。
 
 在线更新选项:
@@ -66,7 +67,7 @@ resolve_release_source() {
         candidate="$SCRIPT_DIR"
     fi
     if [[ -z "$candidate" ]]; then
-        read -r -e -p "请输入已解压发布目录: " candidate
+        read -r -e -p "请输入发布目录或 .tar.gz 发布包: " candidate
     fi
     if [[ ! -d "$candidate" ]]; then
         echo "error: 发布目录不存在: $candidate" >&2
@@ -84,12 +85,79 @@ resolve_release_source() {
     printf '%s\n' "$candidate"
 }
 
-deploy_release() {
+release_archive_root() {
+    local archive="$1"
+    local filename root
+    filename="$(basename -- "$archive")"
+    if [[ "$filename" != *.tar.gz ]]; then
+        echo "error: 发布包必须是 .tar.gz 文件: $archive" >&2
+        return 1
+    fi
+    root="${filename%.tar.gz}"
+    if [[ ! "$root" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+        echo "error: 发布包文件名不安全或格式无效: $filename" >&2
+        return 1
+    fi
+    printf '%s\n' "$root"
+}
+
+run_release_deployment() (
+    set -Eeuo pipefail
     local action="$1"
-    local source
-    source="$(resolve_release_source "${2:-}")"
+    local candidate="${2:-}"
+    local confirm="${3:-0}"
+    local source archive_root deploy_tmp answer
+
+    if [[ -z "$candidate" && -f "$SCRIPT_DIR/manifest.json" ]]; then
+        candidate="$SCRIPT_DIR"
+    fi
+    if [[ -z "$candidate" ]]; then
+        read -r -e -p "请输入发布目录或 .tar.gz 发布包: " candidate
+    fi
+
+    if [[ -f "$candidate" ]]; then
+        require_command tar
+        if ! archive_root="$(release_archive_root "$candidate")"; then
+            return 1
+        fi
+        candidate="$(cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename -- "$candidate")"
+        if ! deploy_tmp="$(mktemp -d "${TMPDIR:-/tmp}/neu-box-release.XXXXXX")"; then
+            echo "error: 无法创建发布包解压临时目录" >&2
+            return 1
+        fi
+        trap 'rm -rf -- "$deploy_tmp"' EXIT
+        printf '正在解压本地发布包: %s\n' "$candidate"
+        if ! extract_release_safely \
+            "$candidate" "$deploy_tmp/extracted" "$archive_root"; then
+            return 1
+        fi
+        candidate="$deploy_tmp/extracted/$archive_root"
+    elif [[ ! -d "$candidate" ]]; then
+        if [[ "$candidate" == *.tar.gz ]]; then
+            echo "error: 发布包不存在: $candidate" >&2
+        else
+            echo "error: 发布目录不存在: $candidate" >&2
+        fi
+        return 1
+    fi
+
+    if ! source="$(resolve_release_source "$candidate")"; then
+        return 1
+    fi
+    if ((confirm)); then
+        printf '即将执行 %s，发布目录: %s\n' "$action" "$source"
+        read -r -p "确认继续？[y/N] " answer
+        case "$answer" in
+            y|Y|yes|YES) ;;
+            *) echo "已取消"; return 0 ;;
+        esac
+    fi
     as_root "$source/neu-box-install" \
         "$action" --role worker --source "$source"
+)
+
+deploy_release() {
+    run_release_deployment "$1" "${2:-}" 0
 }
 
 installed_installer() {
@@ -475,6 +543,7 @@ online_update() (
     fi
 
     release_root="neu-box-$version-linux-$architecture"
+    printf '正在解压 %s...\n' "$asset_name"
     if ! extract_release_safely \
         "$archive" "$update_tmp/extracted" "$release_root"; then
         return 1
@@ -499,19 +568,7 @@ online_update() (
 )
 
 confirm_deploy() {
-    local action="$1"
-    local source
-    source="$(resolve_release_source "${2:-}")"
-    printf '即将执行 %s，发布目录: %s\n' "$action" "$source"
-    read -r -p "确认继续？[y/N] " answer
-    case "$answer" in
-        y|Y|yes|YES)
-            deploy_release "$action" "$source"
-            ;;
-        *)
-            echo "已取消"
-            ;;
-    esac
+    run_release_deployment "$1" "${2:-}" 1
 }
 
 pause_menu() {
