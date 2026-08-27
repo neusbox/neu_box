@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.3.2`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.3.3`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -111,6 +111,9 @@ curl --noproxy '*' -sS \
 | `priority` | 否 | `0` | 队列优先级，取值 `0` 或 `1`（0=普通、1=赶论文）；数值越大越先执行（同级内按提交时间 FIFO）；超范围（<0、>1）或非整数由数据层拒绝，返回 400 |
 | `target` | 否 | `{"type":"host"}` | 执行目标，见“执行目标”一节 |
 
+`user_id` 会在入队前通过宿主机用户数据库校验。用户不存在时返回 HTTP `400`
+和 `{"error":"系统用户 <name> 不存在"}`，任务不会进入队列。
+
 成功响应：
 
 ```http
@@ -144,6 +147,9 @@ HTTP/1.1 202 Accepted
 的 HOME。Worker 在启动进程前将其加入资源沙盒并切换到 `user_id`。
 
 `command` 是完整 Shell 命令，调用方不得把未经处理的外部输入直接拼接进去。
+Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误、语法解析错误、
+`command not found`、权限错误及程序写入 stderr 的内容都会进入任务日志。Shell
+返回非零时任务状态为 `failed`，具体报错读取日志，退出码读取 `result.returncode`。
 
 #### 已运行的 Docker 容器
 
@@ -376,7 +382,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.3.2"}
+{"service":"neu-box-worker","version":"0.3.3"}
 ```
 
 ### 健康检查
@@ -390,7 +396,7 @@ GET /healthz
   "status": "ok",
   "role": "worker",
   "api_version": 1,
-  "version": "0.3.2",
+  "version": "0.3.3",
   "schema_version": 3
 }
 ```

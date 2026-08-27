@@ -107,7 +107,8 @@ def execute_in_sandbox(
 ) -> dict:
     """在沙盒中以指定用户身份安全执行一条命令。
 
-    stderr 已在 shell 层 2>&1 合并到 stdout，保证输出按时间序排列。
+    stderr 在 Popen 层合并到 stdout，保证 Bash 启动、语法解析和命令运行
+    各阶段的错误都按时间顺序进入同一个任务日志。
 
     流程:
       1. TaskQueue 已经选择设备并创建沙盒
@@ -157,9 +158,9 @@ def execute_in_sandbox(
 
     try:
         logger.warning("启动进程, cgroup=%s, user=%s", cg_procs, username or '(root)')
-        # bash -i 交互模式：自动 source ~/.bashrc 完整内容（绕过开头的 *i* guard）
-        # exec 2>&1 把 bash 的 stderr 全局合并到 stdout
-        full_command = f'exec 2>&1; {command}'
+        # bash -i 交互模式：自动 source ~/.bashrc 完整内容（绕过开头的 *i* guard）。
+        # stderr 必须在 Popen 层合并：若用户命令有 Bash 语法错误，解析会发生
+        # 在命令字符串中的 `exec 2>&1` 执行之前，单独的 stderr pipe 会丢失报错。
         # PYTHONUNBUFFERED=1 强制 Python 子进程行缓冲输出
         # bufsize=1 确保 Python 端管道行缓冲，数据即到即读
         # 注意: 传 env dict 时 execve 会绕过 preexec_fn 的 os.environ 修改，
@@ -168,10 +169,10 @@ def execute_in_sandbox(
         if username:
             popen_env['HOME'] = target_dir
         proc = subprocess.Popen(
-            ['bash', '-i', '-c', full_command],
+            ['bash', '-i', '-c', command],
             preexec_fn=preexec,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             bufsize=0,  # 无缓冲，read() 即到即返
             env=popen_env,
         )
