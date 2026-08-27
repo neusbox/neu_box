@@ -16,4 +16,3 @@ dist/
 nohup.out
 config.json
 tmp/
-*.png

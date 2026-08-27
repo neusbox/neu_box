@@ -59,7 +59,14 @@ sudo ./neu-box-install rollback                   # 回滚
 ./run.sh                    # 发布目录或源码仓库中打开菜单
 neu-box                     # 首次安装后可直接打开菜单
 neu-box status              # 也支持非交互子命令
+neu-box check-update        # 检查 GitHub latest Release
+neu-box update              # 下载、校验并在线更新（交互确认）
+neu-box update --yes        # 非交互更新
 ```
+
+在线更新默认读取 `neusbox/neu_box` 的 GitHub Release，根据本机自动选择
+`amd64` 或 `arm64` 产物。菜单中也可选择“从 GitHub Release 在线更新”。指定版本
+可使用 `neu-box update --version 0.4.1`；本地发布目录升级仍保留为离线兜底。
 
 详见 [docs/deployment.md](docs/deployment.md)；API 契约见
 [docs/worker-api.md](docs/worker-api.md)（含 `api_version` 语义）；
@@ -88,6 +95,14 @@ uv sync
 uv run pytest tests/unit          # 单测（worker + 迁移引擎 + 安装器）
 uv run deploy/build_release.py    # 构建发布包
 # 或使用统一入口：./run.sh test / ./run.sh build
+
+# 已部署 Worker 一键实机验收（API、任务、设备分配/释放、Reaper）
+./run.sh deployment-test
+# 也可在 ./run.sh 的交互菜单中选择 12
+
+# 发布到 GitHub Release 时，tag 使用 v<version>，并同时上传这两个文件：
+# neu-box-<version>-linux-<arch>.tar.gz
+# neu-box-<version>-linux-<arch>.tar.gz.sha256
 
 # e2e（需要已部署的 worker + WebUI）
 NEU_BOX_TEST_MASTER=http://<master>:25565 NEU_BOX_TEST_PASS='...' \

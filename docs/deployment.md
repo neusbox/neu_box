@@ -66,13 +66,57 @@ sudo ./neu-box-install install --role worker
 ./run.sh
 ```
 
-菜单提供安装、升级、回滚、服务启停/状态、日志、构建和单测。首次安装后
+菜单提供安装、离线升级、GitHub 在线更新、回滚、服务启停/状态、日志、构建和单测。首次安装后
 入口同时安装为 `/usr/local/sbin/neu-box`，可随时执行 `neu-box` 打开；
 也支持 `neu-box status`、`neu-box restart` 等非交互子命令。
 
 安装器：校验 SHA256SUMS → 释放到 `/opt/neu-box/releases/<v>/` → 链
 `current` → 生成 `/etc/neu-box/worker.env`（已存在则保留）→ 安装
 `neu-box-worker.service` 并启动 → 健康检查（`/healthz`）。
+
+## 从 GitHub Release 在线更新
+
+在线更新需要目标机能够访问 GitHub，并提供 `bash`、`curl`、`tar`、`sha256sum`
+和 GNU `sort`。默认仓库为 `neusbox/neu_box`：
+
+```bash
+neu-box check-update                 # 只查询 latest，不下载发布包
+neu-box update                       # latest，升级前交互确认
+neu-box update --yes                 # latest，非交互执行
+neu-box update --version 0.4.1       # 指定 tag v0.4.1
+neu-box update --version 0.4.0 --force  # 显式允许更新到较旧版本
+```
+
+交互菜单中的“从 GitHub Release 在线更新”调用同一流程。在线更新会：
+
+1. 读取 GitHub latest Release，或使用 `--version` 指定的 `v<version>` tag；
+2. 根据 `uname -m` 选择 `linux-amd64` 或 `linux-arm64` 产物；
+3. 在当前用户的私有临时目录下载 `.tar.gz` 与 `.tar.gz.sha256`；
+4. 校验外层 SHA256，拒绝非预期顶层目录和越界路径；
+5. 使用本机已经安装的可信 `neu-box-install` 再校验包内 manifest、架构和
+   `SHA256SUMS`，然后执行与离线升级完全相同的数据库备份、迁移、切换、
+   健康检查与失败回滚；
+6. 无论成功失败都清理下载和解压临时目录。
+
+同版本直接返回，不重复停服和迁移。数值版本低于当前版本时默认拒绝，必须显式
+增加 `--force`。离线升级入口 `neu-box upgrade <发布目录>` 保持不变。
+
+如使用 GitHub Enterprise 或镜像，可以覆盖下载源：
+
+```bash
+NEU_BOX_RELEASE_REPOSITORY=team/neu_box \
+NEU_BOX_RELEASE_BASE_URL=https://github.example.com \
+neu-box update
+```
+
+每个可在线安装的 Release 必须使用 `v<version>` tag，并同时上传构建脚本生成的：
+
+```text
+neu-box-<version>-linux-<arch>.tar.gz
+neu-box-<version>-linux-<arch>.tar.gz.sha256
+```
+
+需要同时支持 amd64 和 arm64 时，同一个 Release 应包含两种架构的上述文件。
 
 ## 配置参考 — `/etc/neu-box/worker.env`
 
