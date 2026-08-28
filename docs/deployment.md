@@ -91,7 +91,8 @@ neu-box update --version 0.4.0 --force  # 显式允许更新到较旧版本
 
 1. 读取 GitHub latest Release，或使用 `--version` 指定的 `v<version>` tag；
 2. 根据 `uname -m` 选择 `linux-amd64` 或 `linux-arm64` 产物；
-3. 在当前用户的私有临时目录下载 `.tar.gz` 与 `.tar.gz.sha256`；
+3. 在当前用户的私有临时目录下载 `.tar.gz` 与 `.tar.gz.sha256`，交互终端中
+   显示发布包下载进度；
 4. 校验外层 SHA256，拒绝非预期顶层目录和越界路径；
 5. 自动解压到临时目录，使用本机已经安装的可信 `neu-box-install` 再校验包内 manifest、架构和
    `SHA256SUMS`，然后执行与离线升级完全相同的数据库备份、迁移、切换、

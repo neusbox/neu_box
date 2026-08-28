@@ -6,10 +6,11 @@
 # 被 neu_box eBPF 隔离而对 nvidia-smi 不可见的卡保持 busy。
 
 IDLE_MEM_MB=${IDLE_MEM_MB:-200}
+NVIDIA_PROC_ROOT=${NVIDIA_PROC_ROOT:-/proc/driver/nvidia/gpus}
 
 declare -A minor_to_pci
 all_minors=()
-for info in /proc/driver/nvidia/gpus/*/information; do
+for info in "$NVIDIA_PROC_ROOT"/*/information; do
     [ -r "$info" ] || continue
     minor=$(awk '/^Device Minor:/ {print $3}' "$info")
     [ -n "$minor" ] || continue

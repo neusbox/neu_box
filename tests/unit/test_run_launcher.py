@@ -92,6 +92,7 @@ def _fake_curl(
         """#!/usr/bin/env bash
 set -Eeuo pipefail
 head_request=0
+progress_bar=0
 output=''
 url=''
 while (($#)); do
@@ -101,6 +102,7 @@ while (($#)); do
         --write-out|--connect-timeout|--max-time|--retry|--retry-delay|--proto|--proto-redir)
             shift 2
             ;;
+        --progress-bar) progress_bar=1; shift ;;
         --fail|--silent|--show-error|--location) shift ;;
         *) url="$1"; shift ;;
     esac
@@ -119,6 +121,9 @@ if ((head_request)); then
     fi
 else
     printf 'GET %s\\n' "$url" >>"$NEU_BOX_FAKE_REQUEST_LOG"
+    if ((progress_bar)); then
+        printf 'PROGRESS %s\\n' "$url" >>"$NEU_BOX_FAKE_REQUEST_LOG"
+    fi
     name="${url##*/}"
     cp "$NEU_BOX_FAKE_ASSET_DIR/$name" "$output"
 fi
@@ -135,6 +140,7 @@ def _run_online_update(
     tag: str,
     assets: dict[str, bytes],
     *arguments: str,
+    force_progress: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     installed = _fake_installed_installer(tmp_path, installed_version)
     fake_bin, asset_dir, request_log = _fake_curl(tmp_path, tag, assets)
@@ -143,6 +149,9 @@ def _run_online_update(
 source "$1"
 INSTALLED_INSTALLER="$2"
 as_root() { "$@"; }
+if [[ "$NEU_BOX_FAKE_STDERR_TTY" == 1 ]]; then
+    stderr_is_terminal() { return 0; }
+fi
 shift 2
 if online_update "$@"; then
     exit 0
@@ -159,6 +168,7 @@ fi
         "NEU_BOX_FAKE_RELEASE_TAG": tag,
         "NEU_BOX_FAKE_ASSET_DIR": str(asset_dir),
         "NEU_BOX_FAKE_REQUEST_LOG": str(request_log),
+        "NEU_BOX_FAKE_STDERR_TTY": "1" if force_progress else "0",
         "TMPDIR": str(tmp_path),
         "PATH": f"{fake_bin}:{environment['PATH']}",
     })
@@ -285,6 +295,28 @@ def test_online_update_downloads_verifies_extracts_and_runs_new_installer(tmp_pa
     assert "在线更新完成: 1.0.0 -> 1.1.0" in result.stdout
     assert "HEAD http://release.test/neusbox/neu_box/releases/latest" in requests
     assert any(line.startswith("GET ") and line.endswith(".tar.gz") for line in requests)
+    assert not any(line.startswith("PROGRESS ") for line in requests)
+
+
+def test_online_update_shows_archive_progress_bar_in_terminal(tmp_path):
+    tag, assets = _release_assets(tmp_path, "1.1.0")
+    result, _record, requests = _run_online_update(
+        tmp_path,
+        "1.0.0",
+        tag,
+        assets,
+        "--yes",
+        force_progress=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    progress_requests = [
+        line.removeprefix("PROGRESS ")
+        for line in requests
+        if line.startswith("PROGRESS ")
+    ]
+    assert len(progress_requests) == 1
+    assert progress_requests[0].endswith(".tar.gz")
 
 
 def test_check_update_same_version_does_not_download_assets(tmp_path):

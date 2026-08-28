@@ -61,6 +61,10 @@ require_command() {
     fi
 }
 
+stderr_is_terminal() {
+    [[ -t 2 ]]
+}
+
 resolve_release_source() {
     local candidate="${1:-}"
     if [[ -z "$candidate" && -f "$SCRIPT_DIR/manifest.json" ]]; then
@@ -426,6 +430,7 @@ online_update() (
     local installer current tag version architecture asset_name checksum_name
     local base_url release_url update_tmp archive checksum_file release_root release_dir
     local answer
+    local -a download_display_args=(--silent)
 
     while (($#)); do
         case "$1" in
@@ -522,9 +527,12 @@ online_update() (
     if [[ "$base_url" == https://* ]]; then
         protocol_args+=(--proto '=https' --proto-redir '=https')
     fi
+    if stderr_is_terminal; then
+        download_display_args=(--progress-bar)
+    fi
 
     printf '正在下载 %s...\n' "$asset_name"
-    if ! curl --fail --silent --show-error --location \
+    if ! curl --fail "${download_display_args[@]}" --show-error --location \
         --connect-timeout 10 --max-time 1800 --retry 2 --retry-delay 1 \
         "${protocol_args[@]}" --output "$archive" \
         "$release_url/$asset_name"; then
