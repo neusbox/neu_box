@@ -61,9 +61,6 @@ def database_path() -> str:
     explicit = env_text("NEU_BOX_DB_PATH")
     if explicit:
         return os.path.abspath(os.path.expanduser(explicit))
-    legacy_dir = env_text("db_dir")
-    if legacy_dir:
-        return os.path.abspath(os.path.join(os.path.expanduser(legacy_dir), "neu_box.db"))
     return str(user_data_dir("worker") / "neu_box.db")
 
 

@@ -1,195 +1,110 @@
 #!/usr/bin/env python3
-"""Build a versioned, checksummed Neu Box worker deployment archive.
-
-2026-08-25 起本构建只产出 worker 角色（WebUI 见 neu_box_webui 仓库，
-Go 客户端见 neu_box_goClient 仓库，均独立发版）。
-
-产物: dist/neu-box-<version>-linux-<arch>.tar.gz
-包含: worker/  (PyInstaller) + neu-box-install (安装器)
-      + run.sh（交互式安装、升级、回滚与服务管理入口）
-      + config/worker.env.example + systemd/neu-box-worker.service
-      + share/neu-box/{sandbox,info} (沙盒脚本/设备状态脚本/BPF)
-      + docs/ + manifest.json + SHA256SUMS
-"""
+"""Build the native sandbox, PyInstaller Worker bundle, and binary RPM."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import os
-import platform
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_ROOT = ROOT / "build" / "release"
 
 
-def _version() -> str:
-    namespace: dict[str, str] = {}
-    exec((ROOT / "src" / "neu_box" / "__init__.py").read_text(), namespace)
-    return namespace["__version__"]
-
-
-def _architecture() -> str:
-    machine = platform.machine().lower()
-    aliases = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-    }
-    try:
-        return aliases[machine]
-    except KeyError as exc:
-        raise SystemExit(f"Unsupported build architecture: {machine}") from exc
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _run(
-    command: list[str],
-    *,
-    env: dict[str, str] | None = None,
-    cwd: Path = ROOT,
-) -> None:
+def _run(command: list[str], *, cwd: Path = ROOT) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=cwd, check=True, env=env)
+    subprocess.run(command, cwd=cwd, check=True)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
-    shutil.copytree(source, destination, symlinks=True)
+def _build_native(build_dir: Path, *, static_libbpf: bool) -> None:
+    shutil.rmtree(build_dir, ignore_errors=True)
+    _run([
+        "cmake",
+        "-S", str(ROOT / "native" / "sandbox"),
+        "-B", str(build_dir),
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DNEU_BOX_SANDBOX_STATIC_LIBBPF=" + (
+            "ON" if static_libbpf else "OFF"
+        ),
+    ])
+    _run([
+        "cmake", "--build", str(build_dir),
+        "--config", "Release",
+        "--parallel",
+    ])
+    _run([
+        "ctest",
+        "--test-dir", str(build_dir),
+        "--build-config", "Release",
+        "--output-on-failure",
+    ])
+
+
+def _build_worker(dist_dir: Path, work_dir: Path) -> None:
+    shutil.rmtree(dist_dir, ignore_errors=True)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    _run([
+        sys.executable,
+        "-m", "PyInstaller",
+        "--log-level=WARN",
+        "--clean",
+        "--noconfirm",
+        "--distpath", str(dist_dir),
+        "--workpath", str(work_dir),
+        str(ROOT / "deploy" / "pyinstaller" / "worker.spec"),
+    ])
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default=str(ROOT / "dist"))
-    parser.add_argument("--skip-pyinstaller", action="store_true")
+    parser.add_argument("--output-dir", default=str(ROOT / "dist" / "rpm"))
+    parser.add_argument("--release", default="1", help="RPM release number")
+    parser.add_argument(
+        "--dynamic-libbpf",
+        action="store_true",
+        help=(
+            "development build linked to the host libbpf; production RPMs "
+            "should keep the default statically linked libbpf"
+        ),
+    )
+    parser.add_argument(
+        "--source-only",
+        action="store_true",
+        help="compose the binary payload source archive without rpmbuild",
+    )
     args = parser.parse_args()
 
-    version = _version()
-    if not version or "/" in version or version in {".", ".."}:
-        parser.error("project version must be a non-empty path-safe value")
-    architecture = _architecture()
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    native_build = BUILD_ROOT / "native-sandbox"
+    pyinstaller_dist = BUILD_ROOT / "pyinstaller-dist"
+    pyinstaller_work = BUILD_ROOT / "pyinstaller-work" / "worker"
 
-    work_root = ROOT / "build" / "release"
-    pyi_dist = work_root / "pyinstaller-dist"
-    pyi_work = work_root / "pyinstaller-work"
-    generated = work_root / "generated"
-    generated.mkdir(parents=True, exist_ok=True)
+    rpm_release = args.release
+    if args.dynamic_libbpf and not rpm_release.endswith(".dev"):
+        rpm_release += ".dev"
 
-    bpf_object = generated / "device_block.o"
-    _run([
-        "clang", "-O2", "-g", "-target", "bpf", "-c",
-        str(
-            ROOT
-            / "src"
-            / "neu_box"
-            / "worker"
-            / "resources"
-            / "sandbox"
-            / "v2"
-            / "device_block.bpf.c"
-        ),
-        "-o", str(bpf_object),
-    ])
+    _build_native(
+        native_build,
+        static_libbpf=not args.dynamic_libbpf,
+    )
+    _build_worker(pyinstaller_dist, pyinstaller_work)
 
-    if not args.skip_pyinstaller:
-        shutil.rmtree(pyi_dist, ignore_errors=True)
-        shutil.rmtree(pyi_work, ignore_errors=True)
-        build_environment = os.environ.copy()
-        build_environment["NEU_BOX_BUILD_BPF_OBJECT"] = str(bpf_object)
-        for role in ("worker", "installer"):
-            _run([
-                sys.executable,
-                "-m",
-                "PyInstaller",
-                "--log-level=WARN",
-                "--clean",
-                "--noconfirm",
-                "--distpath",
-                str(pyi_dist),
-                "--workpath",
-                str(pyi_work / role),
-                str(ROOT / "deploy" / "pyinstaller" / f"{role}.spec"),
-            ], env=build_environment)
-
-    if not (pyi_dist / "neu-box-worker").is_dir():
-        raise SystemExit("missing PyInstaller output for worker")
-    if not (pyi_dist / "neu-box-install").is_file():
-        raise SystemExit("missing PyInstaller output for installer")
-
-    archive_name = f"neu-box-{version}-linux-{architecture}"
-    with tempfile.TemporaryDirectory(prefix="neu-box-release-") as raw_temp:
-        staging = Path(raw_temp) / archive_name
-        staging.mkdir()
-        _copy_tree(pyi_dist / "neu-box-worker", staging / "worker")
-        shutil.copy2(pyi_dist / "neu-box-install", staging / "neu-box-install")
-        os.chmod(staging / "neu-box-install", 0o755)
-        shutil.copy2(ROOT / "run.sh", staging / "run.sh")
-        os.chmod(staging / "run.sh", 0o755)
-        _copy_tree(ROOT / "deploy" / "config", staging / "config")
-        _copy_tree(ROOT / "deploy" / "systemd", staging / "systemd")
-        _copy_tree(
-            ROOT / "src" / "neu_box" / "worker" / "resources",
-            staging / "share" / "neu-box",
-        )
-        bpf_source = staging / "share" / "neu-box" / "sandbox" / "v2" / "device_block.bpf.c"
-        bpf_out = bpf_source.with_suffix("").with_suffix(".o")
-        shutil.copy2(generated / "device_block.o", bpf_out)
-        shutil.copy2(ROOT / "LICENSE", staging / "LICENSE")
-        shutil.copy2(ROOT / "README.md", staging / "README.md")
-        _copy_tree(ROOT / "docs", staging / "docs")
-
-        manifest = {
-            "format": 1,
-            "name": "neu-box",
-            "version": version,
-            "os": "linux",
-            "architecture": architecture,
-            "built_at": datetime.now(timezone.utc).isoformat(),
-            "python": platform.python_version(),
-        }
-        (staging / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-        checksums: list[str] = []
-        for path in sorted(staging.rglob("*")):
-            if path.is_file() and path.name != "SHA256SUMS":
-                relative = path.relative_to(staging)
-                checksums.append(f"{_sha256(path)}  {relative.as_posix()}")
-        (staging / "SHA256SUMS").write_text(
-            "\n".join(checksums) + "\n",
-            encoding="utf-8",
-        )
-
-        archive = output_dir / f"{archive_name}.tar.gz"
-        temporary_archive = archive.with_name(archive.name + ".tmp")
-        with tarfile.open(temporary_archive, "w:gz", format=tarfile.PAX_FORMAT) as tar:
-            tar.add(staging, arcname=archive_name)
-        os.replace(temporary_archive, archive)
-        checksum_file = archive.with_suffix(archive.suffix + ".sha256")
-        checksum_file.write_text(
-            f"{_sha256(archive)}  {archive.name}\n",
-            encoding="utf-8",
-        )
-        print(archive)
+    command = [
+        sys.executable,
+        str(ROOT / "deploy" / "rpm" / "build_rpm.py"),
+        "--release", rpm_release,
+        "--output-dir", str(Path(args.output_dir).expanduser().resolve()),
+        "--worker-bundle", str(pyinstaller_dist / "neu-box-worker"),
+        "--sandbox-executable", str(native_build / "neu-box-sandbox"),
+        "--bpf-object", str(native_build / "device_block.o"),
+    ]
+    if args.source_only:
+        command.append("--source-only")
+    if args.dynamic_libbpf:
+        command.append("--allow-dynamic-libbpf")
+    _run(command)
     return 0
 
 

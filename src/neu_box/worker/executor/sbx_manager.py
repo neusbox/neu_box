@@ -1,4 +1,4 @@
-"""沙盒资源分配管理 — 调用 sandbox.sh 实现 cgroup v2 + eBPF 设备隔离。
+"""沙盒资源分配管理 — 调用 native CLI 实现 cgroup v2 + eBPF 设备隔离。
 沙盒状态持久化到 SQLite，防止掉线后重复开沙盒出问题。
 
 设备分配模型:
@@ -20,7 +20,7 @@ from typing import Optional, List
 
 from neu_box.config import env_int, env_text
 from neu_box.worker.executor.db import Database
-from neu_box.worker.paths import sandbox_script_path
+from neu_box.worker.paths import sandbox_executable_path
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +32,17 @@ logger = logging.getLogger(__name__)
 class SbxManager:
     """Worker 本地沙盒管理器（单例）。
 
-    封装 sandbox.sh 的 create / join / destroy / status 调用，
+    封装 ``neu-box-sandbox`` 的 create / join / destroy / status 调用，
     并在本地 DB 中记录每个沙盒的状态，支持重启后恢复。
     """
 
     _instance = None
 
     def __init__(self):
-        # 脚本路径
-        self._script_path = str(sandbox_script_path())
+        self._sandbox_path = str(sandbox_executable_path())
 
         # 设备过滤器（正则，匹配 /dev 下设备名）
-        self.device_filter = env_text(
-            "NEU_BOX_DEVICE_FILTER", legacy="device_filter"
-        )
+        self.device_filter = env_text("NEU_BOX_DEVICE_FILTER")
 
         # 本地 DB（统一 SQLite）
         self.db = Database.get_instance()
@@ -69,9 +66,9 @@ class SbxManager:
 
     # ── 内部工具 ─────────────────────────────────────────────────
 
-    def _run_script(self, *args) -> subprocess.CompletedProcess:
-        """调用 sandbox.sh，返回 CompletedProcess。"""
-        cmd = [self._script_path] + list(args)
+    def _run_cli(self, *args) -> subprocess.CompletedProcess:
+        """调用 native sandbox CLI，返回 CompletedProcess。"""
+        cmd = [self._sandbox_path] + list(args)
         return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
     @staticmethod
@@ -132,9 +129,7 @@ class SbxManager:
             if self._last_external_busy is None
             else self._last_external_busy
         )
-        path = env_text(
-            "NEU_BOX_DEVICE_INFO_SCRIPT", legacy="dev_info_script_path"
-        )
+        path = env_text("NEU_BOX_DEVICE_INFO_SCRIPT")
         if not path:
             logger.error('未配置 NEU_BOX_DEVICE_INFO_SCRIPT')
             return set(fallback)
@@ -278,7 +273,7 @@ class SbxManager:
                     "恢复: 沙盒 '%s' 的 cgroup 已不存在，清理设备预留",
                     name,
                 )
-                # 仍需经过 destroy 脚本清理 eBPF map，不能只删 DB，否则
+                # 仍需经过 native destroy 清理 eBPF map，不能只删 DB，否则
                 # reserved_devices 中的卡会一直保持预留状态。
                 if not self.destroy_sandbox(name):
                     logger.error(
@@ -298,7 +293,7 @@ class SbxManager:
             name:    沙盒名称
             cpu:     CPU 核数 (0=不限)
             mem:     内存限制 (如 "512M", "2G", "0"=不限)
-            devices: 设备号列表 (如 ["235:0", "235:1"])。None 表示不预留任何设备。
+            devices: 实际 major:minor 设备号列表。None 表示不预留任何设备。
 
         Returns:
             True 表示创建成功（或已存在且有效）。
@@ -317,7 +312,7 @@ class SbxManager:
                 args.extend(devices)
 
             logger.warning("创建沙盒 '%s' (cpu=%s, mem=%s, devices=%s)", name, cpu, mem, devices)
-            result = self._run_script(*args)
+            result = self._run_cli(*args)
             if result.returncode != 0:
                 logger.error("创建沙盒 '%s' 失败: %s", name, result.stderr.strip())
                 return False
@@ -343,7 +338,7 @@ class SbxManager:
                 logger.error("加入失败: 沙盒 '%s' 不在 DB 中", name)
                 return False
 
-            result = self._run_script('join', name, str(pid))
+            result = self._run_cli('join', name, str(pid))
             if result.returncode != 0:
                 logger.error("加入 PID %s 到 '%s' 失败: %s", pid, name, result.stderr.strip())
                 return False
@@ -428,13 +423,13 @@ class SbxManager:
             if not os.path.isdir(self._cg_path(name)) and not record:
                 return True
 
-            # 即使 cgroup 目录已经消失也必须调用脚本：脚本会根据持久化
-            # 的设备清单删除 eBPF reserved_devices 条目。只有脚本成功且
+            # 即使 cgroup 目录已经消失也必须调用 CLI：CLI 会根据持久化
+            # 的 cgroup owner ID 扫描并删除 eBPF map 条目。只有 CLI 成功且
             # cgroup 确认消失后才能删 DB，否则保留记录供 Reaper 重试。
             try:
-                result = self._run_script('destroy', name)
+                result = self._run_cli('destroy', name)
             except (OSError, subprocess.SubprocessError) as exc:
-                # 单个沙盒脚本超时/启动失败不能打断整个 Reaper 扫描，
+                # 单个沙盒 CLI 超时/启动失败不能打断整个 Reaper 扫描，
                 # 保留 DB 和设备元数据供下一轮继续尝试。
                 logger.error("销毁沙盒 '%s' 执行失败: %s", name, exc)
                 return False
@@ -442,7 +437,7 @@ class SbxManager:
                 logger.error("销毁沙盒 '%s' 失败: %s", name, result.stderr.strip())
                 return False
 
-            # 脚本返回成功 ≠ cgroup 目录已消失（systemd slice 可能阻止 rmdir）
+            # CLI 返回成功 ≠ cgroup 目录已消失
             if os.path.isdir(self._cg_path(name)):
                 logger.warning("沙盒 '%s' cgroup 目录未清除，保留 DB 记录等待重试", name)
                 return False
@@ -452,10 +447,10 @@ class SbxManager:
             return True
 
     def sandbox_status(self, name: str) -> Optional[dict]:
-        """查询沙盒状态（调用 sandbox.sh status）。"""
+        """查询沙盒状态（调用 native CLI status）。"""
         if not os.path.isdir(self._cg_path(name)):
             return None
-        result = self._run_script('status', name)
+        result = self._run_cli('status', name)
         if result.returncode != 0:
             return None
         return {'name': name, 'output': result.stdout}
@@ -464,15 +459,15 @@ class SbxManager:
         """列出 DB 中所有沙盒名称。"""
         return self._list_sandbox_names()
 
-    def list_sandboxes_via_script(self) -> List[str]:
-        """通过 sandbox.sh list 获取 cgroup 中实际存在的沙盒名称列表。"""
+    def list_sandboxes_via_cli(self) -> List[str]:
+        """通过 native CLI list 获取 cgroup 中实际存在的沙盒名称列表。"""
         try:
-            result = self._run_script('list')
+            result = self._run_cli('list')
         except (OSError, subprocess.SubprocessError) as exc:
-            logger.error("sandbox.sh list 执行失败: %s", exc)
+            logger.error("native sandbox list 执行失败: %s", exc)
             return []
         if result.returncode != 0:
-            logger.error("sandbox.sh list 失败: %s", result.stderr.strip())
+            logger.error("native sandbox list 失败: %s", result.stderr.strip())
             return []
         names = [n for n in result.stdout.strip().split('\n') if n and n != '(无)']
         return names
@@ -491,7 +486,7 @@ class SbxManager:
             owner:       沙盒所有者（系统用户名）
             sandbox_id:  沙盒唯一标识（命令任务 ID 或 acquire 的 PID）
             device_num:  要分配的设备数量 (0=不分配，device_ids 为空时自动选取)
-            device_ids:  用户指定的设备号列表 (如 ["235:1","235:3"])，优先于 device_num
+            device_ids:  用户指定的实际 major:minor 列表，优先于 device_num
             cpu/mem: 同 create_sandbox
 
         Returns:
@@ -545,7 +540,6 @@ class SbxManager:
             env_int(
                 "NEU_BOX_SANDBOX_REAPER_INTERVAL",
                 30,
-                "sandbox_reaper_interval",
             ),
         )
         # 与 create/join/destroy/allocate 共用同一把锁，避免 Neu Box 在
@@ -616,7 +610,7 @@ class SbxManager:
             # destroy_sandbox 会验证 cgroup 与 eBPF 清理结果；失败不计为
             # cleaned，下一轮仍会从文件系统再次发现并重试。
             db_names = set(self._list_sandbox_names())
-            fs_names = set(self.list_sandboxes_via_script())
+            fs_names = set(self.list_sandboxes_via_cli())
             orphans = fs_names - db_names
             orphan_cleaned = []
             for name in orphans:
@@ -641,7 +635,6 @@ class SbxManager:
         interval = env_int(
             "NEU_BOX_SANDBOX_REAPER_INTERVAL",
             30,
-            "sandbox_reaper_interval",
         )
         logger.warning("定时收尸已启动 (间隔=%ss)", interval)
 

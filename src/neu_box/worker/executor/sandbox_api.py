@@ -27,8 +27,8 @@ def _normalize_device_ids(raw: list, all_devices: list[str]) -> list[str]:
     """将用户指定的设备 ID 归一化为 ["major:minor", ...] 格式。
 
     支持两种输入：
-      - 纯数字: ["1","3"] → 在所有设备中匹配 minor 号 → ["235:1","235:3"]
-      - major:minor: ["235:1","235:3"] → 原样返回
+      - 纯数字: ["1","3"] → 在所有设备中按 minor 匹配实际 major:minor
+      - major:minor: 与本机设备节点完全一致时原样返回
     """
     result = []
     for d in raw:
@@ -122,14 +122,14 @@ def acquire():
 
     container 缺省时 pid 为宿主机 PID；提供 container 时 pid 为容器 PID。
 
-    响应: { "sandbox_name": "user_pengyt_12345", "devices": ["235:0"], "message": "..." }
+    响应中的 devices 使用本机实际发现的 major:minor。
     """
     body = request.get_json(silent=True) or {}
 
     username = (body.get('username') or '').strip()
     requested_pid = body.get('pid', 0)
     device_num = body.get('device_num', 0)
-    device_ids = body.get('device_ids')  # 可选: ["1","3","5"]（minor 号）或 ["235:1","235:3"]（major:minor）
+    device_ids = body.get('device_ids')  # 可选: minor 号或本机实际 major:minor
     cpu = body.get('cpu', 0)
     mem_val = body.get('memory', 0)
     mem_unit = body.get('mem_unit', 'GB')

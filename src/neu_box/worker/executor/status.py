@@ -73,10 +73,10 @@ class Node_Manager:
     # ── 活跃沙盒 ──────────────────────────────────────────────
 
     def active_sandbox_count(self) -> int:
-        """统计 cgroup 中实际存在的沙盒数量（通过 sandbox.sh list）。"""
+        """统计 cgroup 中实际存在的沙盒数量（通过 native CLI list）。"""
         try:
             from neu_box.worker.executor.sbx_manager import SbxManager
-            return len(SbxManager.get_instance().list_sandboxes_via_script())
+            return len(SbxManager.get_instance().list_sandboxes_via_cli())
         except Exception:
             return 0
 

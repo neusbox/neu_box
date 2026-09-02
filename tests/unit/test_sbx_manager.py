@@ -45,7 +45,7 @@ def fake_script(monkeypatch):
 
     monkeypatch.setattr(sm.subprocess, "check_output", _check_output)
     monkeypatch.setattr(sm, "env_text",
-                        lambda name, legacy=None: "/fake/npu_info.sh")
+                        lambda name: "/fake/npu_info.sh")
     return state
 
 
@@ -165,7 +165,7 @@ class _ReaperManager(sm.SbxManager):
             self.db.delete_sandbox(name)
         return result
 
-    def list_sandboxes_via_script(self):
+    def list_sandboxes_via_cli(self):
         return []
 
 
@@ -271,7 +271,7 @@ def test_join_replaces_db_pid_history_with_cgroup_snapshot():
     manager = object.__new__(sm.SbxManager)
     manager.db = _ReaperDB(pids=[10, 11, 12])
     manager._lock = threading.RLock()
-    manager._run_script = lambda *_args: SimpleNamespace(
+    manager._run_cli = lambda *_args: SimpleNamespace(
         returncode=0,
         stdout='',
         stderr='',
@@ -289,8 +289,8 @@ def test_destroy_timeout_keeps_record_for_next_reaper_scan(tmp_path):
     manager._cg_path = lambda _name: str(tmp_path / 'missing-cgroup')
 
     def timeout(*_args):
-        raise subprocess.TimeoutExpired('sandbox.sh destroy', 30)
+        raise subprocess.TimeoutExpired('neu-box-sandbox destroy', 30)
 
-    manager._run_script = timeout
+    manager._run_cli = timeout
     assert not manager.destroy_sandbox('sbx_user_task.slice')
     assert 'sbx_user_task.slice' in manager.db.records

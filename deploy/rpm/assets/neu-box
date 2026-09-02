@@ -1,0 +1,98 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 0077
+
+readonly WORKER=/usr/libexec/neu-box/worker/neu-box-worker
+readonly SANDBOX=/usr/libexec/neu-box/neu-box-sandbox
+readonly CONFIG=/etc/neu-box/worker.env
+readonly SERVICE=neu-box-worker.service
+
+usage() {
+    cat <<'EOF'
+用法: neu-box <命令> [参数]
+
+Worker 命令:
+  setup                            初始化数据库、检查 sandbox 并启动 Worker
+  db <status|migrate|check|backup>  管理 Worker 数据库
+  worker <参数...>                 直接调用 neu-box-worker
+  sandbox <参数...>                直接调用 native sandbox CLI
+  version                          显示 Worker 版本
+
+服务命令:
+  status                           显示服务状态
+  start|stop|restart               管理服务
+  logs                             跟踪服务日志
+  help                             显示帮助
+
+RPM 安装和升级由 dnf/rpm 负责；本命令只管理当前 Worker。
+EOF
+}
+
+require_worker() {
+    if [[ ! -x "$WORKER" ]]; then
+        echo "neu-box: Worker 可执行文件不存在: $WORKER" >&2
+        exit 1
+    fi
+}
+
+require_sandbox() {
+    if [[ ! -x "$SANDBOX" ]]; then
+        echo "neu-box: sandbox 可执行文件不存在: $SANDBOX" >&2
+        exit 1
+    fi
+}
+
+command="${1:-help}"
+if (($#)); then
+    shift
+fi
+
+case "$command" in
+    setup)
+        require_worker
+        require_sandbox
+        if ((EUID != 0)); then
+            echo "neu-box: setup 需要 root" >&2
+            exit 1
+        fi
+        "$WORKER" --config "$CONFIG" db migrate
+        "$WORKER" --config "$CONFIG" db check
+        "$SANDBOX" list >/dev/null
+        systemctl enable --now "$SERVICE"
+        systemctl is-active --quiet "$SERVICE"
+        echo "Neu Box Worker 已初始化并启动"
+        ;;
+    db)
+        require_worker
+        exec "$WORKER" --config "$CONFIG" db "$@"
+        ;;
+    worker)
+        require_worker
+        exec "$WORKER" --config "$CONFIG" "$@"
+        ;;
+    sandbox)
+        require_sandbox
+        exec "$SANDBOX" "$@"
+        ;;
+    version|--version|-V)
+        require_worker
+        exec "$WORKER" --version
+        ;;
+    status)
+        exec systemctl --no-pager --full status "$SERVICE"
+        ;;
+    start|stop|restart)
+        exec systemctl "$command" "$SERVICE"
+        ;;
+    logs)
+        exec journalctl -u "$SERVICE" -n 100 -f
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "neu-box: 未知命令: $command" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
