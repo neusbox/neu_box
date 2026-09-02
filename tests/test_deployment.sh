@@ -6,8 +6,13 @@
 
 set -Eeuo pipefail
 
+readonly REPOSITORY_ROOT="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P
+)"
+
 WORKER_URL="${NEU_BOX_WORKER_URL:-http://127.0.0.1:59075}"
 TEST_USER="${NEU_BOX_TEST_USER:-$(id -un)}"
+EXPECTED_WORKER_VERSION="${NEU_BOX_EXPECTED_WORKER_VERSION:-}"
 TASK_TIMEOUT=120
 REAPER_TIMEOUT=100
 SKIP_DEVICE=0
@@ -21,6 +26,7 @@ usage() {
 选项:
   --url URL                 Worker 地址（默认 http://127.0.0.1:59075）
   --user USER               执行任务的系统用户（默认当前用户）
+  --expected-version VER    必须匹配的 Worker 版本（默认仓库版本）
   --timeout SECONDS         单个任务的最长等待时间（默认 120）
   --reaper-timeout SECONDS  Reaper 回收的最长等待时间（默认 100）
   --skip-device             跳过所有真实设备占用测试
@@ -30,6 +36,7 @@ usage() {
 环境变量:
   NEU_BOX_WORKER_URL        与 --url 相同
   NEU_BOX_TEST_USER         与 --user 相同
+  NEU_BOX_EXPECTED_WORKER_VERSION  与 --expected-version 相同
 
 示例:
   sudo -u pengyt ./tests/test_deployment.sh
@@ -48,6 +55,11 @@ while (($#)); do
         --user)
             (($# >= 2)) || { echo "--user 缺少参数" >&2; exit 2; }
             TEST_USER="$2"
+            shift 2
+            ;;
+        --expected-version)
+            (($# >= 2)) || { echo "--expected-version 缺少参数" >&2; exit 2; }
+            EXPECTED_WORKER_VERSION="$2"
             shift 2
             ;;
         --timeout)
@@ -103,6 +115,30 @@ if ! command -v curl >/dev/null 2>&1; then
     echo "缺少依赖: curl" >&2
     exit 2
 fi
+if [[ -z "$EXPECTED_WORKER_VERSION" ]]; then
+    EXPECTED_WORKER_VERSION="$($PYTHON_BIN -c '
+import ast
+import pathlib
+import sys
+
+tree = ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for node in tree.body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if any(isinstance(target, ast.Name) and target.id == "__version__"
+           for target in node.targets):
+        value = ast.literal_eval(node.value)
+        if isinstance(value, str) and value:
+            print(value)
+            break
+else:
+    raise SystemExit("无法读取仓库 Worker 版本")
+' "$REPOSITORY_ROOT/src/neu_box/__init__.py")"
+fi
+if [[ -z "$EXPECTED_WORKER_VERSION" ]]; then
+    echo "期望 Worker 版本不能为空" >&2
+    exit 2
+fi
 
 TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/neu-box-deployment.XXXXXX")"
 HTTP_BODY=''
@@ -113,6 +149,8 @@ CREATED_TASK_IDS=()
 REAPER_PARENT=''
 REAPER_CHILD=''
 REAPER_SANDBOX=''
+ISOLATION_PID=''
+ISOLATION_SANDBOX=''
 PASSED=0
 SKIPPED=0
 
@@ -230,6 +268,16 @@ cleanup() {
 
     if [[ -n "$REAPER_CHILD" ]] && kill -0 "$REAPER_CHILD" 2>/dev/null; then
         kill "$REAPER_CHILD" 2>/dev/null || true
+    fi
+    if [[ -n "$ISOLATION_SANDBOX" ]]; then
+        curl --noproxy '*' --silent --show-error --max-time 20 \
+            --header 'Content-Type: application/json' \
+            --data "{\"sandbox_name\":\"$ISOLATION_SANDBOX\"}" \
+            "$WORKER_URL/sandbox/release" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$ISOLATION_PID" ]] && kill -0 "$ISOLATION_PID" 2>/dev/null; then
+        kill "$ISOLATION_PID" 2>/dev/null || true
+        wait "$ISOLATION_PID" 2>/dev/null || true
     fi
     if [[ -n "$REAPER_PARENT" ]] && kill -0 "$REAPER_PARENT" 2>/dev/null; then
         kill "$REAPER_PARENT" 2>/dev/null || true
@@ -357,6 +405,39 @@ wait_idle_at_least() {
     fail "设备未在 ${timeout}s 内恢复到至少 $expected 张空闲卡（当前: $idle）"
 }
 
+device_node_path() {
+    local major="$1"
+    local minor="$2"
+    "$PYTHON_BIN" -c '
+import os
+import stat
+import sys
+
+major = int(sys.argv[1])
+minor = int(sys.argv[2])
+for entry in os.scandir("/dev"):
+    try:
+        info = entry.stat(follow_symlinks=True)
+    except OSError:
+        continue
+    if stat.S_ISCHR(info.st_mode) and os.major(info.st_rdev) == major and os.minor(info.st_rdev) == minor:
+        print(entry.path)
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$major" "$minor"
+}
+
+open_device_node() {
+    local path="$1"
+    "$PYTHON_BIN" -c '
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CLOEXEC)
+os.close(descriptor)
+' "$path"
+}
+
 sandbox_pid_state() {
     local document="$1"
     local sandbox_name="$2"
@@ -395,6 +476,8 @@ WORKER_VERSION="$(json_value "$HTTP_BODY" version)" || fail 'healthz 缺少 vers
 [[ "$ROLE" == 'worker' ]] || fail "healthz role 应为 worker，实际为 $ROLE"
 [[ "$API_VERSION" =~ ^[0-9]+$ ]] || fail "api_version 不是整数: $API_VERSION"
 ((API_VERSION >= 2)) || fail "Worker API 版本过旧: $API_VERSION（要求 >= 2）"
+[[ "$WORKER_VERSION" == "$EXPECTED_WORKER_VERSION" ]] \
+    || fail "Worker 版本不匹配: expected=$EXPECTED_WORKER_VERSION actual=$WORKER_VERSION"
 pass "Worker $WORKER_VERSION 在线，api_version=$API_VERSION"
 
 test_title '资源状态与设备基线'
@@ -432,7 +515,7 @@ submit_task "printf '%s\\n' '$NORMAL_MARKER'" 0
 NORMAL_TASK="$TASK_RESULT"
 wait_task_terminal "$NORMAL_TASK"
 [[ "$TASK_STATE" == 'completed' ]] || fail "正常任务状态应为 completed，实际为 $TASK_STATE"
-NORMAL_RC="$(json_value "$TASK_RESULT" returncode)" || fail '正常任务结果缺少 returncode'
+NORMAL_RC="$(json_value "$TASK_RESULT" result.returncode)" || fail '正常任务结果缺少 result.returncode'
 [[ "$NORMAL_RC" == '0' ]] || fail "正常任务返回码应为 0，实际为 $NORMAL_RC"
 http_request GET "/tasks/$NORMAL_TASK/log?raw=1"
 expect_http 200 '读取正常任务日志失败'
@@ -444,7 +527,7 @@ submit_task 'if' 0
 ERROR_TASK="$TASK_RESULT"
 wait_task_terminal "$ERROR_TASK"
 [[ "$TASK_STATE" == 'failed' ]] || fail "语法错误任务状态应为 failed，实际为 $TASK_STATE"
-ERROR_RC="$(json_value "$TASK_RESULT" returncode)" || fail '错误任务结果缺少 returncode'
+ERROR_RC="$(json_value "$TASK_RESULT" result.returncode)" || fail '错误任务结果缺少 result.returncode'
 [[ "$ERROR_RC" =~ ^-?[0-9]+$ ]] || fail "错误任务返回码不是整数: $ERROR_RC"
 ((ERROR_RC != 0)) || fail '语法错误任务意外返回 0'
 http_request GET "/tasks/$ERROR_TASK/log?raw=1"
@@ -481,6 +564,115 @@ case "$WORKER_URL" in
         LOCAL_WORKER=1
         ;;
 esac
+
+if ((SKIP_DEVICE)); then
+    skip '设备测试已关闭，跳过 BPF 设备访问隔离实测'
+elif ((LOCAL_WORKER == 0)); then
+    skip 'Worker 不是本机地址，无法验证实际设备节点访问'
+elif [[ "$TEST_USER" != "$(id -un)" ]]; then
+    skip '测试用户不是当前用户，无法安全把本机测试进程加入 sandbox'
+elif grep -q 'sandbox_' "/proc/$$/cgroup" 2>/dev/null; then
+    skip '当前测试脚本已处于 Neu Box sandbox 中，无法建立宿主对照组'
+elif ((TOTAL_DEVICES < 2 || BASELINE_IDLE < 2)); then
+    skip '完整 BPF 隔离实测至少需要两张受管卡且两张均空闲'
+else
+    test_title 'BPF 实际设备访问隔离'
+    ISOLATION_PLAN="$TEST_TMP/isolation.plan"
+    ISOLATION_RESULT="$TEST_TMP/isolation.result"
+    "$PYTHON_BIN" -c '
+import errno
+import json
+import os
+import pathlib
+import sys
+import time
+
+plan = pathlib.Path(sys.argv[1])
+result = pathlib.Path(sys.argv[2])
+while not plan.exists():
+    time.sleep(0.05)
+allowed_path, denied_path = plan.read_text(encoding="utf-8").splitlines()
+
+def attempt(path):
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+    except OSError as exc:
+        return {"ok": False, "errno": exc.errno, "error": str(exc)}
+    os.close(descriptor)
+    return {"ok": True, "errno": 0, "error": ""}
+
+result.write_text(json.dumps({
+    "allowed": attempt(allowed_path),
+    "denied": attempt(denied_path),
+}), encoding="utf-8")
+while True:
+    time.sleep(60)
+' "$ISOLATION_PLAN" "$ISOLATION_RESULT" &
+    ISOLATION_PID=$!
+
+    ACQUIRE_PAYLOAD="$(make_acquire_payload "$ISOLATION_PID")"
+    http_request POST '/sandbox/acquire' "$ACQUIRE_PAYLOAD"
+    expect_http 201 '为 BPF 隔离测试申请设备失败'
+    ISOLATION_SANDBOX="$(json_value "$HTTP_BODY" sandbox_name)" || fail '隔离测试响应缺少 sandbox_name'
+    ALLOCATED_DEVICE="$(json_value "$HTTP_BODY" devices.0)" || fail '隔离测试响应缺少设备号'
+    [[ "$ALLOCATED_DEVICE" =~ ^([0-9]+):([0-9]+)$ ]] \
+        || fail "隔离测试收到非法设备号: $ALLOCATED_DEVICE"
+    DEVICE_MAJOR="${BASH_REMATCH[1]}"
+    DEVICE_MINOR="${BASH_REMATCH[2]}"
+    ALLOWED_NODE="$(device_node_path "$DEVICE_MAJOR" "$DEVICE_MINOR")" \
+        || fail "找不到已分配设备节点 $ALLOCATED_DEVICE"
+    refresh_status
+    OTHER_MINOR="$($PYTHON_BIN -c '
+import json
+import sys
+
+status = json.load(sys.stdin)
+allocated = int(sys.argv[1])
+for key, busy in sorted(
+    status.get("dev_status", {}).items(), key=lambda item: int(item[0])
+):
+    minor = int(key)
+    if minor != allocated and busy == 0:
+        print(minor)
+        break
+' "$DEVICE_MINOR" <<<"$HTTP_BODY")"
+    if [[ -z "$OTHER_MINOR" ]]; then
+        fail '状态声称至少两张受管卡，但找不到未分配 minor'
+    fi
+    DENIED_NODE="$(device_node_path "$DEVICE_MAJOR" "$OTHER_MINOR")" \
+        || fail "找不到同 major 的对照设备节点 $DEVICE_MAJOR:$OTHER_MINOR"
+
+    # 宿主进程没有该 major 的 sandbox reservation，必须能打开未分配节点；
+    # 否则后续失败可能只是设备权限/驱动状态，而不是 BPF 隔离。
+    open_device_node "$DENIED_NODE" \
+        || fail "宿主对照组无法打开未分配节点 $DENIED_NODE"
+    if open_device_node "$ALLOWED_NODE" 2>/dev/null; then
+        fail "sandbox 外仍能打开已预留节点 $ALLOWED_NODE"
+    fi
+
+    printf '%s\n%s\n' "$ALLOWED_NODE" "$DENIED_NODE" >"$ISOLATION_PLAN"
+    ISOLATION_DEADLINE=$((SECONDS + 15))
+    while [[ ! -s "$ISOLATION_RESULT" ]] && ((SECONDS < ISOLATION_DEADLINE)); do
+        sleep 1
+    done
+    [[ -s "$ISOLATION_RESULT" ]] || fail 'sandbox 内设备访问探针没有返回结果'
+    ISOLATION_JSON="$(<"$ISOLATION_RESULT")"
+    [[ "$(json_value "$ISOLATION_JSON" allowed.ok)" == true ]] \
+        || fail "sandbox 无法打开自己的设备节点: $ISOLATION_JSON"
+    [[ "$(json_value "$ISOLATION_JSON" denied.ok)" == false ]] \
+        || fail "sandbox 越权打开了另一张受管卡: $ISOLATION_JSON"
+    DENIED_ERRNO="$(json_value "$ISOLATION_JSON" denied.errno)"
+    [[ "$DENIED_ERRNO" == 1 || "$DENIED_ERRNO" == 13 ]] \
+        || fail "越权访问不是由权限检查拒绝: $ISOLATION_JSON"
+
+    http_request POST '/sandbox/release' \
+        "{\"sandbox_name\":\"$ISOLATION_SANDBOX\"}"
+    expect_http 200 '释放 BPF 隔离测试 sandbox 失败'
+    ISOLATION_SANDBOX=''
+    wait "$ISOLATION_PID" 2>/dev/null || true
+    ISOLATION_PID=''
+    pass "已验证 $ALLOWED_NODE 可访问、$DENIED_NODE 被 BPF 拒绝，宿主对照正常"
+fi
 
 if ((SKIP_DEVICE)); then
     skip '设备测试已关闭，跳过 Reaper 实测'

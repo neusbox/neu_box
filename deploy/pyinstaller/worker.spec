@@ -1,21 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 ROOT = Path(SPECPATH).resolve().parents[1]
 SRC = ROOT / "src"
-datas = [
-    item for item in collect_data_files("neu_box.worker")
-    if not item[0].endswith("device_block.o")
-]
-bpf_object = os.environ.get("NEU_BOX_BUILD_BPF_OBJECT")
-if not bpf_object:
-    raise RuntimeError("NEU_BOX_BUILD_BPF_OBJECT is required")
-datas.append((bpf_object, "neu_box/worker/resources/sandbox/v2"))
+MIGRATIONS_PACKAGE = "neu_box.worker.migrations"
+# Migration discovery hashes the packaged source bytes before applying them.
+# Keep Python migrations as resources and as importable hidden modules; SQL
+# migrations only need the resource copy.
+datas = collect_data_files(MIGRATIONS_PACKAGE, include_py_files=True)
+migration_hiddenimports = collect_submodules(MIGRATIONS_PACKAGE)
 
 a = Analysis(
     [str(SRC / "neu_box" / "worker" / "app.py")],
@@ -29,7 +26,7 @@ a = Analysis(
         "neu_box.worker.executor.sandbox_api",
         "neu_box.worker.executor.sbx_manager",
         "neu_box.worker.executor.status",
-        "neu_box.worker.migrations",
+        *migration_hiddenimports,
     ],
     hookspath=[],
     hooksconfig={},

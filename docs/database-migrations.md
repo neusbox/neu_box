@@ -6,7 +6,8 @@ Worker 拥有独立的 SQLite 数据库及迁移序列（WebUI 的 master 数据
 src/neu_box/worker/migrations/
 ```
 
-应用启动不再创建表、执行 `ALTER TABLE` 或吞掉迁移异常。建表和历史数据转换只发生在显式 `db migrate` 中；正式部署由安装器自动调用。
+应用启动不创建表、执行 `ALTER TABLE` 或吞掉迁移异常。建表和历史数据转换只发生
+在显式 `db migrate` 中；RPM scriptlet 不运行数据库迁移，部署流程必须显式调用。
 
 ## 迁移记录表
 
@@ -67,6 +68,10 @@ def upgrade(conn):
 
 迁移接收由运行器管理的同一个 connection。不得调用 `commit()`、`rollback()`、`BEGIN`、`SAVEPOINT` 或 `executescript()`；运行器使用 SQLite authorizer 阻止迁移自行控制事务。一个版本的结构变化、数据变化和迁移记录在同一事务内提交，失败时整个版本回滚。
 
+发布构建会把迁移 `.py` 同时作为 PyInstaller 数据资源和动态导入模块收集，因此运行器
+既能读取原始字节计算 checksum，也能执行 `upgrade()`；打包测试会校验这两个入口，
+新增 Python 迁移不需要手工维护 hidden-import 清单。
+
 ## 开发流程
 
 一次 schema 修改应同时完成：
@@ -79,8 +84,8 @@ def upgrade(conn):
 3. 更新 CRUD 代码；
 4. 增加迁移测试，至少覆盖新库和上一版本数据库升级，并验证数据保留；
 5. 运行单元测试；
-6. 提升项目版本，构建新发布包；
-7. 不再修改已经进入发布包的旧迁移。
+6. 提升项目版本，构建新 RPM；
+7. 不再修改已经进入 RPM 的旧迁移。
 
 ```bash
 UV_CACHE_DIR=/tmp/neu-box-uv-cache uv run --frozen pytest -q
@@ -91,7 +96,6 @@ UV_CACHE_DIR=/tmp/neu-box-uv-cache uv run --frozen pytest -q
 ```bash
 neu-box-worker --config /path/to/worker.env db status
 neu-box-worker --config /path/to/worker.env db migrate
-Worker 数据库：
 neu-box-worker --config /path/to/worker.env db check
 neu-box-worker --config /path/to/worker.env db backup \
   --output-dir /path/to/backups
@@ -111,11 +115,15 @@ neu-box-worker --config /path/to/worker.env db backup \
 
 旧版本到当前结构的转换必须写明确、可测试的兼容迁移，不能恢复成运行时 `try/except ALTER TABLE`。
 
-## 部署与回滚
+## 部署与恢复
 
-安装器的数据库顺序是：停止服务、SQLite 一致备份、备份副本试迁移、正式迁移、启动新服务、健康检查。这样在没有独立测试线的实验室环境中，至少会用真实生产库副本验证迁移。
+普通 RPM 升级的顺序是：停止上游派发并排空 Worker、停止服务、创建 SQLite 一致
+备份、清理空闲的旧 BPF 状态、安装新 RPM、显式执行 `db migrate` 和 `db check`、
+执行 `neu-box sandbox list`、启动服务、健康检查。
+首个 RPM 的一次性交割脚本还会先在备份副本上试迁移，再迁移正式数据库。
 
-不提供通用自动 downgrade SQL。新版本失败或管理员显式回滚时，安装器恢复升级前数据库备份，再切回旧程序。显式回滚会丢弃升级后产生的新写入，所以必须在维护窗口内确认。
+RPM 不提供数据库自动降级，也不在 scriptlet 中恢复业务数据。迁移或健康检查失败
+时，应保持 Worker 停止，由部署流程用升级前的一致备份恢复数据库，再安装明确的
+旧 RPM。恢复会丢弃升级后产生的新写入，因此只能在上游仍停止派发的维护窗口执行。
 
 备份必须使用 SQLite backup API，不能只复制主 `.db` 文件；WAL 模式下直接复制单个文件可能遗漏尚未 checkpoint 的数据。
-

@@ -104,8 +104,8 @@ def main(argv: list[str] | None = None) -> int:
 
         TaskQueue.get_instance().start()
         SbxManager.get_instance().start_reaper()
-        listen = args.listen or env_text("NEU_BOX_LISTEN", "0.0.0.0", "listen")
-        port = args.port or env_int("NEU_BOX_PORT", 59075, "port")
+        listen = args.listen or env_text("NEU_BOX_LISTEN", "0.0.0.0")
+        port = args.port or env_int("NEU_BOX_PORT", 59075)
         threads = env_int("NEU_BOX_HTTP_THREADS", 8)
         logger.info("Worker 正在监听 %s:%s", listen, port)
         waitress_serve(app, host=listen, port=port, threads=threads)

@@ -39,14 +39,10 @@ from neu_box.worker.paths import task_logs_dir
 logger = logging.getLogger(__name__)
 command_bp = Blueprint('command', __name__)
 
-_raw_timeout = env_int("NEU_BOX_COMMAND_TIMEOUT", 0, "command_timeout")
+_raw_timeout = env_int("NEU_BOX_COMMAND_TIMEOUT", 0)
 DEFAULT_TIMEOUT = _raw_timeout if _raw_timeout > 0 else None
-MAX_COMPLETED_TASKS = env_int(
-    "NEU_BOX_COMMAND_MAX_COMPLETED", 200, "command_max_completed"
-)
-QUEUE_RECENT_LIMIT = env_int(
-    "NEU_BOX_COMMAND_QUEUE_RECENT", 30, "command_queue_recent"
-)
+MAX_COMPLETED_TASKS = env_int("NEU_BOX_COMMAND_MAX_COMPLETED", 200)
+QUEUE_RECENT_LIMIT = env_int("NEU_BOX_COMMAND_QUEUE_RECENT", 30)
 
 # 日志文件配置
 LOG_DIR = str(task_logs_dir())

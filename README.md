@@ -29,7 +29,7 @@ Worker，同时提供 WebUI、命令行客户端和面向 Agent 的标准 HTTP �
 | 命令任务 | 异步提交、优先级排队、自动分配资源、隔离执行并持久化任务日志 |
 | 设备仲裁 | 综合 Neu Box 分配记录与驱动侧外部占用信息，避免把忙碌设备重复分配 |
 | 内核访问控制 | 通过 cgroup v2 与 eBPF 限制未获授权进程后续打开已预留设备 |
-| 生命周期管理 | 支持版本化安装、在线/离线升级、数据库迁移、健康检查和失败回滚 |
+| RPM 生命周期 | 使用架构相关 RPM 管理程序文件，以显式数据库迁移和健康检查完成部署 |
 | Agent 接入 | Worker API v2 可直接通过 `curl` 使用；`neu-sbox` 提供可选的确定性 helper 与内置 skill |
 
 ## 系统架构
@@ -50,7 +50,7 @@ HTTP 契约协作：
 
 | 仓库 | 职责 | 部署方式 |
 |---|---|---|
-| **[neu_box](https://github.com/neusbox/neu_box)** | Worker、设备沙盒、任务执行、安装器与聚合测试 | 版本化 Linux 发布包 |
+| **[neu_box](https://github.com/neusbox/neu_box)** | Worker、设备沙盒、任务执行、RPM 与聚合测试 | 架构相关 RPM |
 | **[neu_box_webui](https://github.com/neusbox/neu_box_webui)** | 节点池、任务转发、实验记录与 Web 界面 | Python 3.11+ 源码运行 |
 | **[neu_box_goClient](https://github.com/neusbox/neu_box_goClient)** | `neu-sbox` CLI 与 Agent skill | Go 静态二进制 |
 
@@ -61,58 +61,58 @@ HTTP 契约协作：
 
 ### 环境要求
 
-- Linux `amd64` 或 `arm64`，使用 systemd 与 cgroup v2
+- Linux `x86_64` 或 `aarch64`，内核 5.7+，使用 systemd 与 cgroup v2
 - root 或可用的 `sudo`（安装、设备隔离与服务管理需要）
-- `bash`、`bpftool`、`busctl`
+- `/bin/bash`（安装后的管理 CLI 使用；native sandbox 直接调用 libbpf）
 - 对应厂商的设备驱动和状态工具，例如 `nvidia-smi` 或 `npu-smi`
 - Docker 仅在使用现有容器执行目标时需要
 
 ### 安装 Worker
 
 从 [GitHub Releases](https://github.com/neusbox/neu_box/releases) 下载与目标机器
-架构匹配的发布包及其 `.sha256` 文件：
+架构匹配的 `neu-box-worker` RPM：
 
 ```bash
-VERSION=0.4.0
-ARCH=arm64  # 或 amd64
-PACKAGE="neu-box-${VERSION}-linux-${ARCH}.tar.gz"
-
-curl -fLO "https://github.com/neusbox/neu_box/releases/download/v${VERSION}/${PACKAGE}"
-curl -fLO "https://github.com/neusbox/neu_box/releases/download/v${VERSION}/${PACKAGE}.sha256"
-sha256sum -c "${PACKAGE}.sha256"
-
-tar -xzf "$PACKAGE"
-cd "${PACKAGE%.tar.gz}"
-sudo ./neu-box-install install --role worker
+sudo dnf install ./neu-box-worker-<version>-<release>.<arch>.rpm
+sudoedit /etc/neu-box/worker.env
+sudo neu-box setup
+curl -fsS http://127.0.0.1:59075/healthz
 ```
 
-安装完成后，Worker 默认监听 `0.0.0.0:59075`，管理入口安装为
-`/usr/local/sbin/neu-box`。
+`neu-box setup` 执行数据库迁移、检查 native sandbox 状态，然后启用并
+启动服务。Worker 默认监听 `0.0.0.0:59075`，安装后的管理入口是
+`/usr/sbin/neu-box`。
 
 ### 日常管理
 
 ```bash
-neu-box                 # 打开交互式管理菜单
-neu-box status          # 查看安装版本与回滚状态
-neu-box service-status  # 查看 systemd 服务状态
-neu-box logs            # 跟踪 Worker 日志
-neu-box check-update    # 检查 GitHub latest Release
-neu-box update          # 在线下载、校验、解压并升级
-neu-box rollback        # 回滚程序和升级前数据库
+neu-box version         # 查看 Worker 版本
+sudo neu-box status     # 查看 systemd 服务状态
+sudo neu-box logs       # 跟踪 Worker 日志
+sudo neu-box start      # 启动服务；也支持 stop/restart
+sudo neu-box db status  # 查看数据库 schema 状态
+sudo neu-box db backup  # 创建一致的 SQLite 备份
 ```
 
-在线更新会自动选择本机架构，执行外层 SHA256 与包内文件校验，并复用安装器已有的
-数据库备份、迁移预检、健康检查和失败恢复。无法访问 GitHub 时，仍可使用：
+普通 RPM 升级必须在维护窗口显式执行：停止上游派发并确认 Worker idle，停止服务，
+备份数据库、清理空闲的旧 BPF 状态，再升级 RPM、迁移并检查数据库，最后启动服务并
+检查 native sandbox 与 `/healthz`。
 
 ```bash
-neu-box upgrade /path/to/extracted-release
-neu-box upgrade /path/to/neu-box-<version>-linux-<arch>.tar.gz
+sudo systemctl stop neu-box-worker.service
+sudo neu-box db backup --output-dir /var/backups/neu-box
+sudo neu-box sandbox cleanup
+sudo dnf upgrade ./neu-box-worker-<version>-<release>.<arch>.rpm
+sudo neu-box db migrate
+sudo neu-box db check
+sudo neu-box sandbox list >/dev/null
+sudo systemctl start neu-box-worker.service
+curl -fsS http://127.0.0.1:59075/healthz
 ```
 
-本地 `.tar.gz` 发布包会解压到临时目录，升级结束后自动清理，不需要手工解包。
-
-完整的安装、升级、回滚、目录权限和 Release 资产规范见
-[部署与升级手册](docs/deployment.md)。
+完整的安装、升级、目录权限和 Release 资产规范见
+[部署与升级手册](docs/deployment.md)；native helper、BPF maps 和设备预留语义见
+[沙盒说明](docs/sandbox.md)。
 
 ## 使用 `neu-sbox`
 
@@ -165,7 +165,7 @@ curl http://127.0.0.1:59075/status
 
 | 组件 | 当前系列 | 兼容要求 |
 |---|---|---|
-| Worker | `0.4.x` | `api_version = 2` |
+| Worker | `0.5.x` | `api_version = 2` |
 | WebUI | `0.1.x` | Worker `>= 0.4.0` |
 | `neu-sbox` | `0.2.x` | Worker `>= 0.4.0` |
 
@@ -188,12 +188,16 @@ cd neu_box
 uv sync --frozen --all-groups
 uv run --frozen pytest -q tests/unit
 
-# 构建当前架构发布包
+# 构建当前架构 RPM（输出到 dist/rpm）
 uv run --frozen --group build deploy/build_release.py
 
 # 对已部署 Worker 执行真实 API、任务、设备和 Reaper 验收
 ./run.sh deployment-test
 ```
+
+构建原生沙盒还需要 CMake、C++17 编译器、支持 BPF target 的 Clang、提供
+`readelf` 的 binutils、libbpf 静态库和 libelf/zstd/zlib 开发库，详见
+[部署与升级手册](docs/deployment.md#构建-rpm)。
 
 单元测试默认不访问生产服务；实机验收会创建真实任务并短暂占用设备，应在维护
 窗口执行。测试范围与参数见 [tests/README.md](tests/README.md)。
@@ -202,28 +206,29 @@ uv run --frozen --group build deploy/build_release.py
 
 ```text
 src/neu_box/worker/   Worker 应用、任务执行、沙盒与设备管理
-deploy/               发布构建、安装器、配置和 systemd unit
+native/sandbox/       C++17 沙盒 CLI、libbpf 用户态实现与 BPF 源码
+deploy/               RPM 构建、配置和 systemd unit
 docs/                 API、部署与数据库迁移文档
 tests/                单元测试、跨仓库集成测试与实机验收
 thirds/               WebUI 与 Go Client 的兼容性 submodule
-run.sh                安装、升级、运维、测试和构建统一入口
+run.sh                源码构建、单测和实机验收入口
 ```
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [部署与升级手册](docs/deployment.md) | 安装、在线/离线升级、回滚、配置、权限与日志 |
+| [部署与升级手册](docs/deployment.md) | RPM 安装、升级、配置、权限与日志 |
 | [Worker HTTP API](docs/worker-api.md) | API v2 契约、任务、日志和终端沙盒 |
-| [数据库迁移手册](docs/database-migrations.md) | Schema 版本、迁移开发、部署与回滚 |
+| [数据库迁移手册](docs/database-migrations.md) | Schema 版本、迁移开发与部署检查 |
 | [测试说明](tests/README.md) | 单元测试、集成测试与实机验收 |
 
 ## 版本与发布
 
 - Worker 版本定义在 `src/neu_box/__init__.py`
-- 同一版本号不得以不同内容重新构建；安装器会按 `SHA256SUMS` 拒绝原地覆盖
-- GitHub Release 使用 `v<version>` tag，并为每种架构同时上传 `.tar.gz` 与
-  `.tar.gz.sha256`
+- 构建入口为 `deploy/build_release.py`，产物写入 `dist/rpm/`
+- GitHub Release 使用 `v<version>` tag，并为 x86_64、aarch64 分别发布对应 RPM
+- RPM 的 Version 取自 `src/neu_box/__init__.py`；修订构建应递增 Release
 
 ## 参与项目
 

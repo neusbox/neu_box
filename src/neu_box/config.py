@@ -32,17 +32,15 @@ def load_role_environment(
     return None
 
 
-def env_text(name: str, default: str = "", legacy: str | None = None) -> str:
+def env_text(name: str, default: str = "") -> str:
     value = os.getenv(name)
-    if value is None and legacy:
-        value = os.getenv(legacy)
     if value is None:
         value = default
     return value.strip().strip('"').strip("'")
 
 
-def env_int(name: str, default: int, legacy: str | None = None) -> int:
-    value = env_text(name, str(default), legacy)
+def env_int(name: str, default: int) -> int:
+    value = env_text(name, str(default))
     try:
         return int(value)
     except ValueError as exc:
@@ -70,8 +68,6 @@ def user_log_dir() -> Path:
 def configured_path(
     name: str,
     default: Path,
-    legacy: str | None = None,
 ) -> Path:
-    value = env_text(name, legacy=legacy)
+    value = env_text(name)
     return Path(value).expanduser().resolve() if value else default.resolve()
-

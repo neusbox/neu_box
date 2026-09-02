@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.4.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.5.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -103,7 +103,7 @@ curl --noproxy '*' -sS \
 | `user_id` | 是 | — | Worker 宿主机上已存在的 Linux 用户；Host 命令以该用户运行 |
 | `command` | 是 | — | 要执行的完整 Shell 命令 |
 | `device_num` | 否 | `0` | 自动分配的设备数量，非负整数；`0` 表示不申请设备 |
-| `device_ids` | 否 | `[]` | 指定设备，如 `["0","2"]` 或 `["235:0","235:2"]`；非空时优先于 `device_num` |
+| `device_ids` | 否 | `[]` | 指定设备；推荐只传 minor，如 `["0","2"]`；也接受与本机设备完全一致的 `major:minor`；非空时优先于 `device_num` |
 | `cpu` | 否 | `0` | CPU 核数，非负整数；`0` 表示不限制 |
 | `memory` | 否 | `0` | 内存数量，非负整数；`0` 表示不限制 |
 | `mem_unit` | 否 | `GB` | `GB` 或 `MB`，大小写不敏感 |
@@ -113,6 +113,11 @@ curl --noproxy '*' -sS \
 
 `user_id` 会在入队前通过宿主机用户数据库校验。用户不存在时返回 HTTP `400`
 和 `{"error":"系统用户 <name> 不存在"}`，任务不会进入队列。
+
+设备节点的 major 不是 API 常量。尤其 Ascend 的 `devdrv-cdev` major 会随驱动和
+系统环境变化，Worker 按本机实际设备节点动态发现。调用方应优先只传 minor；若传
+`major:minor`，必须与 Worker 当前发现的完整设备号一致。非空的 `device_ids` 必须
+是数组；包含不存在的设备时返回 HTTP `400`。
 
 成功响应：
 
@@ -131,7 +136,8 @@ HTTP/1.1 202 Accepted
 ```
 
 `devices` 在真正开始运行、资源分配完成后才会出现在任务状态中，格式为 Linux
-设备号 `major:minor`，例如 `235:0`。
+设备号 `major:minor`，例如 `<actual-major>:0`；其中 major 是 Worker 本机动态发现
+的实际值，调用方不能假设它固定为 `235`。
 
 ### 执行目标
 
@@ -269,7 +275,7 @@ curl --noproxy '*' -sS \
   "eta": null,
   "mem": "8G",
   "device_num": 1,
-  "devices": ["235:0"],
+  "devices": ["<actual-major>:0"],
   "target": {"type": "host"},
   "created_at": 1786740000.25,
   "started_at": 1786740002.1,
@@ -364,9 +370,10 @@ curl --noproxy '*' -sS \
 
 ## 队列行为
 
-- 每个 Worker 有一个独立 FIFO 队列，不同 Worker 之间不共享状态。
+- 每个 Worker 有一个独立优先级队列，不同 Worker 之间不共享状态。
 - 队首任务资源不足时会等待并阻塞后面的任务，不会跳过队首进行回填调度。
-- 资源允许时可以同时运行多个任务；FIFO 控制的是资源分配准入顺序。
+- 资源允许时可以同时运行多个任务；资源分配按优先级降序准入，同优先级内按
+  提交时间 FIFO。
 - queued 和 running 状态持久化在 Worker SQLite 中。
 - Worker 重启后，queued 任务重新入队；重启前处于 running 的任务标记为
   `failed`，错误信息为 Worker 可能在执行过程中重启。
@@ -383,7 +390,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.4.0"}
+{"service":"neu-box-worker","version":"0.5.0"}
 ```
 
 ### 健康检查
@@ -397,7 +404,7 @@ GET /healthz
   "status": "ok",
   "role": "worker",
   "api_version": 2,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "schema_version": 3
 }
 ```
@@ -427,6 +434,9 @@ GET /status
 
 内存单位是字节；`idle_cpu` 是百分比；`dev_status` 中 `0` 表示空闲，`1` 表示
 忙碌，JSON 对象中的设备号键为字符串。
+
+`active_sandboxes` 来自原生 sandbox CLI 的 `list` 输出；查询失败时当前实现返回
+`0`，因此它只适合状态展示，不能单独作为部署或升级时的隔离层验收依据。
 
 ## 终端沙盒 API
 
@@ -474,12 +484,13 @@ Host 进程：
 ```json
 {
   "sandbox_name": "sbx_yuxd_45678.slice",
-  "devices": ["235:0"],
-  "message": "PID 45678 已加入沙盒 sbx_yuxd_45678.slice，独占设备 ['235:0']"
+  "devices": ["<actual-major>:0"],
+  "message": "PID 45678 已加入沙盒 sbx_yuxd_45678.slice，独占设备 ['<actual-major>:0']"
 }
 ```
 
-该接口资源不足时直接返回 `503`，不会排队。
+该接口资源不足时直接返回 `503`，不会排队。容器目标已在终端沙盒时返回 `409`；
+Host 目标已在沙盒时，当前实现会先销毁旧沙盒再申请新沙盒。
 
 ### 释放终端沙盒
 
@@ -522,7 +533,8 @@ POST /sandbox/join
 ```
 
 该接口用于宿主机 PID，要求 PID 属于 `username`，并且沙盒名称中的 owner 与
-`username` 相同。
+`username` 相同。若 PID 已在另一个沙盒中，当前实现先将它移到 root cgroup，
+再加入目标沙盒；原沙盒变空后由 reaper 回收。
 
 ### 查询沙盒
 
@@ -540,7 +552,7 @@ GET /sandbox/list?username=yuxd&container=training-01&pid=1316
       "owner": "yuxd",
       "cpu": 4,
       "mem": "8G",
-      "devices": ["235:0"],
+      "devices": ["<actual-major>:0"],
       "created_at": 1786740000.25,
       "pids": [45678]
     }
@@ -550,7 +562,8 @@ GET /sandbox/list?username=yuxd&container=training-01&pid=1316
 ```
 
 `username` 只过滤返回列表。`container` 和 `pid` 必须同时提供，用于查询该容器
-进程当前所在的沙盒，并通过 `current_sandbox` 返回。
+进程当前所在的沙盒，并通过 `current_sandbox` 返回。沙盒列表来自 Worker SQLite
+记录；查询接口不会自动删除记录。
 
 ## HTTP 状态码与错误格式
 

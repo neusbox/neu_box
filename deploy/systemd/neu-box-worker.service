@@ -2,6 +2,7 @@
 Description=Neu Box Worker
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/var/lib/neu-box
 
 [Service]
 Type=simple
@@ -9,7 +10,7 @@ User=root
 Group=root
 WorkingDirectory=/var/lib/neu-box/worker
 EnvironmentFile=/etc/neu-box/worker.env
-ExecStart=/opt/neu-box/current/worker/neu-box-worker --config /etc/neu-box/worker.env serve
+ExecStart=/usr/libexec/neu-box/worker/neu-box-worker --config /etc/neu-box/worker.env serve
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=60
@@ -20,4 +21,3 @@ TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target
-

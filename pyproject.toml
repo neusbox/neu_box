@@ -45,7 +45,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 "neu_box.worker" = [
     "migrations/*.sql",
-    "resources/**/*",
+    "resources/info/*.sh",
 ]
 
 [tool.pytest.ini_options]
