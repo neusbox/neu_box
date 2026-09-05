@@ -300,11 +300,9 @@ class TaskQueue:
     priority 数字越大越先执行（当前 0=普通，1=赶论文），
     同优先级内按提交时间先到先执行。
 
-    调度策略（first-schedulable）：消费者按上述顺序找第一个
-    「当前资源足够」的任务执行——队头任务在等设备（卡被占满 /
-    指定设备未释放）时，不会阻塞后面不需要这些设备的任务
-    （如纯 CPU 任务）。设备释放后的下一轮循环，排在前面的
-    设备任务会优先进入尝试（顺序不变，优先级语义保持）。
+    排队规则：不申请异构卡的任务（device_num=0 且未指定
+    device_ids，即纯 CPU 任务）统一排在所有申请设备的任务之前，
+    避免等卡任务占住队头时纯 CPU 任务被一起阻塞。
     """
 
     _instance = None
@@ -510,31 +508,24 @@ class TaskQueue:
         return public
 
     @staticmethod
+    def _is_cpu_only(task: dict) -> bool:
+        """是否不申请异构卡：device_num=0 且未指定 device_ids。"""
+        return not (task.get('device_ids') or []) and (task.get('device_num', 0) or 0) <= 0
+
+    @staticmethod
     def _sort_key(task: dict):
-        """队列排序键：优先级 DESC，同级按创建时间 ASC（FIFO），task_id 兜底。"""
+        """队列排序键：
+
+        1. 不申请异构卡的纯 CPU 任务排在所有申请设备的任务之前
+        2. 组内：优先级 DESC，同级按创建时间 ASC（FIFO）
+        3. task_id 兜底
+        """
         return (
+            0 if TaskQueue._is_cpu_only(task) else 1,
             -(task.get('priority', 0) or 0),
             task.get('created_at') or 0.0,
             task['task_id'],
         )
-
-    @staticmethod
-    def _is_schedulable(task: dict, free_devices: list[str]) -> bool:
-        """预判任务在当前空闲设备下是否可分配（不占任何资源）。
-
-        - 指定 device_ids：指定的每张卡都空闲
-        - device_num=0（纯 CPU / 不占卡）：总是可调度
-        - device_num>0：空闲卡数足够
-        cpu/mem 仅作 cgroup 限额，不参与调度门控（与分配逻辑一致）。
-        """
-        device_ids = task.get('device_ids') or []
-        if device_ids:
-            free = set(free_devices)
-            return all(d in free for d in device_ids)
-        device_num = task.get('device_num', 0) or 0
-        if device_num <= 0:
-            return True
-        return len(free_devices) >= device_num
 
     def _head_task_id(self) -> str | None:
         """返回当前队首 task_id（持锁调用）。空队列返回 None。"""
@@ -683,74 +674,47 @@ class TaskQueue:
         sbx = SbxManager.get_instance()
         while self._running_flag:
             task = None
-            task_id = None
             sandbox_name = ''
             try:
                 with self._lock:
                     if not self._pending:
                         self._cv.wait(timeout=5)
                         continue
-                    # 按执行顺序（优先级 DESC → FIFO）快照候选任务
-                    candidates = [
-                        dict(self._pending[tid])
-                        for tid in sorted(
-                            self._pending,
-                            key=lambda tid: self._sort_key(self._pending[tid]),
-                        )
-                    ]
+                    task_id = self._head_task_id()
+                    candidate = dict(self._pending[task_id])
 
-                # 队头可能只是在等设备：先探测一次空闲池（昂贵，只跑一次），
-                # 按顺序找到第一个「当前资源足够」的任务，避免队头阻塞。
-                # 全部候选都是纯 CPU 任务时不探测设备池（保持零开销）。
-                need_probe = any(
-                    (t.get('device_ids') or []) or (t.get('device_num', 0) or 0) > 0
-                    for t in candidates
+                allocated = sbx.allocate_sandbox(
+                    owner=candidate['user_id'],
+                    sandbox_id=candidate['task_id'],
+                    cpu=candidate.get('cpu', 0),
+                    mem=candidate.get('mem', '0'),
+                    device_num=candidate.get('device_num', 0),
+                    device_ids=candidate.get('device_ids') or None,
                 )
-                if need_probe:
-                    free_devices = sbx.free_devices()
-                    candidate = next(
-                        (t for t in candidates
-                         if self._is_schedulable(t, free_devices)),
-                        None,
-                    )
-                else:
-                    candidate = candidates[0]
-                if candidate is not None:
-                    task_id = candidate['task_id']
-                    allocated = sbx.allocate_sandbox(
-                        owner=candidate['user_id'],
-                        sandbox_id=task_id,
-                        cpu=candidate.get('cpu', 0),
-                        mem=candidate.get('mem', '0'),
-                        device_num=candidate.get('device_num', 0),
-                        device_ids=candidate.get('device_ids') or None,
-                    )
-                    if allocated is not None:
-                        sandbox_name = allocated['sandbox_name']
-                        with self._lock:
-                            pending_task = self._pending.pop(task_id, None)
-                            if pending_task is not None:
-                                pending_task['status'] = 'running'
-                                pending_task['started_at'] = time.time()
-                                pending_task['devices'] = allocated['devices']
-                                pending_task['_executor'] = self._build_executor(
-                                    pending_task,
-                                    sandbox_name,
-                                    pending_task['devices'],
-                                )
-                                self._running[task_id] = pending_task
-                                self._reindex()
-                                task = pending_task
-                            else:
-                                # 分配期间被用户删除 → 本轮结束，
-                                # sandbox_name 保留，由下方统一销毁
-                                task_id = None
-                if task is None:
-                    # 没有当前可分配的任务（或在分配中发生竞态）→ 等待重试
-                    if sandbox_name:
-                        sbx.destroy_sandbox(sandbox_name)
+                if allocated is None:
                     with self._lock:
                         self._cv.wait(timeout=3)
+                    continue
+                sandbox_name = allocated['sandbox_name']
+
+                stale = False
+                with self._lock:
+                    if self._head_task_id() != task_id:
+                        stale = True
+                    else:
+                        task = self._pending.pop(task_id)
+                        task['status'] = 'running'
+                        task['started_at'] = time.time()
+                        task['devices'] = allocated['devices']
+                        task['_executor'] = self._build_executor(
+                            task,
+                            sandbox_name,
+                            task['devices'],
+                        )
+                        self._running[task_id] = task
+                        self._reindex()
+                if stale:
+                    sbx.destroy_sandbox(sandbox_name)
                     continue
 
                 self._db.update_task_status(
