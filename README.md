@@ -195,7 +195,7 @@ uv run --frozen --group build deploy/build_release.py
 ./run.sh deployment-test
 ```
 
-单元测试默认不访问生产服务；实机验收会创建真实任务并短暂占用设备，应在维护
+单元测试默认不访问生产服务；实机验收会创建真实任务并短暂占用最多两张设备，应在维护
 窗口执行。测试范围与参数见 [tests/README.md](tests/README.md)。
 
 ## 仓库结构

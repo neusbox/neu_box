@@ -511,8 +511,10 @@ cmd_destroy() {
     _require_root "destroy <name>"
     local name="$1"; [ -n "$name" ] || die "用法: $0 destroy <name>"
 
-    # 先拿 cgid（必须在删目录之前）
-    local cgid; cgid=$(_cg_id "$name")
+    # 先拿 cgid（必须在删目录之前）。cgroup 可能已不存在（进程退出后内核
+    # 自动删除空 cgroup），此时必须置空继续，否则 set -e 会让脚本静默退出，
+    # 后面的 eBPF / 元数据清理永远执行不到。
+    local cgid; cgid=$(_cg_id "$name") || cgid=""
 
     if [ -d "$(_cg "$name")" ]; then
         _unregister_systemd_slice "$name"
