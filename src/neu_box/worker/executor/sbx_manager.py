@@ -479,6 +479,16 @@ class SbxManager:
 
     # ── 沙盒分配 ─────────────────────────────────────────────────
 
+    def free_devices(self) -> List[str]:
+        """只读返回当前空闲设备列表（不创建沙盒、不占资源）。
+
+        供任务队列做调度预判：先按空闲池快速筛掉当前无法满足的
+        任务，避免队头任务等设备时把后面的任务（如纯 CPU 任务）
+        一起阻塞（队头阻塞）。
+        """
+        with self._lock:
+            return self._get_free_devices()
+
     def allocate_sandbox(self, owner: str, sandbox_id: str,
                          cpu: int = 0, mem: str = "0",
                          device_num: int = 0,
