@@ -1,4 +1,8 @@
-"""Configuration loading and stable runtime path helpers."""
+"""环境变量读取 + 运行时路径推导。
+
+两者放一起：路径都是"环境变量给就听、不给就按 XDG 约定算"，分开两个文件
+只会让"这个路径谁决定的"要在两个地方找。
+"""
 
 from __future__ import annotations
 
@@ -32,17 +36,15 @@ def load_role_environment(
     return None
 
 
-def env_text(name: str, default: str = "", legacy: str | None = None) -> str:
+def env_text(name: str, default: str = "") -> str:
     value = os.getenv(name)
-    if value is None and legacy:
-        value = os.getenv(legacy)
     if value is None:
         value = default
     return value.strip().strip('"').strip("'")
 
 
-def env_int(name: str, default: int, legacy: str | None = None) -> int:
-    value = env_text(name, str(default), legacy)
+def env_int(name: str, default: int) -> int:
+    value = env_text(name, str(default))
     try:
         return int(value)
     except ValueError as exc:
@@ -70,8 +72,27 @@ def user_log_dir() -> Path:
 def configured_path(
     name: str,
     default: Path,
-    legacy: str | None = None,
 ) -> Path:
-    value = env_text(name, legacy=legacy)
+    value = env_text(name)
     return Path(value).expanduser().resolve() if value else default.resolve()
 
+
+# ── Worker 运行时路径 ───────────────────────────────────────────────
+
+_DEFAULT_SANDBOX_EXECUTABLE = Path("/usr/libexec/neu-box/neu-box-sandbox")
+
+
+def sandbox_executable_path() -> Path:
+    """native sandbox CLI（neu-box-sandbox）的路径。"""
+    return configured_path(
+        "NEU_BOX_SANDBOX_EXECUTABLE",
+        _DEFAULT_SANDBOX_EXECUTABLE,
+    )
+
+
+def task_logs_dir() -> Path:
+    """任务输出日志目录。"""
+    return configured_path(
+        "NEU_BOX_TASK_LOG_DIR",
+        user_data_dir("worker") / "task-logs",
+    )

@@ -1,7 +1,7 @@
 # Worker HTTP API
 
 本文面向不使用 `neu-sbox`、直接接入 Neu Box Worker 的后端系统，适用于
-Neu Box `0.4.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
+Neu Box `0.5.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接口均
 返回 UTF-8；除纯文本日志接口外，请求和响应使用 JSON。
 
 `neu-sbox` 只是这些接口的客户端封装，不是调用 Worker 的必要条件。
@@ -13,14 +13,20 @@ Neu Box `0.4.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
 | `GET` | `/` | 查询服务名称和版本 |
 | `GET` | `/healthz` | 健康检查、API 版本和数据库 schema 版本 |
 | `GET` | `/status` | 查询 CPU、内存、设备和沙盒状态 |
+| `GET` | `/maintenance` | 查询 Worker 暂停及静止状态 |
+| `POST` | `/maintenance/pause` | 暂停接收新任务及分配 sandbox（仅本机） |
+| `POST` | `/maintenance/resume` | 恢复创建新 sandbox（仅本机） |
 | `POST` | `/tasks` | 异步提交命令任务 |
 | `GET` | `/tasks` | 查询队列和最近任务 |
 | `GET` | `/tasks/<task_id>` | 查询任务状态和退出结果 |
 | `GET` | `/tasks/<task_id>/log` | 读取实时任务日志 |
 | `DELETE` | `/tasks` | 删除或取消任务 |
-| `POST` | `/sandbox/acquire` | 为现有进程立即申请终端沙盒 |
-| `POST` | `/sandbox/release` | 释放终端沙盒 |
+| `POST` | `/sandbox/acquire` | 为现有进程排队申请终端沙盒 |
+| `GET` | `/sandbox/acquire/<acquire_id>` | 查询终端沙盒申请 |
+| `POST` | `/container/register` | 容器归属登记（由节点 OCI runtime hook 调用，非用户接口） |
+| `POST` | `/sandbox/release` | 销毁终端沙盒，释放设备 |
 | `POST` | `/sandbox/join` | 将 Host PID 加入已有沙盒 |
+| `GET` | `/sandbox/status` | 按 Host PID 或已登记容器查询沙盒 |
 | `GET` | `/sandbox/list` | 查询终端沙盒 |
 
 ## 接入前须知
@@ -30,8 +36,8 @@ Neu Box `0.4.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
   可以指定 Worker 宿主机上任意已存在的用户。
 - 直接调用 Worker 时不传 `node_id`。`node_id` 是 WebUI 转发请求时使用的字段，
   不属于 Worker API。
-- 命令任务使用 `/tasks` 资源接口，由 Worker 持久化并排队；终端沙盒使用
-  `/sandbox/*`，立即申请资源，不进入任务队列。
+- 命令任务使用 `/tasks` 资源接口并持久化；终端沙盒使用 `/sandbox/*`。
+  两种申请共用 Worker 调度队列，避免绕过已经排队的任务抢占设备。
 - 当前没有 API 版本前缀、幂等键、回调或 Webhook。接入方应记录 `task_id` 并
   轮询结果；不要在响应不确定时盲目重试提交，否则可能产生重复任务。
 
@@ -66,6 +72,7 @@ GET /healthz
 
 任务提交接口只负责入队，正常返回 HTTP `202`，不会等待命令执行完成。因此 HTTP
 客户端本身只需设置较短的请求超时，任务运行时间由 Worker 单独管理。
+Worker 暂停期间返回 HTTP `503`，响应中的 `code` 为 `worker_paused`，不创建任务记录或入队。
 
 ## 命令任务 API
 
@@ -103,7 +110,7 @@ curl --noproxy '*' -sS \
 | `user_id` | 是 | — | Worker 宿主机上已存在的 Linux 用户；Host 命令以该用户运行 |
 | `command` | 是 | — | 要执行的完整 Shell 命令 |
 | `device_num` | 否 | `0` | 自动分配的设备数量，非负整数；`0` 表示不申请设备 |
-| `device_ids` | 否 | `[]` | 指定设备，如 `["0","2"]` 或 `["235:0","235:2"]`；非空时优先于 `device_num` |
+| `device_ids` | 否 | `[]` | 指定设备；推荐只传 minor，如 `["0","2"]`；也接受与本机设备完全一致的 `major:minor`；非空时优先于 `device_num` |
 | `cpu` | 否 | `0` | CPU 核数，非负整数；`0` 表示不限制 |
 | `memory` | 否 | `0` | 内存数量，非负整数；`0` 表示不限制 |
 | `mem_unit` | 否 | `GB` | `GB` 或 `MB`，大小写不敏感 |
@@ -113,6 +120,11 @@ curl --noproxy '*' -sS \
 
 `user_id` 会在入队前通过宿主机用户数据库校验。用户不存在时返回 HTTP `400`
 和 `{"error":"系统用户 <name> 不存在"}`，任务不会进入队列。
+
+设备节点的 major 不是 API 常量。Worker 根据 `NEU_BOX_DEVICE_FILTER` 匹配本机
+实际设备节点，并通过 `stat(2)` 取得设备号。调用方应优先只传 minor；若传
+`major:minor`，必须与 Worker 当前发现的完整设备号一致。非空的 `device_ids`
+必须是数组；包含不存在的设备时返回 HTTP `400`。
 
 成功响应：
 
@@ -131,7 +143,8 @@ HTTP/1.1 202 Accepted
 ```
 
 `devices` 在真正开始运行、资源分配完成后才会出现在任务状态中，格式为 Linux
-设备号 `major:minor`，例如 `235:0`。
+设备号 `major:minor`，例如 `<actual-major>:0`；其中 major 是 Worker 本机动态发现
+的实际值，调用方不能假设它固定为 `235`。
 
 ### 执行目标
 
@@ -151,7 +164,7 @@ Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误�
 `command not found`、权限错误及程序写入 stderr 的内容都会进入任务日志。Shell
 返回非零时任务状态为 `failed`，具体报错读取日志，退出码读取 `result.returncode`。
 
-#### 已运行的 Docker 容器
+#### 一次性 Docker 容器
 
 ```json
 {
@@ -162,8 +175,8 @@ Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误�
   "memory": 8,
   "mem_unit": "GB",
   "target": {
-    "type": "docker_existing",
-    "container": "training-01",
+    "type": "docker",
+    "image": "pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime",
     "workdir": "/workspace",
     "user": "1000:1000",
     "env": {
@@ -174,26 +187,33 @@ Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误�
 }
 ```
 
-`docker_existing` 的 `target` 字段：
+`docker` 目标的字段：
 
 | 字段 | 必填 | 含义 |
 |---|---:|---|
-| `type` | 是 | 固定为 `docker_existing` |
-| `container` | 是 | 已运行容器的名称或 ID |
+| `type` | 是 | 固定为 `docker` |
+| `image` | 是 | 镜像名，可带 registry / tag / digest |
 | `workdir` | 否 | 容器内绝对路径 |
-| `user` | 否 | Docker Exec 使用的容器用户；省略时使用容器默认用户 |
-| `env` | 否 | 传给 Docker Exec 的环境变量对象，最多 128 项 |
+| `user` | 否 | 容器内以哪个用户运行 |
+| `env` | 否 | 环境变量对象，最多 128 项 |
 
 容器任务还有以下要求：
 
 - `user_id` 仍必须是 Worker 宿主机上存在的用户，用作任务和沙盒 owner；
-- 必须通过 `device_num` 或 `device_ids` 申请至少一个设备；
-- 容器必须处于 running 且未 paused；
-- 容器创建时必须已经挂载可能申请的设备节点，Worker 不会向运行中的容器热添加
-  `/dev/davinciN` 或 `/dev/nvidiaN`；
-- 容器内需要 `/bin/sh`；命令最终通过 `/bin/sh -c` 执行；
-- Docker 连接、容器状态或设备可见性错误通常在异步执行阶段出现：提交仍可能返回
-  `202`，随后任务状态变成 `failed`。
+- 必须通过 `device_num` 或 `device_ids` 申请至少一个设备 —— 没有设备的容器拿不到
+  任何 NPU 授权，起容器没有意义；
+- 容器是一次性的：Worker 用 `docker run` 起、跑完删除。**不支持在已有容器里
+  执行**：容器的归属登记必须发生在它第一个 NPU 进程之前，别人已经起好的容器
+  没有这个时机，只能拒绝；
+- 全部受管设备节点都会挂进容器 —— 限制由 BPF 逐卡判定，不靠 `/dev` 里有没有
+  节点，而驱动本身又必须拿到 manager / hdc 才能初始化；
+- 容器里不需要任何客户端：Worker 只把沙盒名写成 `sandbox_cgroup` annotation，
+  由节点级 OCI runtime hook 在容器 ENTRYPOINT 之前登记 mount namespace。Worker
+  自己**不补登记** —— 登记晚了驱动已经按空权限建过 UDA 设备表，补也修不回来；
+- cpu/memory 限额落在容器的 docker flag 上，语义是"每个容器一份"，与 Host 目标的
+  "整个沙盒合计一份"不同；
+- 镜像不存在、Docker 不可用、容器没在 runtime hook 里登记（`docker_runtime_not_registered`）
+  等错误出现在异步执行阶段：提交仍可能返回 `202`，随后任务状态变成 `failed`。
 
 ### 查询队列
 
@@ -239,9 +259,12 @@ curl --noproxy '*' -sS "$WORKER/tasks"
 `eta` 的单位是分钟，只在 queued 任务上计算；它是前方排队任务 `est_time` 的
 简单累加，不包含正在运行任务的剩余时间，因此只能用于展示，不能作为调度保证。
 
-排队顺序固定为 `priority` 降序 → `created_at` 升序：数值越大越先执行，
-当前 0=普通、1=赶论文，赶论文任务永远先于普通任务执行，同优先级内按
-提交时间 FIFO；`position` 是这一顺序下的全局排位。
+排队顺序按 `priority` 降序、`created_at` 升序排列。当前优先级为 0=普通、
+1=赶论文，同优先级内按提交时间 FIFO；`position` 是这一顺序下的全局排位。
+
+真正决定"先跑谁"的是 **first-schedulable**：队列按上述顺序扫描，取**第一个当前
+资源足够**的条目。队首在等设备（卡被占满 / 指定卡未释放）时不会阻塞后面不需要
+这张卡的条目。
 
 ### 查询单个任务
 
@@ -269,7 +292,7 @@ curl --noproxy '*' -sS \
   "eta": null,
   "mem": "8G",
   "device_num": 1,
-  "devices": ["235:0"],
+  "devices": ["<actual-major>:0"],
   "target": {"type": "host"},
   "created_at": 1786740000.25,
   "started_at": 1786740002.1,
@@ -286,7 +309,7 @@ curl --noproxy '*' -sS \
 
 | 状态 | 含义 |
 |---|---|
-| `queued` | 已持久化，等待队首资源可用 |
+| `queued` | 已持久化，等待有可用资源时被调度 |
 | `running` | 已分配沙盒并开始执行 |
 | `completed` | 进程正常结束且退出码为 `0` |
 | `failed` | 非零退出、超时、取消、Docker 错误或沙盒清理失败 |
@@ -364,9 +387,11 @@ curl --noproxy '*' -sS \
 
 ## 队列行为
 
-- 每个 Worker 有一个独立 FIFO 队列，不同 Worker 之间不共享状态。
-- 队首任务资源不足时会等待并阻塞后面的任务，不会跳过队首进行回填调度。
-- 资源允许时可以同时运行多个任务；FIFO 控制的是资源分配准入顺序。
+- 每个 Worker 有一个独立优先级队列，不同 Worker 之间不共享状态。
+- 队列按 first-schedulable 出队：从队首开始找第一个能拿到资源的任务，暂时拿不到
+  资源的任务退避 1 秒后重新参与排队，不会阻塞后面的任务。
+- 资源允许时可以同时运行多个任务；资源分配按优先级降序准入，同优先级内按
+  提交时间 FIFO。
 - queued 和 running 状态持久化在 Worker SQLite 中。
 - Worker 重启后，queued 任务重新入队；重启前处于 running 的任务标记为
   `failed`，错误信息为 Worker 可能在执行过程中重启。
@@ -383,7 +408,7 @@ GET /
 ```
 
 ```json
-{"service":"neu-box-worker","version":"0.4.0"}
+{"service":"neuboxd","version":"0.5.0"}
 ```
 
 ### 健康检查
@@ -397,8 +422,8 @@ GET /healthz
   "status": "ok",
   "role": "worker",
   "api_version": 2,
-  "version": "0.4.0",
-  "schema_version": 3
+  "version": "0.5.0",
+  "schema_version": 6
 }
 ```
 
@@ -421,6 +446,26 @@ GET /status
   "idle_devices": 7,
   "dev_status": {"0": 1, "1": 0},
   "active_sandboxes": 1,
+  "maintenance": {
+    "pending_tasks": 0,
+    "pending_acquires": 0,
+    "running_tasks": 1,
+    "running_acquires": 0,
+    "running_total": 1,
+    "running": 1,
+    "dispatching": 0,
+    "maintenance_errors": {},
+    "pause_in_progress": false,
+    "paused": false,
+    "allocations_in_flight": 0,
+    "sandbox_lifecycle": {
+      "active": 1,
+      "creating": 0,
+      "destroying": 0,
+      "residuals": []
+    },
+    "quiet": false
+  },
   "api_version": 2
 }
 ```
@@ -428,10 +473,46 @@ GET /status
 内存单位是字节；`idle_cpu` 是百分比；`dev_status` 中 `0` 表示空闲，`1` 表示
 忙碌，JSON 对象中的设备号键为字符串。
 
+`maintenance` 是队列的维护快照：`pending_*` / `running_*` 分别是排队中和运行中
+的任务与 acquire 数量，`dispatching` 是正在调度中的请求数，`sandbox_lifecycle`
+按数据库状态统计沙盒数量，`residuals` 是数据库或 cgroup 里还看得见的沙盒名。
+
+`active_sandboxes` 来自原生 sandbox CLI 的 `list` 输出；查询失败时当前实现返回
+`0`，因此它只适合状态展示，不能单独作为部署或升级时的隔离层验收依据。
+
+### 维护暂停
+
+```http
+POST /maintenance/pause
+GET /maintenance
+POST /maintenance/resume
+```
+
+pause/resume 只接受 loopback 请求，只设置暂停状态并返回，不等待任务结束，也不
+停服、备份或清理 BPF。pause 不清空 tasks 的 pending 队列，不中断已经运行的任务，
+但会取消仍在排队的 acquire（以 `worker_paused` 失败结束，恢复后需重新申请）；
+`POST /tasks` 和 `POST /sandbox/acquire` 均拒绝新建请求，返回 `503 worker_paused`。
+显式调用过 `POST /maintenance/pause` 后，`POST /maintenance/resume` 返回
+`409 maintenance_in_progress`，直到 Worker 重启。
+
+`quiet=true` 表示 Worker 已暂停，且没有运行任务、分配或调度中的请求，也没有
+DB/cgroup/native state 残留沙盒；pending 任务不参与该判断。查询生命周期失败时
+`quiet` 保持 `false`。全局 BPF 程序及 pins 不参与 `quiet` 判断，升级前仍需清理。
+
+暂停标记持久化在数据库路径加 `.paused` 的文件中，Worker 重启后仍保持暂停，
+resume 删除该标记并恢复调度。直接以 root 调用 `neuboxctl sandbox create`
+属于管理操作，不经过 Worker 的 pause 闸门。
+
+安装后的 `neuboxctl pause` 在调用暂停接口后，还会等待 `quiet=true`、备份数据库
+及配置、执行 BPF cleanup，全部成功后才停服，供 RPM 升级使用。等待超时、备份或 cleanup
+失败时，Worker 保持在线且暂停。该命令默认无限等待，可用 `--timeout <秒>` 限时，
+不自动杀任务。完成后用 `neuboxctl setup` 启动新版 Worker；setup 在健康检查
+通过后调用 resume。`neuboxctl resume` 本身不启动服务。
+
 ## 终端沙盒 API
 
-这些接口用于把已经存在的进程加入设备沙盒，不经过命令队列。第三方任务调度系统
-一般只需使用 `/tasks`。
+这些接口用于把已经存在的进程加入设备沙盒。`acquire` 与命令任务共用调度队列，
+第三方任务调度系统一般只需使用 `/tasks`。
 
 ### 申请终端沙盒
 
@@ -439,7 +520,7 @@ GET /status
 POST /sandbox/acquire
 ```
 
-Host 进程：
+Host 进程（`pid` 是宿主机 PID）：
 
 ```json
 {
@@ -449,41 +530,36 @@ Host 进程：
   "device_ids": [],
   "cpu": 4,
   "memory": 8,
-  "mem_unit": "GB"
+  "mem_unit": "GB",
+  "priority": 0
 }
 ```
 
-容器内进程：
+`priority` 可选，语义与 `POST /tasks` 完全一致：取值 `0`（普通）或 `1`（赶论文），
+默认 `0`，数值越大越先拿设备；超范围或非整数返回 `400`。acquire 与命令任务**共用
+同一个调度队列**（同一个优先级顺序），只是抢到设备之后一个去 join 已有 PID、一个
+去起新进程。
 
-```json
-{
-  "username": "yuxd",
-  "pid": 1316,
-  "container": "training-01",
-  "device_num": 1,
-  "cpu": 0,
-  "memory": 0,
-  "mem_unit": "GB"
-}
-```
+`pid` 必须是宿主机 PID，并校验它属于 `username`。容器不走 `acquire`：容器本身
+不持有授权，也不搬进沙盒 cgroup，由节点级 OCI runtime hook 在启动时登记归属
+（见 `/container/register`）。
 
-不提供 `container` 时，`pid` 是宿主机 PID，并校验它属于 `username`。提供
-`container` 时，`pid` 是容器 PID namespace 中看到的 PID，Worker 会映射并
-核验宿主机 PID。成功返回 HTTP `201`：
+成功返回 HTTP `201`：
 
 ```json
 {
   "sandbox_name": "sbx_yuxd_45678.slice",
-  "devices": ["235:0"],
-  "message": "PID 45678 已加入沙盒 sbx_yuxd_45678.slice，独占设备 ['235:0']"
+  "devices": ["<actual-major>:0"],
+  "message": "PID 45678 已加入沙盒 sbx_yuxd_45678.slice，独占设备 ['<actual-major>:0']"
 }
 ```
 
-该接口资源不足时直接返回 `503`，不会排队。
+资源不足时请求留在 Worker 调度队列中，接口立即返回 `202` 和 `acquire_id`，调用方
+轮询 `GET /sandbox/acquire/<acquire_id>`；分配成功并把 PID 加入沙盒后返回 `201`。
+Worker 已暂停时返回 `503 worker_paused`。目标 PID 已在终端沙盒时返回 `409`，调用方
+必须先显式 release，Worker 不会隐式销毁旧沙盒。
 
 ### 释放终端沙盒
-
-Host：
 
 ```http
 POST /sandbox/release
@@ -493,25 +569,17 @@ POST /sandbox/release
 {"sandbox_name":"sbx_yuxd_45678.slice"}
 ```
 
-容器终端必须同时提供容器内 Shell PID 和本次 HTTP 客户端 PID：
-
-```json
-{
-  "sandbox_name": "sbx_yuxd_45678.slice",
-  "container": "training-01",
-  "pid": 1316,
-  "client_pid": 1488
-}
-```
-
-Worker 会先把 Shell 和 HTTP 客户端迁回原 Docker cgroup，再销毁沙盒；销毁沙盒
-会终止仍留在其中的其他进程。
+`release` 只接收沙盒名，销毁整个沙盒：归还 acquire 借出去的那个终端、收掉沙盒
+里长出来的进程，并收掉挂靠的容器（撤登记 → `docker rm -f` → 等容器真的退出 →
+放 pin）。是否涉及容器由 Worker 在内部判断，调用方不需要报容器。
 
 ### 加入已有沙盒
 
 ```http
 POST /sandbox/join
 ```
+
+把 host PID 写进沙盒 cgroup：
 
 ```json
 {
@@ -521,15 +589,84 @@ POST /sandbox/join
 }
 ```
 
-该接口用于宿主机 PID，要求 PID 属于 `username`，并且沙盒名称中的 owner 与
-`username` 相同。
+要求 PID 属于 `username`，并且沙盒名称中的 owner 与 `username` 相同。
+
+### 登记容器归属（runtime hook 专用）
+
+```http
+POST /container/register
+```
+
+```json
+{
+  "container_id": "5f1c…",
+  "host_pid": 1316,
+  "sandbox_cgroup": "sbx_yuxd_12345.slice",
+  "container_cgroup": "/system.slice/docker-5f1c….scope",
+  "mount_namespace": 4026533001
+}
+```
+
+这个端点**不是给用户调的**：调用方是节点上的 OCI runtime hook（`neu-box-hook`），
+它在容器 ENTRYPOINT 之前把可信的运行时身份交上来，Worker 才是唯一写 BPF map 和
+数据库的一方。沙盒名来自 Docker 的 `sandbox_cgroup` annotation，而容器侧的
+annotation 由谁写、怎么走，见 `docs/container-registration.md`；**本节是接口的
+准**（字段、状态码、错误码），那份文档讲 Worker 侧的流程，不复述这里的表。
+
+容器只报身份，不报归属：cgroup 路径、mount namespace 和 init host PID 都由
+Worker 自己读 `/proc/<pid>` 解析（**不查 Docker API** —— hook 跑在 Docker 的
+create 路径里，从那里调 Docker 会重入授权插件）。`container_cgroup` /
+`mount_namespace` 只做交叉验证，与 Worker 读到的不一致返回 `409`；与宿主机共用
+mount namespace 的 PID 一律拒绝，否则等于把整机登记成受托方。
+
+容器不持有授权，只是**受托方**：它借的是它挂上的那个沙盒那一份；同一个 mount
+namespace 已经登记在别的沙盒（或别的 container_id）下时返回 `409`。成功返回
+HTTP `201`：
+
+```json
+{
+  "sandbox_name": "sbx_yuxd_12345.slice",
+  "container_id": "5f1c…",
+  "mount_namespace": 4026533001,
+  "container_cgroup": "/system.slice/docker-5f1c….scope",
+  "status": "registered"
+}
+```
+
+同一身份重复登记是幂等的（hook 可能重试）：返回 HTTP `200` 和
+`"status":"already_registered"`，不会重复写入。登记必须发生在容器里第一个 NPU
+进程之前 —— 驱动在第一次初始化时按当时权限建 UDA 设备表并按 mount namespace
+缓存复用，登记晚了会建出一张空表且事后无法修复。注销不设端点：容器退出由 Worker
+的 pidfd 监听即时发现，沙盒销毁时也会一并收掉它名下的容器。
+
+错误响应：
+
+| 状态 | `code` | 含义 |
+|---:|---|---|
+| `400` | — | `container_id` / `host_pid` / `sandbox_cgroup` 缺失或非法 |
+| `404` | `sandbox_not_found` | 沙盒名不是数据库里的精确沙盒名 |
+| `409` | `sandbox_not_active` | 沙盒正在销毁 |
+| `409` | `docker_container_registered_elsewhere` | 该 mount namespace 已登记给别的沙盒或别的容器 |
+| `409` | `docker_container_same_mount_namespace` | PID 与宿主机共用 mount namespace |
+| `409` | `runtime_identity_changed` | hook 报的 cgroup / mnt ns 与 Worker 读到的不一致 |
+| `409` | `docker_container_pid_invalid` | PID 不存在或已退出 |
+
+hook 收到非 2xx（或超时/连不上）会退非 0，`runc create` 失败、容器不启动 ——
+这是 fail-closed：没有登记的容器拿不到任何设备授权。
 
 ### 查询沙盒
+
+宿主进程可用 `GET /sandbox/status?pid=<host-pid>` 查询；容器内使用私有 PID
+namespace 时，应传已登记的 `GET /sandbox/status?container=<name-or-id>`，Worker
+按容器登记记录返回所属 sandbox。两种形式均返回：
+
+```json
+{"sandbox_name": "sbx_yuxd_45678.slice", "sandbox": {...}}
+```
 
 ```http
 GET /sandbox/list
 GET /sandbox/list?username=yuxd
-GET /sandbox/list?username=yuxd&container=training-01&pid=1316
 ```
 
 ```json
@@ -540,17 +677,17 @@ GET /sandbox/list?username=yuxd&container=training-01&pid=1316
       "owner": "yuxd",
       "cpu": 4,
       "mem": "8G",
-      "devices": ["235:0"],
+      "devices": ["<actual-major>:0"],
       "created_at": 1786740000.25,
-      "pids": [45678]
+      "pids": [45678],
+      "state": "ACTIVE"
     }
-  ],
-  "current_sandbox": null
+  ]
 }
 ```
 
-`username` 只过滤返回列表。`container` 和 `pid` 必须同时提供，用于查询该容器
-进程当前所在的沙盒，并通过 `current_sandbox` 返回。
+`username` 只过滤返回列表（比对沙盒名的 owner 段），不改变返回内容。沙盒列表来自
+Worker SQLite 记录；查询接口不会自动删除记录。
 
 ## HTTP 状态码与错误格式
 
@@ -560,26 +697,26 @@ GET /sandbox/list?username=yuxd&container=training-01&pid=1316
 {"error":"user_id 不能为空"}
 ```
 
-Docker 终端错误还可能包含机器可读的 `code`：
+沙盒和容器登记相关的错误还可能包含机器可读的 `code`：
 
 ```json
 {
-  "error": "目标容器不存在: training-01",
-  "code": "docker_container_not_found"
+  "error": "无法完整扫描或清理 sandbox sbx_yuxd_12345.slice 的 Docker 容器",
+  "code": "docker_container_cleanup_failed"
 }
 ```
 
 | 状态码 | 含义 |
 |---:|---|
 | `200` | 查询、释放、删除或加入成功 |
-| `201` | 终端沙盒创建成功 |
-| `202` | 命令任务成功入队 |
+| `201` | 终端沙盒创建成功，或容器归属登记成功 |
+| `202` | 命令任务成功入队，或终端沙盒申请进入队列 |
 | `400` | JSON 字段缺失、类型错误或目标参数不合法 |
 | `403` | Host PID 与用户名不匹配，或沙盒 owner 不匹配 |
-| `404` | 任务或 Docker 容器不存在 |
-| `409` | 容器身份发生变化、设备不可见或容器终端已在沙盒中 |
+| `404` | 任务不存在，或沙盒名对不上（`sandbox_not_found`） |
+| `409` | PID 已加入其他沙盒、沙盒正在销毁，或容器身份冲突 |
 | `500` | cgroup、进程迁移、日志读取或沙盒销毁失败 |
-| `503` | 即时沙盒资源不足，或 Docker 服务不可用 |
+| `503` | Worker 处于暂停维护，或 Docker 服务不可用 |
 
 对于 `POST /tasks`，HTTP `202` 只代表成功入队。执行阶段的非零退出码、超时、
 Docker 错误和清理错误都通过任务的 `status=failed`、`result.returncode` 和

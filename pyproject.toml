@@ -7,7 +7,16 @@ name = "neu-box"
 dynamic = ["version"]
 description = "Neu Box worker: node-side accelerator device sandboxing and task execution"
 readme = "README.md"
-requires-python = ">=3.11"
+# 上界是硬的，别往上调：Worker 用 os.pidfd_open() 盯容器退出，而这个函数是
+# CPython 编译期决定的（构建时 <sys/syscall.h> 里要有 SYS_pidfd_open）。conda
+# 拿老 sysroot 编的解释器没有它 —— 一旦构建环境挑中这种解释器，PyInstaller 会把
+# 它一起打包，装出来的 Worker 在 /container/register 上直接 AttributeError 500，
+# 任何容器都登记不了。
+#
+# 上界收到 3.13 以下，uv 就不会去用本机那个 conda 3.13（实测 uv 会改挑
+# /usr/bin/python3.11，它有 pidfd_open）。这只是躲开当前这台机器上的坏解释器，
+# 不构成保证 —— 构建流程里另有一道显式检查，见 deploy/build_release.py。
+requires-python = ">=3.11,<3.13"
 license = "MIT"
 authors = [
     { name = "Neu Box contributors" },
@@ -26,7 +35,8 @@ dependencies = [
 ]
 
 [project.scripts]
-neu-box-worker = "neu_box.worker.app:main"
+neuboxd = "neu_box.app:main"
+neuboxctl = "neu_box.ctl:main"
 
 [dependency-groups]
 dev = [
@@ -43,9 +53,9 @@ version = { attr = "neu_box.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-"neu_box.worker" = [
+"neu_box" = [
     "migrations/*.sql",
-    "resources/**/*",
+    "resources/info/*.sh",
 ]
 
 [tool.pytest.ini_options]
