@@ -1,6 +1,6 @@
 """第 3 层 · 单卡（manifest 19-29）。
 
-组夹具 ``single_card`` 已经确认至少有一张空闲设备且 /dev 下节点齐全 —— 这
+组 fixture ``single_card`` 已经确认至少有一张空闲设备且 /dev 下节点齐全 —— 这
 一组不再判断"有没有卡"，全部当真跑，缺什么就直接失败。
 """
 
@@ -29,7 +29,7 @@ def test_device_task_allocates_and_releases(single_card):
     marker = f"neu-box-device-{secrets.token_hex(4)}"
 
     task_id = single_card.submit(
-        f"printf '%s-start\\n' {marker!r}; sleep 6; printf '%s-done\\n' {marker!r}",
+        f"printf '%s-start\\n' {marker!r}; sleep 4; printf '%s-done\\n' {marker!r}",
         device_ids=[device],
     )
     running = single_card.wait_task_running(task_id)
@@ -54,7 +54,7 @@ def test_device_saturated_task_queues_instead_of_failing(single_card):
     baseline = single_card.idle_devices()
     device = single_card.idle_minors()[0]
 
-    blocker = single_card.submit("sleep 20", device_ids=[device])
+    blocker = single_card.submit("sleep 8", device_ids=[device])
     single_card.wait_task_running(blocker)
 
     queued = single_card.submit("sleep 1", device_ids=[device])
@@ -118,39 +118,43 @@ def test_same_device_not_handed_to_two_sandboxes(single_card):
     first_terminal = single_card.spawn_terminal()
     second_terminal = single_card.spawn_terminal()
 
-    first = single_card.acquire_sandbox(
+    # 第一个沙盒的 release 是这一条的被测行为（释放后排队者才拿得到卡），
+    # 显式写在中间；with 只兜失败路径，出块时的释放此时已经是空操作。
+    with single_card.sandbox(
         single_card.acquire_payload(first_terminal.pid, device_ids=[device]),
-    )
-    assert [int(item.split(":")[1]) for item in first["devices"]] == [device], first
+    ) as first:
+        assert [int(item.split(":")[1]) for item in first["devices"]] == [device], first
 
-    result = single_card.client.acquire(
-        single_card.acquire_payload(second_terminal.pid, device_ids=[device]),
-    )
-    assert result.status == 202, (
-        f"同一张卡被第二次申请时返回 HTTP {result.status}，应当排队（202）:\n"
-        f"{result.text[:500]}"
-    )
-    request_id = result.value("acquire_id")
-
-    # 排队不是"立刻失败"：连着查几次都必须还是 queued。
-    for _ in range(3):
-        polled = single_card.client.acquire_status(request_id)
-        assert polled.status == 202, (
-            f"排队中的 acquire 返回 HTTP {polled.status}，应当保持 202 queued:\n"
-            f"{polled.text[:500]}"
+        result = single_card.client.acquire(
+            single_card.acquire_payload(second_terminal.pid, device_ids=[device]),
         )
-        assert polled.value("status") == "queued", polled.text
-        time.sleep(single_card.poll)
+        assert result.status == 202, (
+            f"同一张卡被第二次申请时返回 HTTP {result.status}，应当排队（202）:\n"
+            f"{result.text[:500]}"
+        )
+        request_id = result.value("acquire_id")
 
-    released = single_card.release_sandbox(first["sandbox_name"])
-    assert released.status == 200, released.text
+        # 排队不是"立刻失败"：连着查几次都必须还是 queued。
+        for _ in range(3):
+            polled = single_card.client.acquire_status(request_id)
+            assert polled.status == 202, (
+                f"排队中的 acquire 返回 HTTP {polled.status}，应当保持 202 queued:\n"
+                f"{polled.text[:500]}"
+            )
+            assert polled.value("status") == "queued", polled.text
+            time.sleep(single_card.poll)
 
-    second = _wait_acquire(single_card, request_id)
-    assert [int(item.split(":")[1]) for item in second["devices"]] == [device], (
-        f"卡释放后第二个申请拿到的设备不对: {second['devices']}"
-    )
-    assert second["sandbox_name"] != first["sandbox_name"], second
-    single_card.release_sandbox(second["sandbox_name"])
+        released = single_card.release_sandbox(first["sandbox_name"])
+        assert released.status == 200, released.text
+
+        second = _wait_acquire(single_card, request_id)
+        try:
+            assert [int(item.split(":")[1]) for item in second["devices"]] == [device], (
+                f"卡释放后第二个申请拿到的设备不对: {second['devices']}"
+            )
+            assert second["sandbox_name"] != first["sandbox_name"], second
+        finally:
+            single_card.release_sandbox(second["sandbox_name"])
     single_card.wait_idle_at_least(baseline)
 
 
@@ -192,16 +196,18 @@ def test_release_returns_device_to_idle(single_card):
     device = single_card.idle_minors()[0]
     terminal = single_card.spawn_terminal()
 
-    sandbox = single_card.acquire_sandbox(
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    single_card.wait_idle_at_most(baseline - 1)
-    assert [int(item.split(":")[1]) for item in sandbox["devices"]] == [device], sandbox
+    ) as sandbox:
+        single_card.wait_idle_at_most(baseline - 1)
+        assert [int(item.split(":")[1]) for item in sandbox["devices"]] == [device], (
+            sandbox
+        )
 
-    released = single_card.release_sandbox(sandbox["sandbox_name"])
-    assert released.status == 200, released.text
+        released = single_card.release_sandbox(sandbox["sandbox_name"])
+        assert released.status == 200, released.text
 
-    single_card.wait_sandbox_gone(sandbox["sandbox_name"])
+        single_card.wait_sandbox_gone(sandbox["sandbox_name"])
     single_card.wait_idle_at_least(baseline)
     assert device in single_card.idle_minors(), (
         f"release 之后卡 {device} 没有回到空闲池: {single_card.idle_minors()}"
@@ -231,7 +237,7 @@ def test_device_isolation_blocks_outside_open(single_card):
         ),
     )
 
-    hold = 30
+    hold = 10
     task_id = single_card.submit(
         single_card.probe_command(node, hold=hold), device_ids=[device],
     )
@@ -271,7 +277,7 @@ def test_priority_jump_and_fifo(single_card):
 
     # 四条都指定同一张卡，排位就只由 priority 和提交顺序决定（否则 position
     # 会掺进"某个任务其实根本拿不到这张卡"的干扰）。
-    blocker = single_card.submit("sleep 25", device_ids=[device])
+    blocker = single_card.submit("sleep 8", device_ids=[device])
     single_card.wait_task_running(blocker)
 
     normal = single_card.submit("sleep 1", device_ids=[device], priority=0)
@@ -347,43 +353,48 @@ def test_acquire_list_release_round_trip(single_card):
     origin = single_card.process_cgroup(terminal.pid)
     assert origin, f"读不到测试进程 {terminal.pid} 的初始 cgroup"
 
-    sandbox = single_card.acquire_sandbox(
+    # release 本身是被测行为，写在中间；with 保证前面任何断言失败都不漏卡。
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
-    assert name.startswith(f"sbx_{single_card.user}_"), (
-        f"沙盒命名与用户名对不上: {name}"
-    )
-    assert [int(item.split(":")[1]) for item in sandbox["devices"]] == [device], sandbox
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
+        assert name.startswith(f"sbx_{single_card.user}_"), (
+            f"沙盒命名与用户名对不上: {name}"
+        )
+        assert [int(item.split(":")[1]) for item in sandbox["devices"]] == [device], (
+            sandbox
+        )
 
-    record = single_card.find_sandbox(name)
-    assert record is not None, f"acquire 之后 /sandbox/list 里没有 {name}"
-    assert record["owner"] == single_card.user, record
-    assert record["state"] == "ACTIVE", (
-        f"acquire 之后沙盒状态应为 ACTIVE，实际为 {record['state']!r}"
-    )
-    assert terminal.pid in record["pids"], (
-        f"借出的终端 {terminal.pid} 不在沙盒的 PID 列表里: {record['pids']}"
-    )
-    assert [int(item.split(":")[1]) for item in record["devices"]] == [device], record
+        record = single_card.find_sandbox(name)
+        assert record is not None, f"acquire 之后 /sandbox/list 里没有 {name}"
+        assert record["owner"] == single_card.user, record
+        assert record["state"] == "ACTIVE", (
+            f"acquire 之后沙盒状态应为 ACTIVE，实际为 {record['state']!r}"
+        )
+        assert terminal.pid in record["pids"], (
+            f"借出的终端 {terminal.pid} 不在沙盒的 PID 列表里: {record['pids']}"
+        )
+        assert [int(item.split(":")[1]) for item in record["devices"]] == [device], (
+            record
+        )
 
-    by_pid = single_card.sandbox_of_pid(terminal.pid)
-    assert by_pid["sandbox_name"] == name, by_pid
-    assert single_card.process_cgroup(terminal.pid).endswith(f"sandbox_{name}"), (
-        f"终端没有进入沙盒 cgroup: {single_card.process_cgroup(terminal.pid)}"
-    )
+        by_pid = single_card.sandbox_of_pid(terminal.pid)
+        assert by_pid["sandbox_name"] == name, by_pid
+        assert single_card.process_cgroup(terminal.pid).endswith(f"sandbox_{name}"), (
+            f"终端没有进入沙盒 cgroup: {single_card.process_cgroup(terminal.pid)}"
+        )
 
-    released = single_card.release_sandbox(name)
-    assert released.status == 200, released.text
-    single_card.wait_sandbox_gone(name)
+        released = single_card.release_sandbox(name)
+        assert released.status == 200, released.text
+        single_card.wait_sandbox_gone(name)
 
-    assert process_alive(terminal.pid), (
-        f"release 误杀了借出去的终端 {terminal.pid}"
-    )
-    back = single_card.process_cgroup(terminal.pid)
-    assert back == origin and "sandbox_" not in back, (
-        f"release 后终端没有回到原 cgroup：期望 {origin}，实际 {back}"
-    )
+        assert process_alive(terminal.pid), (
+            f"release 误杀了借出去的终端 {terminal.pid}"
+        )
+        back = single_card.process_cgroup(terminal.pid)
+        assert back == origin and "sandbox_" not in back, (
+            f"release 后终端没有回到原 cgroup：期望 {origin}，实际 {back}"
+        )
     single_card.wait_idle_at_least(baseline)
 
 
@@ -421,7 +432,11 @@ def _wait_acquire(deployment, request_id: str) -> dict:
     while time.time() < deadline:
         result = deployment.client.acquire_status(request_id)
         if result.status == 201:
-            return result.json()
+            body = result.json()
+            # 登记进会话收尾：这条路径绕过了 acquire_sandbox()，不记下来
+            # 失败时就没人知道还有个沙盒在占卡。
+            deployment.created_sandboxes.append(body.get("sandbox_name", ""))
+            return body
         if result.status == 202:
             time.sleep(deployment.poll)
             continue

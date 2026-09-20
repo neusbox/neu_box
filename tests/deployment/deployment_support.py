@@ -6,7 +6,7 @@
 
 模块内容：
   * :class:`HttpResult` / :class:`WorkerClient` —— 不依赖第三方库的 HTTP 客户端
-  * :class:`Deployment` —— 夹具与用例共用的操作集合（任务、设备、沙盒、
+  * :class:`Deployment` —— fixture 与用例共用的操作集合（任务、设备、沙盒、
     进程、Docker、服务停/起）
 
 所有 HTTP 请求都显式绕过代理（等价于 curl 的 ``--noproxy '*'``）：部署机
@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pwd
@@ -45,9 +46,15 @@ DEFAULT_REAPER_INTERVAL = 30.0
 
 # 单个 HTTP 请求的上限；任务与 Reaper 的等待用各自的 deadline 控制。
 HTTP_TIMEOUT = 30.0
-TASK_TIMEOUT = 180.0
-REAPER_TIMEOUT = 240.0
-POLL_INTERVAL = 1.0
+# 下面三个是**失败**才付的代价：等待本身在条件满足时立刻返回，只有被测对象
+# 真卡住时才一路等到上限。所以它们同时也是"一条用例最多把整套拖多久"的预算
+# —— 昨晚那条 300s 的 pause 超时就是被这个预算放大的。正常路径上最长的负载
+# 是 25s 级的阻塞任务，60s 给了 2 倍余量。
+TASK_TIMEOUT = 60.0
+REAPER_TIMEOUT = 120.0
+# 本机 HTTP + cgroup 轮询，0.25s 的粒度对被测对象的秒级状态变化足够了；1.0s
+# 的粒度会让几十处等待各自多等最多 1s，纯属白等。
+POLL_INTERVAL = 0.25
 
 # open(2) 探测的结果：设备节点在沙盒外的可见性判定。
 OPEN_OK = 0
@@ -241,7 +248,7 @@ def read_env_file(path: str) -> dict[str, str]:
 
 
 class Deployment:
-    """夹具与用例共用的操作集合。
+    """fixture 与用例共用的操作集合。
 
     所有方法只做"做这件事并返回结果"，判定放在用例里 —— 这样失败信息能
     带上用例自己的上下文。
@@ -309,6 +316,77 @@ class Deployment:
             except BaseException:
                 pass
         shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    # ── 用例级收尾 ──────────────────────────────────────────────
+
+    def mark(self) -> tuple:
+        """记下"这一刻已经造出来的东西"，作为一条用例的清理基线。"""
+        return (
+            set(self.created_containers),
+            tuple(self._children),
+            set(self.created_sandboxes),
+            set(self.created_tasks),
+        )
+
+    def cleanup_since(self, mark: tuple) -> list[str]:
+        """只回收 ``mark`` 之后新造出来的东西，返回回收清单。
+
+        会话级 finalizer 要整套跑完才执行，用例中途失败（断言、超时、Ctrl-C）
+        留下的半成品会一直占着卡：昨晚 41 号用例泄漏的一个 ``sleep 6`` 任务占
+        住卡，让三条需要空闲卡的用例各报一个 ``IndexError``；泄漏的 acquire
+        终端又让 43 号的 ``pause`` 永远等不到静止，一路撞上 300s 上限。
+
+        顺序与会话收尾一致 —— 容器 → 本机进程 → 沙盒 → 任务：先删容器再释放
+        沙盒，因为 release 只认登记过的容器。
+        """
+        containers, children, sandboxes, tasks = mark
+        recycled: list[str] = []
+
+        for container in [c for c in self.created_containers if c not in containers]:
+            self.remove_container(container)
+            self.created_containers.remove(container)
+            recycled.append(f"容器 {container}")
+
+        for process in [p for p in self._children if p not in children]:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            except BaseException:
+                pass
+            self._children.remove(process)
+            recycled.append(f"进程 {process.pid}")
+
+        # Worker 不在线时不再发 HTTP：每条都撞 30s 超时，会把失败现场拖得更久。
+        # 这种时候**保留**登记（而不是清空），留给会话收尾在服务起来之后再试。
+        try:
+            online = self.client.get("/healthz", timeout=5).status == 200
+        except BaseException:
+            online = False
+
+        for name in [n for n in self.created_sandboxes if n and n not in sandboxes]:
+            if online:
+                try:
+                    self.client.release(name)
+                except BaseException:
+                    pass
+                self.created_sandboxes.remove(name)
+                recycled.append(f"沙盒 {name}")
+            else:
+                recycled.append(f"沙盒 {name}（Worker 不在线，留给会话收尾）")
+
+        stale = [t for t in self.created_tasks if t not in tasks]
+        if stale and online:
+            try:
+                self.client.delete_tasks(stale)
+            except BaseException:
+                pass
+            for task in stale:
+                self.created_tasks.remove(task)
+                recycled.append(f"任务 {task}")
+        elif stale:
+            recycled.extend(f"任务 {t}（Worker 不在线，留给会话收尾）" for t in stale)
+        return recycled
 
     # ── Worker 配置 ─────────────────────────────────────────────
 
@@ -504,6 +582,42 @@ class Deployment:
         dev_status = self.status().get("dev_status") or {}
         return sorted(int(minor) for minor, busy in dev_status.items() if not busy)
 
+    def require_idle(self, count: int) -> list[int]:
+        """取 ``count`` 张空闲卡（互不相同）；不够就直接失败，不跳过。
+
+        选卡一律走 Worker 的 ``/status``：``dev_status`` 已经把 ``npu_info.sh``
+        报的外部占用和本地预留都算进去了，所以调用方不需要（也不该）知道哪张卡
+        是好的。维护窗口里 8 张全空闲时，这里自然拿到 8 张。
+        """
+        idle = self.idle_minors()
+        if len(idle) < count:
+            pytest.fail(
+                f"前置缺失：这条用例需要 {count} 张空闲设备，当前只有 "
+                f"{len(idle)} 张（{idle}；total_devices={self.total_devices()}）",
+                pytrace=False,
+            )
+        return idle[:count]
+
+    def externally_busy_minors(self) -> list[int]:
+        """被本 Worker 之外的作业占着的卡：``dev_status`` 说忙、但没被自己占。
+
+        ``dev_status`` 的 1 表示忙、0 表示空闲（见 ``idle_minors``）；"忙"里
+        减掉本进程登记的任务/沙盒占用，剩下的就只能是外部作业占的
+        （``npu_info.sh`` 是这件事的唯一来源）。
+        """
+        held: set[int] = set()
+        for task in self.queue():
+            for device in task.get("devices") or []:
+                held.add(_minor(device))
+        for sandbox in self.sandboxes():
+            for device in sandbox.get("devices") or []:
+                held.add(_minor(device))
+        dev_status = self.status().get("dev_status") or {}
+        return sorted(
+            int(minor) for minor, busy in dev_status.items()
+            if busy and int(minor) not in held
+        )
+
     def total_devices(self) -> int:
         return int(self.status().get("total_devices") or 0)
 
@@ -623,6 +737,7 @@ class Deployment:
         cpu: int = 0,
         memory: int = 0,
         mem_unit: str = "GB",
+        priority: int = 0,
         user: str | None = None,
     ) -> dict:
         payload = {
@@ -632,6 +747,7 @@ class Deployment:
             "cpu": cpu,
             "memory": memory,
             "mem_unit": mem_unit,
+            "priority": priority,
         }
         if device_ids:
             payload["device_ids"] = [str(value) for value in device_ids]
@@ -686,6 +802,26 @@ class Deployment:
         if result.status == 200 and sandbox_name in self.created_sandboxes:
             self.created_sandboxes.remove(sandbox_name)
         return result
+
+    @contextlib.contextmanager
+    def sandbox(self, payload: dict, *, timeout: float | None = None):
+        """``acquire_sandbox`` 的 finally 版本：出块时无条件释放。
+
+        申请成功之后用例里任何一条断言失败、任何一次超时、乃至 Ctrl-C，都会走
+        到 ``finally``。这很要紧：残留的 acquire 沙盒**不会**被收尸器兜底
+        （cgroup 里还住着借出去的终端，按设计就该保留），它会一直占着卡，后面
+        每一条要空闲卡的用例都跟着失败，最后把 ``neuboxctl pause`` 也堵死。
+        """
+        sandbox = self.acquire_sandbox(payload, timeout=timeout)
+        name = sandbox.get("sandbox_name") or ""
+        try:
+            yield sandbox
+        finally:
+            if name:
+                try:
+                    self.release_sandbox(name)
+                except BaseException:  # 收尾路径：不让释放失败盖住原异常
+                    pass
 
     def sandboxes(self, username: str | None = None) -> list[dict]:
         result = self.client.dev_list(username)
@@ -796,6 +932,76 @@ class Deployment:
     def spawn_sleeper(self, seconds: int = 600, *, user: str | None = None):
         """起一个长期存活的进程，用于 acquire / join 类用例。"""
         return self.spawn(["sleep", str(seconds)], user=user)
+
+    # 造"容器替身"的候选写法。登记接口认的是 mount namespace 与宿主不同，
+    # 而 ``unshare --mount`` 在部分环境里会被内核/安全策略挡掉：命令在、进程
+    # 也活着，但 ns 根本没换（登记时以 409 docker_container_same_mount_namespace
+    # 打回来，看上去像产品缺陷）。所以这里挨个试、并且真的读 /proc 验证。
+    FOREIGN_NS_CANDIDATES: tuple[tuple[str, ...], ...] = (
+        ("unshare", "--mount"),
+        ("unshare", "--user", "--map-root-user", "--mount"),
+    )
+    # 等 unshare 真的把 ns 换过来。它不是"进程一起来就在新 ns 里"：unshare
+    # 先 fork/exec 自己，再调 unshare(2)，最后 exec 目标命令 —— 这几毫秒里
+    # 进程还挂在宿主的 mnt ns 上，读早了会得出"ns 没换"的假结论。
+    FOREIGN_NS_SETTLE = 3.0
+
+    def spawn_foreign_namespace_process(self,
+                                        seconds: int = 600) -> subprocess.Popen:
+        """起一个 mount namespace 与宿主不同的进程（容器替身）。
+
+        ``shutil.which('unshare')`` 只能证明命令在，证明不了它管用，所以每个
+        候选都真的验证 ``/proc/<pid>/ns/mnt`` 的 inode 变了。判据是**轮询**
+        出来的：要么 inode 变了（成了），要么进程自己退了（unshare 被内核/安全
+        策略拒了），先到先算。全都造不出来时 ``pytest.fail`` 说明这是环境前置
+        缺失 —— 调用方要在**占卡之前**叫它。
+        """
+        if shutil.which("unshare") is None:
+            pytest.fail(
+                "前置缺失：找不到 unshare 命令，造不出一个非宿主 mount namespace "
+                "的容器替身",
+                pytrace=False,
+            )
+        host = mount_namespace_inode(os.getpid())
+        tried: list[str] = []
+        for prefix in self.FOREIGN_NS_CANDIDATES:
+            process = self.spawn([*prefix, "sleep", str(int(seconds))])
+            inode = self._await_foreign_namespace(process.pid, host)
+            if inode is not None and inode != host:
+                return process
+            if inode is None:
+                tried.append(
+                    f"  {' '.join(prefix)} → 进程没起来就退了"
+                    f"（unshare 被拒，宿主 mnt:[{host}]）"
+                )
+            else:
+                tried.append(
+                    f"  {' '.join(prefix)} → mnt:[{inode}]"
+                    f"（宿主 mnt:[{host}]，{self.FOREIGN_NS_SETTLE:.0f}s 内没换）"
+                )
+            self.kill(process.pid)
+            self.wait_process_gone(process.pid)
+        pytest.fail(
+            "前置缺失：本机造不出与宿主不同的 mount namespace，登记接口必然用 "
+            "409 docker_container_same_mount_namespace 拒绝这条用例的容器替身"
+            "（这是环境限制，不是产品失败）：\n" + "\n".join(tried)
+            + "\n手动复核：unshare --mount sh -c 'readlink /proc/self/ns/mnt'"
+              "（打印出的 inum 与 /proc/1/ns/mnt 不同才算能造）",
+            pytrace=False,
+        )
+
+    def _await_foreign_namespace(self, pid: int, host: int) -> int | None:
+        """轮询等 mnt ns 换过去；进程没起来就退了则返回 None。"""
+        deadline = time.time() + self.FOREIGN_NS_SETTLE
+        inode = None
+        while time.time() < deadline:
+            if not process_alive(pid):
+                return None
+            inode = mount_namespace_inode(pid)
+            if inode is not None and inode != host:
+                return inode
+            time.sleep(0.05)
+        return inode
 
     def spawn_terminal(self, seconds: int = 600) -> subprocess.Popen:
         """起一个"借出去当终端"的进程：归属必须是验收用户，且当前不在沙盒里。
@@ -1349,6 +1555,19 @@ def process_alive(pid: int) -> bool:
     except OSError:
         return False
     return bool(fields) and fields[0] != "Z"
+
+
+def _minor(device: str) -> int:
+    """``234:0`` / ``0`` → ``0``。"""
+    return int(str(device).split(":")[-1])
+
+
+def mount_namespace_inode(pid: int) -> int | None:
+    """读 ``/proc/<pid>/ns/mnt`` 的 inode；进程已经不在了返回 None。"""
+    try:
+        return os.stat(f"/proc/{pid}/ns/mnt").st_ino
+    except OSError:
+        return None
 
 
 def shell_command(script: str, *args: str) -> str:

@@ -1,7 +1,7 @@
 """第 3 层 · 基本盘（manifest 1-18）。
 
 跑在装了 worker RPM 的部署机上：真 Worker、真任务、真 cgroup。这里**没有
-skip** —— 缺前置一律失败并写清缺什么，前置在 ``conftest.py`` 的组夹具里查。
+skip** —— 缺前置一律失败并写清缺什么，前置在 ``conftest.py`` 的组 fixture 里查。
 """
 
 from __future__ import annotations
@@ -266,8 +266,8 @@ def test_log_streaming_by_offset_and_limit(basic):
     second = f"STREAM_SECOND_{secrets.token_hex(4)}"
     third = f"STREAM_THIRD_{secrets.token_hex(4)}"
     command = (
-        f"printf '%s\\n' {first!r}; sleep 3; "
-        f"printf '%s\\n' {second!r}; sleep 3; "
+        f"printf '%s\\n' {first!r}; sleep 2; "
+        f"printf '%s\\n' {second!r}; sleep 2; "
         f"printf '%s\\n' {third!r}"
     )
     task_id = basic.submit(command, device_num=0)
@@ -507,7 +507,7 @@ def test_restart_recovers_state(basic):
     baseline_idle = basic.idle_devices()
     baseline_total = basic.total_devices()
 
-    task_id = basic.submit("sleep 45", device_num=0)
+    task_id = basic.submit("sleep 20", device_num=0)
     running = basic.wait_task_running(task_id)
     assert running["status"] == "running", running
 

@@ -1,6 +1,6 @@
 """第 3 层 · 容器（manifest 32-39）。
 
-组夹具 ``container`` 已经确认 dockerd 可用、且 ``default-runtime`` 真的是
+组 fixture ``container`` 已经确认 dockerd 可用、且 ``default-runtime`` 真的是
 ``neu-box-runtime`` —— 容器能不能拿到设备全靠这条 hook 链，指错了后面全是
 假阳性。
 
@@ -11,7 +11,7 @@ namespace 登记到 Worker，借用沙盒的授权。所以这里的观察点有
 
 需要设备的那几条用例额外要 ``single_card`` —— manifest 给这些行写的前置是
 "1 卡 + dockerd + runtime"，而 32/35/36/37 只要 dockerd 和 runtime，卡不是
-它们的前置，所以没把卡数塞进 ``container`` 夹具。
+它们的前置，所以没把卡数塞进 ``container`` fixture。
 """
 
 from __future__ import annotations
@@ -77,36 +77,35 @@ def test_annotated_container_is_registered_and_reaches_device(
     device = single_card.idle_minors()[0]
     node = single_card.device_node(device)
     terminal = single_card.spawn_terminal()
-    sandbox = single_card.acquire_sandbox(
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    reference, result = run_container(
-        single_card, container_image, annotation=name,
-        command=container_probe_command(node),
-    )
-    assert result.returncode == 0, (
-        f"带 annotation 的容器起不来（docker run 退出码 {result.returncode}）:\n"
-        f"{(result.stdout or '')[:2000]}\n"
-        f"容器起不来通常就是 hook 登记被拒 —— 看 Worker 日志里 "
-        f"/container/register 的结果"
-    )
+        reference, result = run_container(
+            single_card, container_image, annotation=name,
+            command=container_probe_command(node),
+        )
+        assert result.returncode == 0, (
+            f"带 annotation 的容器起不来（docker run 退出码 {result.returncode}）:\n"
+            f"{(result.stdout or '')[:2000]}\n"
+            f"容器起不来通常就是 hook 登记被拒 —— 看 Worker 日志里 "
+            f"/container/register 的结果"
+        )
 
-    container_id = single_card.container_id_of(reference)
-    registered = single_card.wait_container_registered(container_id)
-    assert registered == name, f"容器登记到了沙盒 {registered}，期望 {name}"
+        container_id = single_card.container_id_of(reference)
+        registered = single_card.wait_container_registered(container_id)
+        assert registered == name, f"容器登记到了沙盒 {registered}，期望 {name}"
 
-    text = wait_container_log_count(
-        single_card, reference, CONTAINER_PROBE_MARKER, 1,
-    )
-    assert CONTAINER_OPEN_OK in text, (
-        f"容器内的设备节点 {node} 打不开 —— 登记落了库、BPF 授权却没生效：\n"
-        f"{text[:2000]}"
-    )
+        text = wait_container_log_count(
+            single_card, reference, CONTAINER_PROBE_MARKER, 1,
+        )
+        assert CONTAINER_OPEN_OK in text, (
+            f"容器内的设备节点 {node} 打不开 —— 登记落了库、BPF 授权却没生效：\n"
+            f"{text[:2000]}"
+        )
 
-    single_card.remove_container(reference)
-    single_card.release_sandbox(name)
+        single_card.remove_container(reference)
     single_card.wait_idle_at_least(baseline)
 
 
@@ -176,40 +175,40 @@ def test_worker_down_blocks_annotated_container(container, container_image):
     """
     container.require_service_control()
     terminal = container.spawn_terminal()
-    sandbox = container.acquire_sandbox(
+    with container.sandbox(
         container.acquire_payload(terminal.pid, device_num=0),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    container.stop_worker()
-    try:
-        reference, down = run_container(
+        container.stop_worker()
+        try:
+            reference, down = run_container(
+                container, container_image, annotation=name, command="sleep 60",
+                detach=False,
+            )
+            assert down.returncode != 0, (
+                f"Worker 已经停了，带 annotation 的容器居然还能起来 —— hook 连不上 "
+                f"Worker 时必须退非 0:\n{(down.stdout or '')[:2000]}"
+            )
+            require_container_not_running(
+                container, reference,
+                context="Worker 停着的时候 hook 连不上 Worker",
+            )
+            container.remove_container(reference)
+        finally:
+            container.start_worker()
+
+        reference, up = run_container(
             container, container_image, annotation=name, command="sleep 60",
-            detach=False,
         )
-        assert down.returncode != 0, (
-            f"Worker 已经停了，带 annotation 的容器居然还能起来 —— hook 连不上 "
-            f"Worker 时必须退非 0:\n{(down.stdout or '')[:2000]}"
+        assert up.returncode == 0, (
+            f"Worker 恢复后同一个容器仍然起不来（退出码 {up.returncode}）:\n"
+            f"{(up.stdout or '')[:2000]}"
         )
-        require_container_not_running(
-            container, reference, context="Worker 停着的时候 hook 连不上 Worker",
-        )
+        container_id = container.container_id_of(reference)
+        assert container.wait_container_registered(container_id) == name
+
         container.remove_container(reference)
-    finally:
-        container.start_worker()
-
-    reference, up = run_container(
-        container, container_image, annotation=name, command="sleep 60",
-    )
-    assert up.returncode == 0, (
-        f"Worker 恢复后同一个容器仍然起不来（退出码 {up.returncode}）:\n"
-        f"{(up.stdout or '')[:2000]}"
-    )
-    container_id = container.container_id_of(reference)
-    assert container.wait_container_registered(container_id) == name
-
-    container.remove_container(reference)
-    container.release_sandbox(name)
 
 
 def test_unrelated_container_unaffected(container, container_image):
@@ -245,7 +244,9 @@ def test_submit_docker_task_e2e(container, single_card, container_image):
         device_ids=[device],
         target={"type": "docker", "image": container_image},
     )
-    task = single_card.wait_task(task_id, timeout=max(single_card.task_timeout, 180.0))
+    # docker target 要走"起容器 + hook 登记"，比纯命令任务慢，所以比全局
+    # deadline 多留一点；但它同样只是失败路径的上限。
+    task = single_card.wait_task(task_id, timeout=max(single_card.task_timeout, 90.0))
     assert task["status"] == "completed", (
         f"docker target 任务没有完成: {task}\n"
         f"{single_card.task_log_text(task_id)[:2000]}"
@@ -292,36 +293,35 @@ def test_container_exit_unregisters(container, single_card, container_image):
     device = single_card.idle_minors()[0]
     node = single_card.device_node(device)
     terminal = single_card.spawn_terminal()
-    sandbox = single_card.acquire_sandbox(
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    reference, result = run_container(
-        single_card, container_image, annotation=name,
-        command=container_probe_command(node),
-    )
-    assert result.returncode == 0, (result.stdout or "")[:2000]
-    container_id = single_card.container_id_of(reference)
-    assert single_card.wait_container_registered(container_id) == name
+        reference, result = run_container(
+            single_card, container_image, annotation=name,
+            command=container_probe_command(node),
+        )
+        assert result.returncode == 0, (result.stdout or "")[:2000]
+        container_id = single_card.container_id_of(reference)
+        assert single_card.wait_container_registered(container_id) == name
 
-    stopped = single_card.docker("stop", "-t", "5", reference, timeout=90)
-    assert stopped.returncode == 0, (stopped.stdout or "")[:2000]
+        stopped = single_card.docker("stop", "-t", "2", reference, timeout=90)
+        assert stopped.returncode == 0, (stopped.stdout or "")[:2000]
 
-    single_card.wait_container_unregistered(container_id)
+        single_card.wait_container_unregistered(container_id)
 
-    # 注销只撤掉"容器借用的授权"，沙盒自己仍然占着这张卡。
-    record = single_card.find_sandbox(name)
-    assert record is not None, (
-        f"容器退出把沙盒 {name} 也带走了；沙盒只能由 release 或 Reaper 销毁"
-    )
-    assert record["state"] == "ACTIVE", record
-    assert single_card.idle_devices() == baseline - 1, (
-        f"容器退出后卡 {device} 就被放回了空闲池，但沙盒 {name} 还持有它"
-    )
+        # 注销只撤掉"容器借用的授权"，沙盒自己仍然占着这张卡。
+        record = single_card.find_sandbox(name)
+        assert record is not None, (
+            f"容器退出把沙盒 {name} 也带走了；沙盒只能由 release 或 Reaper 销毁"
+        )
+        assert record["state"] == "ACTIVE", record
+        assert single_card.idle_devices() == baseline - 1, (
+            f"容器退出后卡 {device} 就被放回了空闲池，但沙盒 {name} 还持有它"
+        )
 
-    single_card.remove_container(reference)
-    single_card.release_sandbox(name)
+        single_card.remove_container(reference)
     single_card.wait_idle_at_least(baseline)
 
 
@@ -331,42 +331,96 @@ def test_container_restart_registers_again(container, single_card, container_ima
     device = single_card.idle_minors()[0]
     node = single_card.device_node(device)
     terminal = single_card.spawn_terminal()
-    sandbox = single_card.acquire_sandbox(
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    reference, result = run_container(
-        single_card, container_image, annotation=name,
-        command=container_probe_command(node),
-    )
-    assert result.returncode == 0, (result.stdout or "")[:2000]
-    container_id = single_card.container_id_of(reference)
-    assert single_card.wait_container_registered(container_id) == name
+        reference, result = run_container(
+            single_card, container_image, annotation=name,
+            command=container_probe_command(node),
+        )
+        assert result.returncode == 0, (result.stdout or "")[:2000]
+        container_id = single_card.container_id_of(reference)
+        assert single_card.wait_container_registered(container_id) == name
 
-    first_run = wait_container_log_count(
-        single_card, reference, CONTAINER_PROBE_MARKER, 1,
-    )
-    assert CONTAINER_OPEN_OK in first_run, (
-        f"重启前的探测就没打开设备节点，后面这条比不了:\n{first_run[:2000]}"
-    )
+        first_run = wait_container_log_count(
+            single_card, reference, CONTAINER_PROBE_MARKER, 1,
+        )
+        assert CONTAINER_OPEN_OK in first_run, (
+            f"重启前的探测就没打开设备节点，后面这条比不了:\n{first_run[:2000]}"
+        )
 
-    restarted = single_card.docker("restart", "-t", "5", reference, timeout=120)
-    assert restarted.returncode == 0, (
-        f"docker restart 失败:\n{(restarted.stdout or '')[:2000]}"
-    )
+        restarted = single_card.docker("restart", "-t", "2", reference, timeout=90)
+        assert restarted.returncode == 0, (
+            f"docker restart 失败:\n{(restarted.stdout or '')[:2000]}"
+        )
 
-    assert single_card.wait_container_registered(container_id) == name, (
-        "容器重启后没有被重新登记 —— 重启会重新走一遍 runtime hook，登记要么"
-        "命中已有记录（幂等），要么补一条新的"
-    )
-    text = wait_container_log_count(
-        single_card, reference, CONTAINER_PROBE_MARKER, 2,
-    )
-    assert text.count(CONTAINER_OPEN_OK) >= 2, (
-        f"重启后容器内设备节点打不开了（登记在、授权没恢复）:\n{text[:2000]}"
-    )
+        assert single_card.wait_container_registered(container_id) == name, (
+            "容器重启后没有被重新登记 —— 重启会重新走一遍 runtime hook，登记要么"
+            "命中已有记录（幂等），要么补一条新的"
+        )
+        text = wait_container_log_count(
+            single_card, reference, CONTAINER_PROBE_MARKER, 2,
+        )
+        assert text.count(CONTAINER_OPEN_OK) >= 2, (
+            f"重启后容器内设备节点打不开了（登记在、授权没恢复）:\n{text[:2000]}"
+        )
 
-    single_card.remove_container(reference)
-    single_card.release_sandbox(name)
+        single_card.remove_container(reference)
     single_card.wait_idle_at_least(baseline)
+
+
+def test_docker_task_opens_only_its_reserved_devices(container, container_image):
+    """51 · docker 多卡任务：自己申请的卡能开，别人预留的卡开不了。
+
+    容器拿到的 ``--device`` 是**全部**受管节点（``devices.node_paths()``，驱动
+    初始化需要 manager/hdc），真正的闸门是 BPF 对 ``davinciN`` 的 open 判定。
+    所以这条用例两件事一起验：申请到的两张卡在容器里打得开；同一时刻另一张被
+    别的沙盒预留的卡，在容器里打不开。
+    """
+    first, second, bystander = container.require_idle(3)
+    nodes = {
+        minor: container.device_node(minor)
+        for minor in (first, second, bystander)
+    }
+    baseline = container.idle_devices()
+
+    # 先把 bystander 占住：它成了"别人的卡"，从我们的容器里必然打不开。
+    terminal = container.spawn_terminal()
+    with container.sandbox(
+        container.acquire_payload(terminal.pid, device_ids=[bystander]),
+    ):
+        probes = "; ".join(
+            f"if : <{nodes[minor]}; then echo SBX_OPEN_OK_{minor}; "
+            f"else echo SBX_OPEN_DENIED_{minor}; fi"
+            for minor in (first, second, bystander)
+        )
+        task_id = container.submit(
+            f"sh -c '{probes}'",
+            device_ids=[first, second],
+            target={"type": "docker", "image": container_image},
+        )
+        task = container.wait_task(
+            task_id, timeout=max(container.task_timeout, 90.0),
+        )
+        assert task["status"] == "completed", (
+            f"多卡 docker 任务没有完成: {task}\n"
+            f"{container.task_log_text(task_id)[:2000]}"
+        )
+        assert sorted(_minor(item) for item in task["devices"]) == sorted(
+            [first, second]
+        ), task["devices"]
+
+        text = container.task_log_text(task_id)
+        for minor in (first, second):
+            assert f"SBX_OPEN_OK_{minor}" in text, (
+                f"容器里打不开自己申请的卡 {minor}（{nodes[minor]}）—— 登记在、"
+                f"BPF 授权没生效:\n{text[:2000]}"
+            )
+        assert f"SBX_OPEN_DENIED_{bystander}" in text, (
+            f"容器里打开了别的沙盒预留的卡 {bystander}（{nodes[bystander]}）——"
+            f"设备隔离没有覆盖到 docker 任务:\n{text[:2000]}"
+        )
+
+    container.wait_idle_at_least(baseline)

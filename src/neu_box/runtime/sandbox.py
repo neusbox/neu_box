@@ -23,6 +23,7 @@ from neu_box.runtime.containers import (
     DockerExecutorError,
     docker_client,
     identity_alive,
+    load_docker,
     verify_identity,
 )
 from neu_box.runtime.reaper import Reaper
@@ -852,12 +853,17 @@ class SbxManager:
         except DockerExecutorError as exc:
             logger.error('删除容器 %s 失败（docker 不可用）: %s', container_ref, exc)
             return
+        # docker_client 已经成功说明 docker 装了，这里取的是异常类型本身。
+        not_found = load_docker().errors.NotFound
         try:
             client.containers.get(container_ref).remove(force=True)
+        except not_found:
+            # 容器跑完退出之后 Docker 自己会把它清掉，收尸时再来看就是 404。
+            # 这是正常路径，不能和下面那条 catch-all 合并 —— 一条 404 打两段
+            # traceback，会把真正的删除失败埋掉（排查时看到的正好相反）。
+            return
         except Exception:
-            logger.warning(
-                '删除容器 %s 失败（可能已不存在）', container_ref, exc_info=True,
-            )
+            logger.warning('删除容器 %s 失败', container_ref, exc_info=True)
         finally:
             try:
                 client.close()

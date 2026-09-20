@@ -90,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
         # 忽略环境里的 pyproject.toml / setup.cfg / tox.ini（含 addopts）。
         "-c", os.path.join(suite_dir(), "pytest.ini"),
         "-ra",
+        # 每次跑都给出最慢的十几条：这套用例有一半时间在等（收尸周期、负载
+        # 的 sleep、停/起服），没有这个就只能靠猜哪里慢。放在 argv 前面，
+        # 需要时可以用 --durations=0 覆盖。
+        "--durations=15",
     ]
     args.extend(argv)
     print(f"+ pytest {' '.join(args)}", flush=True)

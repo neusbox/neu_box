@@ -1,6 +1,6 @@
 """第 3 层 · 慢（manifest 40-42）。
 
-组夹具 ``slow`` 已经确认 Worker 在跑、Reaper 线程在周期扫描、至少有一张空闲
+组 fixture ``slow`` 已经确认 Worker 在跑、Reaper 线程在周期扫描、至少有一张空闲
 设备。这一组每条都要等收尸周期（默认 30s），所以单列一组。
 
 Reaper 的实际判据（``runtime/reaper.py`` 的 ``run_once``）：
@@ -17,15 +17,16 @@ Reaper 的实际判据（``runtime/reaper.py`` 的 ``run_once``）：
 from __future__ import annotations
 
 import secrets
-import shutil
 import time
 
 import pytest
 
 from deployment_support import process_alive, run_container
 
-# 收尸周期之外再留一点余量，避免刚好压在周期边界上。
-_PERSIST_MARGIN = 15.0
+# 收尸周期之外再留一点余量，避免刚好压在周期边界上；轮询粒度 0.25s，
+# 2s 足够跨过边界（这条用例的时长基本等于一个收尸周期，看 NEU_BOX_SANDBOX_
+# REAPER_INTERVAL：默认 30s → 这条要 ~60s，验收环境调成 5s 就只要 ~12s）。
+_PERSIST_MARGIN = 2.0
 
 
 def test_reaper_keeps_live_child_then_reclaims(slow):
@@ -40,42 +41,44 @@ def test_reaper_keeps_live_child_then_reclaims(slow):
     tag = f"reaper-{secrets.token_hex(4)}"
     parent, _ = slow.fork_child_in_place(seconds=600, tag=tag)
 
-    sandbox = slow.acquire_sandbox(
+    # 这条用例要的是"Reaper 回收"，所以沙盒正常路径上不该由用例自己释放；
+    # 但失败路径必须兜住 —— 否则 cgroup 里还活着的子进程会让它永远撤不掉。
+    with slow.sandbox(
         slow.acquire_payload(parent.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    child = slow.fork_now(tag=tag)
-    child_cgroup = slow.process_cgroup(child)
-    assert child_cgroup.endswith(f"sandbox_{name}"), (
-        f"fork 出来的子进程没有落在沙盒 cgroup 里（{child_cgroup}），"
-        f"这一条用例的前提不成立"
-    )
-
-    slow.kill(parent.pid)
-    slow.wait_process_gone(parent.pid)
-    slow.wait_process_alive(child)
-
-    deadline = time.time() + slow.reaper_interval + _PERSIST_MARGIN
-    while time.time() < deadline:
-        assert slow.find_sandbox(name) is not None, (
-            f"沙盒 {name} 在子进程 {child} 还活着的时候就被 Reaper 回收了"
-            f"（活跃子进程被丢下，设备预留已经释放）"
+        child = slow.fork_now(tag=tag)
+        child_cgroup = slow.process_cgroup(child)
+        assert child_cgroup.endswith(f"sandbox_{name}"), (
+            f"fork 出来的子进程没有落在沙盒 cgroup 里（{child_cgroup}），"
+            f"这一条用例的前提不成立"
         )
-        assert process_alive(child), (
-            f"子进程 {child} 在沙盒存续期间意外退出，用例前提被破坏"
+
+        slow.kill(parent.pid)
+        slow.wait_process_gone(parent.pid)
+        slow.wait_process_alive(child)
+
+        deadline = time.time() + slow.reaper_interval + _PERSIST_MARGIN
+        while time.time() < deadline:
+            assert slow.find_sandbox(name) is not None, (
+                f"沙盒 {name} 在子进程 {child} 还活着的时候就被 Reaper 回收了"
+                f"（活跃子进程被丢下，设备预留已经释放）"
+            )
+            assert process_alive(child), (
+                f"子进程 {child} 在沙盒存续期间意外退出，用例前提被破坏"
+            )
+            time.sleep(slow.poll)
+
+        # 子进程也死了 → cgroup 空了 → 下一个收尸周期回收。
+        slow.kill(child)
+        slow.wait_process_gone(child)
+        slow.wait_sandbox_gone(name, timeout=slow.reaper_timeout)
+
+        slow.wait_idle_at_least(baseline)
+        assert device in slow.idle_minors(), (
+            f"沙盒回收之后卡 {device} 没有回到空闲池: {slow.idle_minors()}"
         )
-        time.sleep(slow.poll)
-
-    # 子进程也死了 → cgroup 空了 → 下一个收尸周期回收。
-    slow.kill(child)
-    slow.wait_process_gone(child)
-    slow.wait_sandbox_gone(name, timeout=slow.reaper_timeout)
-
-    slow.wait_idle_at_least(baseline)
-    assert device in slow.idle_minors(), (
-        f"沙盒回收之后卡 {device} 没有回到空闲池: {slow.idle_minors()}"
-    )
 
 
 @pytest.mark.deployment_restart
@@ -97,59 +100,61 @@ def test_restart_reconciles_orphan_registration(slow):
     的暂停启动同样会跑到。
     """
     slow.require_service_control()
-    if shutil.which("unshare") is None:
-        pytest.fail(
-            "前置缺失：找不到 unshare 命令，造不出一个非宿主 mount namespace "
-            "的容器替身",
-            pytrace=False,
-        )
+    # 前置必须先验：造不出非宿主 mount namespace 时立刻失败，而不是先占住一
+    # 张卡、留下 ``sleep 600`` 的终端，再把失败现场交给后面的用例。
+    # ``unshare --mount`` 在部分环境里命令在、进程活着，但 ns 根本没换。
+    orphan = slow.spawn_foreign_namespace_process(seconds=600)
 
-    baseline = slow.idle_devices()
-    device = slow.idle_minors()[0]
-    terminal = slow.spawn_terminal()
-    sandbox = slow.acquire_sandbox(
-        slow.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
-
-    # ``unshare --mount`` 之后 exec 的还是同一个 PID，只是 mnt ns 换了 ——
-    # 登记接口认的正是"与宿主不同的 mount namespace"。
-    orphan = slow.spawn(["unshare", "--mount", "sleep", "600"])
-    slow.wait_process_alive(orphan.pid)
-    container_id = secrets.token_hex(32)
-
-    registered = slow.client.register_container({
-        "container_id": container_id,
-        "host_pid": orphan.pid,
-        "sandbox_cgroup": name,
-    })
-    assert registered.status == 201, (
-        f"登记容器替身失败（HTTP {registered.status}）:\n"
-        f"{registered.text[:1000]}\n"
-        f"409 same_mount_namespace 说明 unshare 没有真的开出新的 mount "
-        f"namespace；409 registered_elsewhere 说明这个 mnt ns 已经被别的"
-        f"沙盒登记了"
-    )
-    assert slow.sandbox_of_container(container_id).json().get("sandbox_name") == name
-
-    slow.stop_worker()
     try:
-        slow.kill(orphan.pid)
-        slow.wait_process_gone(orphan.pid)
+        baseline = slow.idle_devices()
+        device = slow.idle_minors()[0]
+        terminal = slow.spawn_terminal()
+        # 沙盒用 with：这一块里任何断言失败都不会把卡留在场上。
+        with slow.sandbox(
+            slow.acquire_payload(terminal.pid, device_ids=[device]),
+        ) as sandbox:
+            name = sandbox["sandbox_name"]
+            container_id = secrets.token_hex(32)
+
+            registered = slow.client.register_container({
+                "container_id": container_id,
+                "host_pid": orphan.pid,
+                "sandbox_cgroup": name,
+            })
+            assert registered.status == 201, (
+                f"登记容器替身失败（HTTP {registered.status}）:\n"
+                f"{registered.text[:1000]}\n"
+                f"409 same_mount_namespace 说明 unshare 没有真的开出新的 mount "
+                f"namespace；409 registered_elsewhere 说明这个 mnt ns 已经被别的"
+                f"沙盒登记了"
+            )
+            assert slow.sandbox_of_container(container_id).json().get(
+                "sandbox_name") == name
+
+            slow.stop_worker()
+            try:
+                slow.kill(orphan.pid)
+                slow.wait_process_gone(orphan.pid)
+            finally:
+                slow.start_worker()
+
+            slow.wait_container_unregistered(container_id)
+
+            # 对账只清容器：沙盒自己是好的，借出去的终端也不该被牵连。
+            record = slow.find_sandbox(name)
+            assert record is not None, (
+                f"重启对账把沙盒 {name} 也一起清掉了；启动恢复只该丢弃孤儿的"
+                f"容器登记"
+            )
+            assert record["state"] == "ACTIVE", record
+            assert process_alive(terminal.pid), (
+                f"重启之后借出去的终端 {terminal.pid} 不见了"
+            )
     finally:
-        slow.start_worker()
-
-    slow.wait_container_unregistered(container_id)
-
-    # 对账只清容器：沙盒自己是好的，借出去的终端也不该被牵连。
-    record = slow.find_sandbox(name)
-    assert record is not None, (
-        f"重启对账把沙盒 {name} 也一起清掉了；启动恢复只该丢弃孤儿的容器登记"
-    )
-    assert record["state"] == "ACTIVE", record
-    assert process_alive(terminal.pid), f"重启之后借出去的终端 {terminal.pid} 不见了"
-
-    slow.release_sandbox(name)
+        # 沙盒替身进程不能比用例活得久：它和别的 ``sleep 600`` 不一样，
+        # 外面没有任何东西会来收它。
+        if process_alive(orphan.pid):
+            slow.kill(orphan.pid)
     slow.wait_idle_at_least(baseline)
 
 
@@ -160,37 +165,42 @@ def test_release_reclaims_registered_container(slow, single_card, container_imag
     事 —— 它必须把名下登记过的容器真的删掉，否则容器会带着已撤销的授权继续
     跑（表现成"驱动装了没生效"），而卡已经被放回空闲池。
 
-    这一步要 dockerd + runtime，所以额外要容器组的夹具；manifest 给这一行写
+    这一步要 dockerd + runtime，所以额外要容器组的 fixture；manifest 给这一行写
     的前置只有"1 卡"，实际还差一个容器运行时。
     """
     baseline = single_card.idle_devices()
     device = single_card.idle_minors()[0]
     terminal = single_card.spawn_terminal()
-    sandbox = single_card.acquire_sandbox(
+    # 用例本身要显式 release（那是被测行为），with 只是保证失败路径上不漏。
+    with single_card.sandbox(
         single_card.acquire_payload(terminal.pid, device_ids=[device]),
-    )
-    name = sandbox["sandbox_name"]
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
 
-    reference, result = run_container(
-        single_card, container_image, annotation=name, command="sleep 600",
-    )
-    assert result.returncode == 0, (result.stdout or "")[:2000]
-    container_id = single_card.container_id_of(reference)
-    assert single_card.wait_container_registered(container_id) == name
-    single_card.wait_idle_at_most(baseline - 1)
+        reference, result = run_container(
+            single_card, container_image, annotation=name, command="sleep 600",
+        )
+        assert result.returncode == 0, (result.stdout or "")[:2000]
+        container_id = single_card.container_id_of(reference)
+        assert single_card.wait_container_registered(container_id) == name
+        single_card.wait_idle_at_most(baseline - 1)
 
-    released = single_card.client.release(name, timeout=single_card.task_timeout)
-    assert released.status == 200, released.text
+        released = single_card.client.release(
+            name, timeout=single_card.task_timeout,
+        )
+        assert released.status == 200, released.text
 
-    single_card.wait_container_removed(reference)
-    assert single_card.sandbox_of_container(container_id).json().get(
-        "sandbox_name") is None, (
-        f"沙盒释放后容器 {container_id} 仍然有登记记录"
-    )
-    single_card.wait_sandbox_gone(name)
-    assert process_alive(terminal.pid), f"release 误杀了借出去的终端 {terminal.pid}"
-    single_card.wait_idle_at_least(baseline)
-    assert device in single_card.idle_minors(), single_card.idle_minors()
+        single_card.wait_container_removed(reference)
+        assert single_card.sandbox_of_container(container_id).json().get(
+            "sandbox_name") is None, (
+            f"沙盒释放后容器 {container_id} 仍然有登记记录"
+        )
+        single_card.wait_sandbox_gone(name)
+        assert process_alive(terminal.pid), (
+            f"release 误杀了借出去的终端 {terminal.pid}"
+        )
+        single_card.wait_idle_at_least(baseline)
+        assert device in single_card.idle_minors(), single_card.idle_minors()
 
 
 @pytest.mark.deployment_restart
@@ -199,7 +209,11 @@ def test_neuboxctl_pause_setup_roundtrip(basic):
     before = basic.status()
     assert before["maintenance"]["paused"] is False, before["maintenance"]
 
-    paused = basic.run_ctl("pause", "--timeout", "0", timeout=300)
+    # "等运行中的任务结束"是 pause 的**产品行为**，要保留；但用例没必要陪它无限
+    # 等：给它自己 60s 的等待预算，超了由 neuboxctl 报错退出（报错信息里带着
+    # 当前 maintenance 状态，比被外面 SIGKILL 好查）。外层 90s 只是兜底 ——
+    # 60s 等待之外还有备份库、sandbox cleanup、停服三段要做。
+    paused = basic.run_ctl("pause", "--timeout", "60", timeout=90)
     assert "数据库备份:" in paused.stdout, paused.stdout
     assert "配置备份:" in paused.stdout, paused.stdout
     assert not basic.service_active(), "neuboxctl pause 返回后服务仍在运行"

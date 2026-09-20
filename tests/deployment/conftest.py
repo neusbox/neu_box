@@ -1,6 +1,6 @@
-"""第 3 层实机验收的 pytest 夹具与收集隔离。
+"""第 3 层实机验收的 pytest fixture 与收集隔离。
 
-**这一层不跳过。** 每组一个夹具，夹具里检查该组的前置条件，缺什么就直接
+**这一层不跳过。** 每组一个 fixture，fixture 里检查该组的前置条件，缺什么就直接
 ``pytest.fail`` 并把缺的东西写进消息 —— 这是部署验收，不是开发机上的便利
 测试。``tests/integration/`` 那两层的 skip 语义在这里是反的。
 
@@ -81,10 +81,20 @@ def pytest_configure(config) -> None:
 def pytest_report_header(config) -> list[str]:
     if not _SELECTED:
         return []
-    return [
+    lines = [
         f"实机验收目标: {config.getoption('deployment_url')}",
         f"执行用户:     {config.getoption('deployment_user') or support.current_user()}",
     ]
+    # 慢组的时长基本等于收尸周期（那条用例至少要跨一轮），所以把周期打出来：
+    # 维护窗口里把它调小（worker.env 的 NEU_BOX_SANDBOX_REAPER_INTERVAL）是整套
+    # 验收最大的一笔可调开销（30s → 这套要多花 ~50s）。
+    try:
+        environment = support.read_env_file(config.getoption("deployment_config"))
+        interval = float(environment.get("NEU_BOX_SANDBOX_REAPER_INTERVAL") or 30)
+        lines.append(f"收尸周期:     {interval:.0f}s")
+    except Exception:  # 读不到就只少一行，不影响验收本身
+        pass
+    return lines
 
 
 def pytest_collection_modifyitems(session, config, items) -> None:
@@ -114,6 +124,22 @@ def deployment(request) -> Deployment:
     )
     request.addfinalizer(target.cleanup)
     return target
+
+
+@pytest.fixture(autouse=True)
+def case_cleanup(deployment: Deployment, request):
+    """用例级收尾：这一条造出来的东西，这一条结束时就得收干净。
+
+    会话级 finalizer 只在整套跑完才执行，所以一条用例中途失败留下的沙盒/终端
+    会一直占着卡，后面每一条要空闲卡的用例都跟着报假失败，失败现场还会被污染
+    成完全不相干的样子。这里只动本用例**新造**的东西，通过的用例照旧——
+    已经自己收干净时它是空操作。
+    """
+    mark = deployment.mark()
+    yield
+    recycled = deployment.cleanup_since(mark)
+    if recycled:
+        print(f"\n[收尾] {request.node.name}: " + "，".join(recycled))
 
 
 @pytest.fixture(scope="session")
