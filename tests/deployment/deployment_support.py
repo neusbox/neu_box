@@ -551,7 +551,11 @@ class Deployment:
         return command
 
     def queue(self) -> list[dict]:
-        """``GET /tasks`` 的队列快照（running 在前，然后是按出队顺序的 queued）。"""
+        """``GET /tasks`` 的快照：running → queued → **最近完成的**。
+
+        注意最后一段：最近完成的任务仍然带着它们的 ``devices``，判断"谁在占用
+        卡"时要按 ``status`` 过滤，别把它们算进去。
+        """
         result = self.client.list_tasks()
         if result.status != 200:
             pytest.fail(
@@ -607,6 +611,11 @@ class Deployment:
         """
         held: set[int] = set()
         for task in self.queue():
+            # ``GET /tasks`` 是"active + 最近完成的"，最近完成的任务手里还留着
+            # 它们当年用的 devices —— 那不算占用，减进来会把所有卡都算成"被自己
+            # 占着"，于是永远找不到外部占用。
+            if task.get("status") not in {"running", "queued"}:
+                continue
             for device in task.get("devices") or []:
                 held.add(_minor(device))
         for sandbox in self.sandboxes():
