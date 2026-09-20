@@ -1,4 +1,6 @@
-"""第 3 层 · 容器（manifest 32-39）。
+"""第 3 层 · 容器（manifest 32-35、37-39、51）。
+
+停服窗口里的容器行为（36）在 ``test_maintenance.py``：它要停 Worker，属于维护组。
 
 组 fixture ``container`` 已经确认 dockerd 可用、且 ``default-runtime`` 真的是
 ``neu-box-runtime`` —— 容器能不能拿到设备全靠这条 hook 链，指错了后面全是
@@ -161,54 +163,6 @@ def test_annotation_pointing_at_unknown_sandbox_blocks_start(
         context=f"hook 拒绝了不存在的沙盒 {missing}",
     )
     container.remove_container(reference)
-
-
-@pytest.mark.deployment_restart
-def test_worker_down_blocks_annotated_container(container, container_image):
-    """36 · Worker 停掉 → 容器起不来。
-
-    停服用 ``stop_worker()``（SIGTERM MainPID，和 ``pause`` 停服做的事一样；
-    ``systemctl stop`` 被单元的 ``RefuseManualStop=yes`` 拒绝），恢复用
-    ``start_worker()``（``neuboxctl setup``）。这里不能用
-    ``neuboxctl pause`` 停：它要先等到 ``quiet=true``，而本用例手里
-    还攥着一个 active 沙盒，pause 只会一直等。
-    """
-    container.require_service_control()
-    terminal = container.spawn_terminal()
-    with container.sandbox(
-        container.acquire_payload(terminal.pid, device_num=0),
-    ) as sandbox:
-        name = sandbox["sandbox_name"]
-
-        container.stop_worker()
-        try:
-            reference, down = run_container(
-                container, container_image, annotation=name, command="sleep 60",
-                detach=False,
-            )
-            assert down.returncode != 0, (
-                f"Worker 已经停了，带 annotation 的容器居然还能起来 —— hook 连不上 "
-                f"Worker 时必须退非 0:\n{(down.stdout or '')[:2000]}"
-            )
-            require_container_not_running(
-                container, reference,
-                context="Worker 停着的时候 hook 连不上 Worker",
-            )
-            container.remove_container(reference)
-        finally:
-            container.start_worker()
-
-        reference, up = run_container(
-            container, container_image, annotation=name, command="sleep 60",
-        )
-        assert up.returncode == 0, (
-            f"Worker 恢复后同一个容器仍然起不来（退出码 {up.returncode}）:\n"
-            f"{(up.stdout or '')[:2000]}"
-        )
-        container_id = container.container_id_of(reference)
-        assert container.wait_container_registered(container_id) == name
-
-        container.remove_container(reference)
 
 
 def test_unrelated_container_unaffected(container, container_image):

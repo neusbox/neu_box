@@ -1,7 +1,10 @@
-"""第 3 层 · 基本盘（manifest 1-18）。
+"""第 3 层 · 基本盘（manifest 1-16）。
 
 跑在装了 worker RPM 的部署机上：真 Worker、真任务、真 cgroup。这里**没有
 skip** —— 缺前置一律失败并写清缺什么，前置在 ``conftest.py`` 的组 fixture 里查。
+
+这一组不碰卡（``device_num=0`` 的纯 CPU 任务 + 日志/参数/路由），所以它排在最
+前面：它挂了说明"Worker 根本没起来"，后面那些要卡的组不用看了。
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import time
 
 import pytest
 
-# 重启类用例要用 systemd 停/起 Worker，统一排在整套最后（见 conftest）。
+# 会停/起 Worker 的用例都在 test_maintenance.py（整套最后），这里不再有。
 
 
 def test_healthz_reports_api_version(basic):
@@ -430,109 +433,3 @@ def _log_value(text: str, key: str) -> str:
     match = re.search(rf"^{key}=(.*)$", text, re.M)
     assert match, f"任务日志里没有 {key}:\n{text[:2000]}"
     return match.group(1).strip()
-
-
-@pytest.mark.deployment_restart
-def test_pause_refuses_new_work_until_restart(basic):
-    """17 · pause 拒新请求 → resume。
-
-    ``POST /maintenance/pause`` 是一次**停机维护**的开始：Worker 停止接受新任务
-    和新沙盒，并且此后 ``resume`` 会被拒（409 ``maintenance_in_progress``）——
-    恢复调度的唯一路径是让进程重启。所以这条用例以重启收尾，否则后面的用例全会
-    撞在暂停态上。
-
-    重启由 ``restart_worker()`` 完成：先给 MainPID 发 SIGTERM（``systemctl
-    stop/restart`` 被单元的 ``RefuseManualStop=yes`` 拒绝），再用
-    ``neuboxctl setup`` 拉起 —— 后者会清掉遗留的 ``.paused`` 标记并恢复
-    调度，所以重启之后 Worker 一定能接任务。
-    """
-    health = basic.client.maintenance()
-    assert health.status == 200, health.text
-    assert health.value("maintenance").get("paused") is False, (
-        "用例开始前 Worker 就已经是暂停态，无法验证 pause 的效果"
-    )
-
-    paused = basic.client.pause()
-    assert paused.status == 200, paused.text
-    state = paused.value("maintenance")
-    assert state.get("paused") is True, state
-    assert state.get("pause_in_progress") is True, state
-
-    task = basic.client.create_task(basic.task_payload("true", device_num=0))
-    assert task.status == 503, (
-        f"暂停期间新任务没有被拒绝（HTTP {task.status}）:\n{task.text[:500]}"
-    )
-    assert task.value("code") == "worker_paused", task.text
-
-    terminal = basic.spawn_terminal()
-    acquire = basic.client.acquire(
-        basic.acquire_payload(terminal.pid, device_num=0),
-    )
-    assert acquire.status == 503, (
-        f"暂停期间 acquire 没有被拒绝（HTTP {acquire.status}）:\n{acquire.text[:500]}"
-    )
-    assert acquire.value("code") == "worker_paused", acquire.text
-
-    resumed = basic.client.resume()
-    assert resumed.status == 409, (
-        f"维护进行中 resume 返回 HTTP {resumed.status}，应为 409；"
-        f"暂停维护期间恢复调度会让 pause 等的那一堆状态重新动起来:\n"
-        f"{resumed.text[:500]}"
-    )
-    assert resumed.value("code") == "maintenance_in_progress", resumed.text
-
-    still = basic.client.maintenance().value("maintenance")
-    assert still.get("paused") is True, (
-        f"被拒绝的 resume 之后 Worker 竟然恢复调度了: {still}"
-    )
-
-    basic.restart_worker()
-    restored = basic.client.create_task(basic.task_payload("true", device_num=0))
-    assert restored.status == 202, (
-        f"重启后 Worker 仍然不接受任务（HTTP {restored.status}）:\n"
-        f"{restored.text[:500]}"
-    )
-    basic.wait_task(restored.value("task_id"))
-
-
-@pytest.mark.deployment_restart
-def test_restart_recovers_state(basic):
-    """18 · 服务重启后状态恢复。
-
-    重启的机制是 SIGTERM MainPID + ``neuboxctl setup``（见
-    ``restart_worker()``）：``systemctl restart`` 被单元拒绝，也不用
-    ``neuboxctl pause`` —— 那个会先等运行中的任务结束，而这条用例
-    恰恰要在任务还在跑的时候把 Worker 停掉，看启动恢复怎么收尾它。
-    """
-    baseline_idle = basic.idle_devices()
-    baseline_total = basic.total_devices()
-
-    task_id = basic.submit("sleep 20", device_num=0)
-    running = basic.wait_task_running(task_id)
-    assert running["status"] == "running", running
-
-    basic.restart_worker()
-
-    task = basic.wait_task(task_id)
-    assert task["status"] == "failed", (
-        f"重启前仍在 running 的任务重启后应为 failed，实际为 {task['status']}"
-    )
-    assert "重启" in (task["result"].get("error") or ""), (
-        f"孤儿任务的失败原因没有说明是 Worker 重启: {task['result']}"
-    )
-
-    status = basic.status()
-    assert status["total_devices"] == baseline_total, (
-        f"重启后 total_devices 从 {baseline_total} 变成 {status['total_devices']}"
-    )
-    assert status["maintenance"]["paused"] is False, status["maintenance"]
-    basic.wait_idle_at_least(baseline_idle)
-
-    assert basic.sandboxes() is not None  # /sandbox/list 必须可用
-    for record in basic.sandboxes():
-        assert record.get("state") in {"ACTIVE", "CREATING", "DESTROYING"}, (
-            f"重启后沙盒 {record.get('name')} 的状态异常: {record.get('state')!r}"
-        )
-
-    fresh = basic.submit("printf 'after-restart\\n'", device_num=0)
-    assert basic.wait_task(fresh)["status"] == "completed", "重启后新任务跑不通"

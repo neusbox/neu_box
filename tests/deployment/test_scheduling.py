@@ -1,4 +1,4 @@
-"""第 3 层 · 调度（manifest 52-54）。
+"""第 3 层 · 调度（manifest 52-53）。
 
 这一组验的是"卡什么时候发出去"，而不是卡本身：优先级只分两档（0 普通 /
 1 赶论文），同一档内按提交顺序；每轮调度扫一遍队列，**取第一个能分配的任务**
@@ -9,7 +9,6 @@ Worker + 真卡上的表现。
 
 from __future__ import annotations
 
-import secrets
 import time
 
 import pytest
@@ -98,44 +97,3 @@ def test_acquire_shares_the_task_priority_order(multi_card):
     task = multi_card.wait_task(normal)
     assert task["status"] == "completed", task.get("result")
     multi_card.wait_idle_at_least(baseline)
-
-
-@pytest.mark.deployment_restart
-def test_pause_keeps_queued_task_until_setup(basic):
-    """54 · pause 期间已排队的任务保留，setup 之后继续跑。
-
-    ``POST /maintenance/pause`` 的契约是"停止接收新任务、已经排队的 pending
-    保留、不自动中断"。所以占卡的任务跑完、Worker 进入暂停之后，队列里那条仍
-    然在；恢复调度的唯一路径是重启（``setup``），起来之后它才继续执行。
-    """
-    baseline = basic.idle_devices()
-    device = basic.idle_minors()[0]
-    marker = f"PAUSED_QUEUED_{secrets.token_hex(4)}"
-
-    blocker = basic.submit("sleep 8", device_ids=[device])
-    basic.wait_task_running(blocker)
-    queued = basic.submit(
-        f"printf '%s\\n' {marker!r}", device_ids=[device],
-    )
-
-    paused = basic.client.pause()
-    assert paused.status == 200, paused.text
-    assert paused.value("maintenance").get("paused") is True, paused.text
-
-    # 占卡的跑完了（pause 不打断它），但暂停期间调度不会动队列里那条。
-    basic.wait_task(blocker)
-    entry = basic.queue_entry(queued)
-    assert entry is not None and entry["status"] == "queued", (
-        f"暂停期间排队任务 {queued} 被丢了或者被执行了: {entry}；"
-        f"pause 的契约是 pending 保留、不自动中断"
-    )
-    assert basic.client.task(queued).status == 200, "暂停期间任务查询不该失败"
-
-    basic.restart_worker()
-    task = basic.wait_task(queued)
-    assert task["status"] == "completed", task.get("result")
-    assert marker in basic.task_log_text(queued), (
-        f"恢复之后这条排队任务没有真的执行（日志里没有 {marker}）:\n"
-        f"{basic.task_log_text(queued)[:1000]}"
-    )
-    basic.wait_idle_at_least(baseline)

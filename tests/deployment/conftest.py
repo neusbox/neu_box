@@ -1,8 +1,13 @@
-"""第 3 层实机验收的 pytest fixture 与收集隔离。
+"""第 3 层实机验收的 pytest fixture、收集顺序与收集隔离。
 
 **这一层不跳过。** 每组一个 fixture，fixture 里检查该组的前置条件，缺什么就直接
 ``pytest.fail`` 并把缺的东西写进消息 —— 这是部署验收，不是开发机上的便利
 测试。``tests/integration/`` 那两层的 skip 语义在这里是反的。
+
+七个文件就是七个组，按"越靠后越贵"排（``_FILE_ORDER``）：基本盘（不碰卡）→
+单卡 → 多卡 → 调度 → 容器 → 收尸（要跨收尸周期）→ 维护（停/起服，独占，必须
+最后）。pytest 默认按文件名字母序收集，和这个顺序不一样（``scheduling`` 会插到
+``single_device`` 前面、``reaper`` 会跑到最后），所以顺序在这里显式钉住。
 
 收集隔离：这套用例默认**不参与**开发机上的 ``pytest tests/`` —— 它打真实
 任务、真实设备、真实容器，最后几条用例还会停/起 Worker（SIGTERM MainPID +
@@ -32,6 +37,18 @@ _SELECTED = os.environ.get("NEU_BOX_DEPLOYMENT_TESTS") == "1"
 
 # 非验收模式下这个目录里什么都不收：开发机上 `pytest tests/` 必须保持干净。
 collect_ignore_glob: list[str] = [] if _SELECTED else ["test_*.py"]
+
+# 组顺序：越靠后的组越贵，也越有破坏性。``test_maintenance`` 会停/起 Worker，
+# 所有带 ``deployment_restart`` 的用例都在那里，所以它排最后。
+_FILE_ORDER = (
+    "test_basic.py",          # 1. 基本盘：不碰卡，API/日志/参数校验
+    "test_single_device.py",  # 2. 单卡
+    "test_multi_device.py",   # 3. 多卡
+    "test_scheduling.py",     # 4. 调度与优先级
+    "test_containers.py",     # 5. 容器 / OCI runtime
+    "test_reaper.py",         # 6. 收尸：每条都要跨收尸周期
+    "test_maintenance.py",    # 7. 停机维护：停/起服，必须最后
+)
 
 
 def pytest_addoption(parser) -> None:
@@ -98,11 +115,24 @@ def pytest_report_header(config) -> list[str]:
 
 
 def pytest_collection_modifyitems(session, config, items) -> None:
-    """把重启类用例挪到最后。
+    """先按组排序，再把重启类用例挪到整套最后。
 
-    它们会停/起 Worker，跑在中间会把并发用例的沙盒和任务一起带走；而
-    ``POST /maintenance/pause`` 之后 Worker 必须重启才能恢复调度。
+    组的顺序见 ``_FILE_ORDER``（pytest 自己的字母序和我们的意图不一致）。
+    重启类用例会停/起 Worker，跑在中间会把并发用例的沙盒和任务一起带走；而
+    ``POST /maintenance/pause`` 之后 Worker 必须重启才能恢复调度。现在它们都
+    在 ``test_maintenance.py`` 里，这里再兜一层：以后谁在别的组写了 restart
+    用例，也会被挪到最后，而不是把后面的用例一起带崩。
     """
+    order = {name: index for index, name in enumerate(_FILE_ORDER)}
+    ranked = sorted(
+        enumerate(items),
+        key=lambda pair: (
+            order.get(pair[1].location[0].rsplit("/", 1)[-1], len(order)),
+            pair[0],
+        ),
+    )
+    items[:] = [item for _index, item in ranked]
+
     restart = [item for item in items if item.get_closest_marker("deployment_restart")]
     if not restart:
         return
@@ -280,8 +310,12 @@ def container_image(container: Deployment) -> str:
 
 
 @pytest.fixture(scope="session")
-def slow(deployment: Deployment, single_card: Deployment) -> Deployment:
-    """慢组：Reaper 类用例，需要 1 张空闲设备和 Worker 的收尸线程在跑。"""
+def reaper_ready(deployment: Deployment, single_card: Deployment) -> Deployment:
+    """收尸组：需要 1 张空闲设备、Worker 在线、``/maintenance`` 可读。
+
+    收尸由 ``neuboxd`` 自己的后台线程做，没有开关，所以"线程在跑"只能靠用例
+    真的等一个周期来验证 —— 这也是这一组慢的原因（见 ``test_reaper.py``）。
+    """
     maintenance = deployment.client.maintenance()
     if maintenance.status != 200:
         pytest.fail(

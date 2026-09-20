@@ -214,9 +214,10 @@ Clang、`pkg-config`、libbpf 1.0+ 开发包，以及提供 `readelf` 的
 binutils，详见
 [部署与升级手册](docs/deployment.md#构建-rpm)。
 
-实机验收套件在 `tests/deployment/`：pytest 写的，按 manifest 的五个组（基本盘 /
-单卡 / 多卡 / 容器 / 慢）分成五个文件，每组一个 session fixture 查该组前置，缺什么
-就 fail 并写清缺的是什么（**不跳过**）。它被打成 PyInstaller onedir 产物随 RPM
+实机验收套件在 `tests/deployment/`：pytest 写的，按 manifest 分成七个组各一个文件
+（基本盘 / 单卡 / 多卡 / 调度 / 容器 / 收尸 / 停机维护），执行顺序就按这个顺序
+—— 不碰卡的在前，会停/起 Worker 的维护组独占最后。每组一个 session fixture 查
+该组前置，缺什么就 fail 并写清缺的是什么（**不跳过**）。它被打成 PyInstaller onedir 产物随 RPM
 安装到 `/usr/libexec/neu-box/tests/`，对已部署的 Worker 用
 `neuboxctl test` 运行。它会创建真实任务、占用设备、起真实容器，还会重启
 Worker，应在维护窗口以 root 执行。
