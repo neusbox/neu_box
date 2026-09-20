@@ -238,5 +238,10 @@ def test_externally_busy_device_is_not_allocated(multi_card):
         )
         time.sleep(multi_card.poll)
 
-    multi_card.client.delete_tasks([task_id])
-    multi_card.wait_task(task_id)
+    # 排队任务被删除后是**记录也没了**（契约：queued → 删任务 + 删日志），
+    # 所以这里不能 wait_task() 等终态 —— 那只会等来 404。
+    deleted = multi_card.client.delete_tasks([task_id])
+    assert deleted.status == 200, deleted.text
+    assert multi_card.client.task(task_id).status == 404, (
+        f"排队任务 {task_id} 删除后仍可查询；外部占用期间它没被执行、也不该留下记录"
+    )
