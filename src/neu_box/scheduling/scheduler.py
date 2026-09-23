@@ -68,13 +68,11 @@ class SchedulerMixin:
                 any(resources.device_request(value))
                 for _key, value in candidates
             )
-        # 探测在锁外：npu-smi 要几百毫秒，持锁会把提交路径一起堵住。
+        # 探测在 `_lock` 外（npu-smi 要几百毫秒，持它会把提交路径一起堵住）。
+        # 但整个回合由 `_round_lock` 罩着，所以探测期间队列不会被改。
         free = resources.free_devices() if needs_probe else []
         with self._lock:
-            for (kind, identifier), _value in self._ordered():
-                value = self._lookup(kind, identifier)
-                if value is None:
-                    continue          # 这一轮之间被删/取消了
+            for (kind, identifier), value in self._ordered():
                 if resources.is_schedulable(value, free):
                     return kind, identifier
         return None
@@ -83,9 +81,19 @@ class SchedulerMixin:
         self._loop = asyncio.get_running_loop()
         self._wake = asyncio.Event()
         while self._running_flag:
-            entry = self._pick_schedulable()
-            if entry is not None:
-                await self._dispatch(*entry)
+            # 一整个回合（探设备池 → 扫队列 → allocate → 摘队 + 置 running）都在
+            # 回合锁里，期间没人能改队列：既不用复查"条目还在不在"，取消 pending
+            # 也只要等回合结束再摘。详见 TaskQueue.__init__ 的回合锁注释。
+            with self._round_lock:
+                entry = self._pick_schedulable()
+                if entry is not None:
+                    with self._lock:
+                        self._dispatching += 1
+                    try:
+                        self._dispatch(*entry)
+                    finally:
+                        with self._lock:
+                            self._dispatching -= 1
 
             if self._active:
                 # ★ 每轮让一次权。``_dispatch`` 里的 ``create_task`` 只是入队，

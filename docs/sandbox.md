@@ -130,3 +130,7 @@ sandbox 并执行 cleanup。
 未被任何 sandbox 预留的设备仍可由其他 cgroup 打开。设备 cgroup
 检查发生在打开设备节点时，不会追溯撤销进程在加入 sandbox 之前
 已经打开的 file descriptor。
+
+容器走的是另一条分支（按 mount namespace 查委托方沙盒，空闲卡也拒绝），
+以及驱动那张按 mnt ns 缓存的 UDA 表为什么是"第二道门"：见
+[`isolation.md`](isolation.md)。

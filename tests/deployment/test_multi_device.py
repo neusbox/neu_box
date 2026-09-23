@@ -168,8 +168,12 @@ def test_multi_device_cancel_releases_all_devices(multi_card):
     result = multi_card.client.delete_tasks([task_id])
     assert result.status == 200, result.text
     task = multi_card.wait_task(task_id)
-    assert task["status"] == "failed", (
-        f"取消后的多卡任务状态应为 failed，实际 {task['status']}: {task}"
+    assert task["status"] == "cancelled", (
+        f"取消后的多卡任务状态应为 cancelled（取消是独立终态，不再混在 failed "
+        f"里，和 27 号同口径），实际 {task['status']}: {task}"
+    )
+    assert "手动取消" in (task["result"].get("error") or ""), (
+        f"取消原因不明确: {task['result']}"
     )
 
     multi_card.wait_idle_at_least(baseline)
@@ -238,10 +242,11 @@ def test_externally_busy_device_is_not_allocated(multi_card):
         )
         time.sleep(multi_card.poll)
 
-    # 排队任务被删除后是**记录也没了**（契约：queued → 删任务 + 删日志），
-    # 所以这里不能 wait_task() 等终态 —— 那只会等来 404。
+    # 取消排队任务是"留痕"语义（记录保留、终态 cancelled、日志保留）——
+    # 早先那版是"删记录 + 删日志"，已经统一掉了。
     deleted = multi_card.client.delete_tasks([task_id])
     assert deleted.status == 200, deleted.text
-    assert multi_card.client.task(task_id).status == 404, (
-        f"排队任务 {task_id} 删除后仍可查询；外部占用期间它没被执行、也不该留下记录"
+    cancelled = multi_card.get_task(task_id)
+    assert cancelled["status"] == "cancelled", (
+        f"排队任务 {task_id} 取消后状态应为 cancelled，实际 {cancelled['status']}"
     )

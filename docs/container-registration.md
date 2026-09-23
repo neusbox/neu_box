@@ -7,6 +7,7 @@
 
 | 想看什么 | 去哪 |
 |---|---|
+| 隔离为什么成立：预留表、mnt ns 委托、驱动 UDA 表三层怎么配合，release / exec / stop→start 各条路径的结论 | [`isolation.md`](isolation.md) |
 | 端点契约：请求字段、状态码、错误码、幂等语义 | [`worker-api.md`](worker-api.md)「登记容器归属（runtime hook 专用）」—— **接口以那边为准**，本文不重复字段表 |
 | runtime 侧怎么做：wrapper 怎么注入、hook 怎么读 OCI state、`daemon.json` / `runtime.env` 怎么配、装机顺序为什么是硬的 | `neu_box_runtime/docs/runtime-hook.md` |
 | 客户端 `neu-sbox` 怎么用、annotation 是谁拼的 | `neu_box_goClient/README.md` |
@@ -122,10 +123,19 @@ mnt ns fd、对 init `host_pid` 开 pidfd 挂进 epoll —— 容器一退出，
 后来的新容器会白捡一份授权。
 
 三条兜底路径：Worker 重启（fd 全丢）之后由 `reconcile_containers` 对账清掉残留
-条目；沙盒销毁时也会一并收掉它名下的容器（撤登记 → `docker rm -f` → 等容器真的
-退出 → 放 pin）；启动恢复和每轮收尸还会按 `neu-box.sandbox` label 全量扫一遍
-Docker，收掉**沙盒记录已经不存在**的无主容器。`POST /sandbox/release` 的语义见
-此：调用方不需要报容器。
+条目 —— 启动时还会把**还活着**的登记容器一并停掉、撤绑定
+（`SbxManager.retire_containers_on_startup`：退出监听是内存态，重启后全丢，
+留着登记既有 inum 复用被白捡授权的风险，也等于跨崩溃续授权）；沙盒销毁时也会
+一并**停掉**它名下的容器（撤登记 → `docker stop` → 等容器真的退出 → 放 pin）；
+启动恢复和每轮收尸还会按 `neu-box.sandbox` label 全量扫一遍 Docker，停掉
+**沙盒记录已经不存在**的无主容器。`POST /sandbox/release` 的语义见此：调用方
+不需要报容器。
+
+**只停不删**：删容器会连它的可写层一起销毁，而用户可能还要 `docker commit` /
+`docker cp` 把产物捞出来。要的只是"它的进程别再占着卡"—— 进程一没，那个 mount
+namespace 就死了，驱动按 mnt ns 缓存的 UDA 表也就没人能用（详见
+[`isolation.md`](isolation.md)）。容器留着，下次 `docker start` 会重新走一遍
+runtime hook：沙盒还在就幂等登记，沙盒没了就 404、容器起不来（fail-closed）。
 
 第三条是给崩溃窗口兜底的：容器在 `docker create/start` 之后就带着 label，但
 `containers` 行要等 runtime hook 登记才出现。Worker 若死在这两者之间，那个容器对

@@ -205,6 +205,10 @@ Worker 在进程管道层合并 stdout 和 stderr，因此 Bash 初始化错误�
 - 容器是一次性的：Worker 用 `docker run` 起、跑完删除。**不支持在已有容器里
   执行**：容器的归属登记必须发生在它第一个 NPU 进程之前，别人已经起好的容器
   没有这个时机，只能拒绝；
+- `command` 是**参数表**不是 shell 字符串：Worker 把它交给 Docker 时会按 shell
+  引用规则拆成 argv（docker-py 的 `split_command`）。要跑多语句或重定向，自己写
+  `sh -c '...'`，例如 `"sh -c 'echo hi; sleep 1'"`；直接写裸脚本会被拆成
+  `["out=$(", "(", …]` 去 exec，报 `executable file not found`；
 - 全部受管设备节点都会挂进容器 —— 限制由 BPF 逐卡判定，不靠 `/dev` 里有没有
   节点，而驱动本身又必须拿到 manager / hdc 才能初始化；
 - 容器里不需要任何客户端：Worker 只把沙盒名写成 `sandbox_cgroup` annotation，
@@ -253,6 +257,19 @@ curl --noproxy '*' -sS "$WORKER/tasks"
 }
 ```
 
+`queue` 是**统一队列视图**：命令任务 + acquire 会话，两类条目都在里面，靠
+`kind`（`task` / `acquire`）区分。顺序是"在跑的"（任务的 `running`、会话的
+`active`）→"排队中的"（任务的 `queued`、会话的 `queued`/`allocating`，两类一起
+按优先级降序、提交时间升序编号 `position`/`eta`）→ 最近结束的（两类各取最近
+`NEU_BOX_COMMAND_QUEUE_RECENT` 条，按结束时间倒序合并）。
+
+可用 `?kind=task|acquire`、`?state=<状态>` 过滤。任务条目沿用原来的字段（另加
+`kind`/`id`）；acquire 条目没有 `command`/日志/`returncode`，它的字段是
+`id`(=request_id)、`status`(会话状态)、`user_id`、`pid`、`device_num`、
+`device_ids`、`devices`、`priority`、`sandbox_name`、`code`、`created_at`、
+`started_at`(=借出时间)、`finished_at`。消费方按 `kind` 分支渲染即可 ——
+以前 acquire 根本不在这个列表里（排队中的会话甚至没有列表接口）。
+
 `queue` 包含所有用户的 running、queued 任务以及最近 completed/failed 任务，不含
 日志和退出结果。`total_pending` 只统计 queued，不包含 running。
 
@@ -260,7 +277,8 @@ curl --noproxy '*' -sS "$WORKER/tasks"
 简单累加，不包含正在运行任务的剩余时间，因此只能用于展示，不能作为调度保证。
 
 排队顺序按 `priority` 降序、`created_at` 升序排列。当前优先级为 0=普通、
-1=赶论文，同优先级内按提交时间 FIFO；`position` 是这一顺序下的全局排位。
+1=赶论文，同优先级内按提交时间 FIFO；`position` 是这一顺序下的全局排位 ——
+**任务和 acquire 会话一起编号**（以前只数任务，master 看到的排位会和队列对不上）。
 
 真正决定"先跑谁"的是 **first-schedulable**：队列按上述顺序扫描，取**第一个当前
 资源足够**的条目。队首在等设备（卡被占满 / 指定卡未释放）时不会阻塞后面不需要
@@ -305,14 +323,15 @@ curl --noproxy '*' -sS \
 }
 ```
 
-任务状态只有四种：
+任务状态有五种：
 
 | 状态 | 含义 |
 |---|---|
 | `queued` | 已持久化，等待有可用资源时被调度 |
 | `running` | 已分配沙盒并开始执行 |
 | `completed` | 进程正常结束且退出码为 `0` |
-| `failed` | 非零退出、超时、取消、Docker 错误或沙盒清理失败 |
+| `failed` | 非零退出、超时、Docker 错误或沙盒清理失败 |
+| `cancelled` | 被用户取消（排队中取消或运行中取消）；记录与日志**保留** |
 
 时间字段是 Unix 时间戳（秒，可能带小数）。任务不存在时返回 HTTP `404`。
 标准输出和标准错误不放在此响应中，应通过日志接口读取。
@@ -359,7 +378,7 @@ JSON 响应：
 范围参数按字节计算。日志尚未创建时返回空内容和 HTTP `200`；日志接口本身不会
 判断任务是否存在，因此查询错误的 `task_id` 也会得到空日志。
 
-### 删除或取消任务
+### 删除或取消任务（批量兼容入口）
 
 ```http
 DELETE /tasks
@@ -381,9 +400,45 @@ curl --noproxy '*' -sS \
 }
 ```
 
-- queued、completed、failed：删除任务记录和对应日志；
-- running：发起异步取消并销毁沙盒，最终任务保留为 `failed`，日志保留；
+- **queued / running：取消**。终态是 `cancelled`，**记录与日志都保留**（取消是
+  历史的一部分，不再"删掉就当没发生"）；running 的任务会异步取消并销毁沙盒；
+- **completed / failed / cancelled：删除**记录与对应日志（这才是真正的"删除"）；
 - `deleted` 表示本次请求处理的 ID 数量，不应被用来证明每个 ID 原来都存在。
+
+### 取消单个条目（任务或 acquire 会话）
+
+```http
+DELETE /tasks/<id>?kind=task|acquire
+Content-Type: application/json
+```
+
+```bash
+# 取消一个还在排队的命令任务
+curl --noproxy '*' -sS -X DELETE "$WORKER/tasks/7c65d5ac21f4?kind=task"
+
+# 取消一个 acquire 会话：还没拿到卡就摘出队列，已经拿到卡就就地释放
+curl --noproxy '*' -sS -X DELETE \
+  -H 'Content-Type: application/json' \
+  -d '{"host_pid": 12345}' \
+  "$WORKER/tasks/9f0a1b2c3d4e?kind=acquire"
+```
+
+`kind` 缺省为 `task`。响应 `{"status": ...}`：
+
+| status | 含义 |
+|---|---|
+| `cancelled` | 排队中的条目被摘出队列（任务留痕 `cancelled`；会话账本写 `cancelled`），永远不会被执行 |
+| `cancelling` | 运行中的任务已发取消信号，终态由执行体落成 `cancelled` |
+| `released` | acquire 已经拿到卡：**在同一个调用里**完成释放（归还借出的进程、收掉长出来的进程与容器、还卡），响应里带 `sandbox_name` |
+| `deleted` | 该任务已经是终态，按"删除"处理（记录与日志删除） |
+
+id 既不在队列里也不在运行中 → `404`；`kind` 不是 task/acquire 或 `host_pid`
+不是整数 → `400`。重复取消天然幂等（第二次得到 404）。
+
+`host_pid` 只有 acquire 用得上，而且只在"已经拿到卡"时起作用：调用方可能是被借
+出去的 shell 的**子进程**（`neubox acquire` 阻塞期间按下 Ctrl-C 的 neubox 就是
+这样，cgroup 成员身份随 fork 继承），Worker 会先把它搬回父进程的 origin 再销毁
+沙盒 —— 否则它会被这次释放的 `cgroup.kill` 一起带走。
 
 ## 队列行为
 
@@ -423,7 +478,7 @@ GET /healthz
   "role": "worker",
   "api_version": 2,
   "version": "0.5.0",
-  "schema_version": 6
+  "schema_version": 7
 }
 ```
 
@@ -570,8 +625,27 @@ POST /sandbox/release
 ```
 
 `release` 只接收沙盒名，销毁整个沙盒：归还 acquire 借出去的那个终端、收掉沙盒
-里长出来的进程，并收掉挂靠的容器（撤登记 → `docker rm -f` → 等容器真的退出 →
-放 pin）。是否涉及容器由 Worker 在内部判断，调用方不需要报容器。
+里长出来的进程，并**停掉**挂靠的容器（撤登记 → `docker stop` → 等容器真的退出 →
+放 pin）。**只停不删** —— 删容器会连可写层一起销毁，用户可能还要 commit / cp
+出来；容器留着，下次 `docker start` 重新走 hook，登记被拒就起不来。是否涉及容器
+由 Worker 在内部判断，调用方不需要报容器。
+
+acquire 会话在 Worker 侧有一份**账本**（`sessions` 表）：`queued` → `allocating`
+→ `active` → `released`，旁路 `cancelled`（客户端取消 / 停机维护批量取消）与
+`failed`（校验或 join 失败，`code` 说明原因）。中间态照记，但**运行时逻辑不依赖
+它** —— 调度看的是内存队列与沙盒的实际状态；进程异常退出后只做"修表"：把没有
+终态的行标成 `interrupted`（不重建请求、不重跑校验），而 `active` 且沙盒仍在的
+会话保持原样并在启动时重新装载为"运行中的 acquire"。账本可以用
+`GET /tasks?kind=acquire` 查询（含历史）。
+
+可选的 `host_pid` 是**调用方自己的 PID**（`{"sandbox_name":"…","host_pid":45678}`）：
+调用方可能是被借出去的那个 shell 的**子进程**（`neubox release` 就是这样，
+cgroup 成员身份随 fork 继承），而销毁的最后一步是 `cgroup.kill` —— 不先把它
+搬出去，它会跟着自己这次 release 一起被杀（表现为 `zsh: killed`、退出码 137）。
+给了 `host_pid` 时 Worker 会在销毁前把它搬回**它父进程的 origin**（也就是被借
+进程原来的 cgroup），只搬它自己：它的子树与"沙盒里长出来的进程"照旧随沙盒
+一起收掉。搬不动（不在本沙盒、父进程没有 origin）不算错误，不影响 release
+本身的语义。
 
 ### 加入已有沙盒
 
@@ -637,7 +711,8 @@ HTTP `201`：
 `"status":"already_registered"`，不会重复写入。登记必须发生在容器里第一个 NPU
 进程之前 —— 驱动在第一次初始化时按当时权限建 UDA 设备表并按 mount namespace
 缓存复用，登记晚了会建出一张空表且事后无法修复。注销不设端点：容器退出由 Worker
-的 pidfd 监听即时发现，沙盒销毁时也会一并收掉它名下的容器。
+的 pidfd 监听即时发现，沙盒销毁时也会一并停掉它名下的容器（不删，可写层留给
+用户；见 [`isolation.md`](isolation.md)）。
 
 错误响应：
 

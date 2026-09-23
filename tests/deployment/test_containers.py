@@ -345,9 +345,18 @@ def test_docker_task_opens_only_its_reserved_devices(container, container_image)
     with container.sandbox(
         container.acquire_payload(terminal.pid, device_ids=[bystander]),
     ):
+        # 两个坑叠在一起，都踩过：
+        # 1) docker 目标任务的 `command` 会被 shlex 拆成 argv（docker-py 的
+        #    ContainerConfig 走 split_command），所以多语句必须写成
+        #    `sh -c '...'`；直接写脚本会被拆成 `["out=$(", "(", …]` 去 exec，
+        #    runtime 报 `exec: "out=$(": executable file not found`。
+        # 2) 探测要在**子 shell** 里 open、只看退出码：非交互 sh 遇到重定向失败
+        #    会退出整个脚本（`if : <node` 也救不了），那样"被拒绝"就表现成任务
+        #    失败，而不是一个可断言的结论。只看退出码、不认消息文本 —— 镜像里的
+        #    libc 消息目录不一定完整（与 container_probe_command 同一套判据）。
         probes = "; ".join(
-            f"if : <{nodes[minor]}; then echo SBX_OPEN_OK_{minor}; "
-            f"else echo SBX_OPEN_DENIED_{minor}; fi"
+            f"out=$( ( exec 3<{nodes[minor]} ) 2>&1 ); rc=$?; "
+            f"echo SBX_PROBE_{minor}=$rc"
             for minor in (first, second, bystander)
         )
         task_id = container.submit(
@@ -368,13 +377,15 @@ def test_docker_task_opens_only_its_reserved_devices(container, container_image)
 
         text = container.task_log_text(task_id)
         for minor in (first, second):
-            assert f"SBX_OPEN_OK_{minor}" in text, (
+            assert f"SBX_PROBE_{minor}=0" in text, (
                 f"容器里打不开自己申请的卡 {minor}（{nodes[minor]}）—— 登记在、"
                 f"BPF 授权没生效:\n{text[:2000]}"
             )
-        assert f"SBX_OPEN_DENIED_{bystander}" in text, (
-            f"容器里打开了别的沙盒预留的卡 {bystander}（{nodes[bystander]}）——"
-            f"设备隔离没有覆盖到 docker 任务:\n{text[:2000]}"
+        assert f"SBX_PROBE_{bystander}=1" in text, (
+            f"别的沙盒预留的卡 {bystander}（{nodes[bystander]}）在容器里的探测结果"
+            f"不是被拒绝（退出码 1 = 权限类错误）：退出码 0 说明容器越权打开了"
+            f"这张卡（设备隔离没覆盖 docker 任务），124 是超时，2 是非权限类错误"
+            f"（例如驱动没初始化，无从判断）:\n{text[:2000]}"
         )
 
     container.wait_idle_at_least(baseline)

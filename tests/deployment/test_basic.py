@@ -376,7 +376,12 @@ def test_delete_completed_task_and_log(basic):
 
 
 def test_delete_queued_task_never_runs(single_card):
-    """15 · 排队任务删除后不执行（1 卡）。"""
+    """15 · 排队任务取消后不执行，且**留痕**（记录保留为 cancelled）。
+
+    以前取消排队任务是"删记录 + 删日志"（之后查不到），现在统一成"取消"语义：
+    记录与日志都留着、终态是 ``cancelled``，跟 acquire 会话的取消一致 —— 历史
+    可见，也不再出现"这条任务到底跑没跑过"的疑问。
+    """
     baseline = single_card.idle_devices()
     device = single_card.idle_minors()[0]
 
@@ -395,8 +400,12 @@ def test_delete_queued_task_never_runs(single_card):
     assert result.status == 200, result.text
     assert result.value("deleted") == 1, result.text
 
-    assert single_card.client.task(queued).status == 404, "排队任务删除后仍可查询"
-    assert marker not in single_card.task_log_text(queued), "已删除的排队任务仍被执行"
+    cancelled = single_card.get_task(queued)
+    assert cancelled["status"] == "cancelled", (
+        f"排队任务取消后的状态应为 cancelled，实际为 {cancelled['status']}"
+    )
+    assert "取消" in (cancelled["result"].get("error") or ""), cancelled["result"]
+    assert marker not in single_card.task_log_text(queued), "已取消的排队任务仍被执行"
 
     single_card.client.delete_tasks([blocker])
     single_card.wait_task(blocker)  # 取消是异步的，等它落到终态

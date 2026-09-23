@@ -319,9 +319,10 @@ def release():
     请求体: { "sandbox_name": "sbx_pengyt_12345.slice" }
 
     "还一个、收其余" 指：归还 acquire 借出去的那个终端（join 时记了
-    origin），收掉沙盒里长出来的进程，收掉挂靠的容器（撤登记 →
-    ``docker rm -f`` → 等它真的退出 → 放 pin）。是否涉及容器在内部判断，
-    客户端只需要报沙盒名。
+    origin），收掉沙盒里长出来的进程，停掉挂靠的容器（撤登记 →
+    ``docker stop`` → 等它真的退出 → 放 pin；**只停不删**，可写层留给用户，
+    理由见 ``docs/isolation.md``）。是否涉及容器在内部判断，客户端只需要报
+    沙盒名。
     """
     body = request.get_json(silent=True) or {}
     sandbox_name = (body.get('sandbox_name') or '').strip()
@@ -330,6 +331,19 @@ def release():
         return {'error': 'sandbox_name 为必填参数'}, 400
 
     sbx = SbxManager.get_instance()
+
+    # 调用方可以报自己的 host PID：销毁的最后一步是 cgroup.kill，而调用方可能
+    # 就住在沙盒 cgroup 里 —— `neubox release` 是被借的 shell fork 出来的子
+    # 进程，cgroup 成员身份随 fork 继承，不先搬出去就会被自己这次销毁带走
+    # （用户看到 `zsh: killed`、退出码 137）。搬不动不算错误：调用方不在沙盒
+    # 里时本来就无事可做。
+    host_pid = body.get('host_pid')
+    if host_pid is not None:
+        try:
+            caller_pid = int(host_pid)
+        except (TypeError, ValueError):
+            return {'error': 'host_pid 必须是整数'}, 400
+        sbx.evacuate_caller(sandbox_name, caller_pid)
 
     # acquire 属于 TaskQueue 的长期 running 生命周期。通过队列释放可确保
     # pause/maintenance 在 destroy 完成前仍能看到该 sandbox；命令任务或

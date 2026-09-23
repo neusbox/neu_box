@@ -80,13 +80,16 @@ def test_reaper_keeps_live_child_then_reclaims(reaper_ready):
         )
 
 
-def test_release_reclaims_registered_container(
+def test_release_stops_registered_container(
         reaper_ready, single_card, container_image):
-    """42 · 销毁沙盒时容器被一并回收（release 后看容器）。
+    """42 · 销毁沙盒时容器被一并停掉（release 后看容器）。
 
     容器不住在沙盒 cgroup 里，所以 ``release`` 不能只 kill 一遍 cgroup 就完
-    事 —— 它必须把名下登记过的容器真的删掉，否则容器会带着已撤销的授权继续
+    事 —— 它必须把名下登记过的容器真的停下，否则容器会带着已撤销的授权继续
     跑（表现成"驱动装了没生效"），而卡已经被放回空闲池。
+
+    **只停不删**：删容器会连它的可写层一起销毁，用户可能还要 commit / cp 出
+    产物；进程一没，那个 mnt ns 就死了，驱动按它缓存的 UDA 表也就没人能用。
 
     这一步要 dockerd + runtime，所以额外要容器组的 fixture；manifest 给这一行写
     的前置只有"1 卡"，实际还差一个容器运行时。
@@ -113,7 +116,7 @@ def test_release_reclaims_registered_container(
         )
         assert released.status == 200, released.text
 
-        single_card.wait_container_removed(reference)
+        single_card.wait_container_stopped(reference)
         assert single_card.sandbox_of_container(container_id).json().get(
             "sandbox_name") is None, (
             f"沙盒释放后容器 {container_id} 仍然有登记记录"

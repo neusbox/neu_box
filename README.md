@@ -248,6 +248,7 @@ thirds/               WebUI 与 Go Client 的兼容性 submodule
 | [Worker 测试](docs/testing.md) | 单元、集成、native 与发布前测试 |
 | [Worker HTTP API](docs/worker-api.md) | API v2 契约、任务、日志和终端沙盒 |
 | [容器归属登记](docs/container-registration.md) | `/container/register` 的 Worker 侧流程、锁序与失败语义（runtime 侧见 neu_box_runtime） |
+| [设备隔离原理](docs/isolation.md) | 预留表 / mnt ns 委托 / 驱动 UDA 表三层怎么合起来保证隔离，以及 release、exec、stop→start 各条路径的结论 |
 | [数据库迁移手册](docs/database-migrations.md) | Schema 版本、迁移开发与部署检查 |
 
 ## 版本与发布

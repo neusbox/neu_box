@@ -17,7 +17,11 @@ test`` 与 ``tests/deployment/run.py`` 都会设置）时才收集。
 
 from __future__ import annotations
 
+import functools
 import os
+import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -46,9 +50,58 @@ _FILE_ORDER = (
     "test_multi_device.py",   # 3. 多卡
     "test_scheduling.py",     # 4. 调度与优先级
     "test_containers.py",     # 5. 容器 / OCI runtime
-    "test_reaper.py",         # 6. 收尸：每条都要跨收尸周期
-    "test_maintenance.py",    # 7. 停机维护：停/起服，必须最后
+    "test_client.py",         # 6. client(neubox) 基本路径：前置软缺失，没装就跳过
+    "test_client_docker.py",  # 7. client 的容器路径：docker run / stop / start / release
+    "test_driver_isolation.py",  # 8. 驱动侧隔离：读 /proc/uda 验 UDA 表
+    "test_reaper.py",         # 9. 收尸：每条都要跨收尸周期
+    "test_maintenance.py",    # 10. 停机维护：停/起服，必须最后
 )
+
+# client 组要求的最低 neubox 版本。
+#
+# 0.3.0 起有 `cancel` 与 release 的 `host_pid`；0.3.1 起 SIGINT 的 handler 在
+# **第一次请求之前**就装好 —— 之前它只在轮询开始时装，`neubox acquire` 刚发出
+# 请求、还没开始轮询的窗口里按 Ctrl-C 会走 Go 的默认动作被信号打死（退出码 -2，
+# 既不取消也不按 130 退），用例 66 会间歇性失败。
+MIN_NEUBOX_VERSION = (0, 3, 1)
+
+
+def client_binary() -> str:
+    """neubox 二进制的路径；没装返回空串。"""
+    override = os.environ.get("NEU_BOX_CLIENT_BIN", "").strip()
+    if override:
+        return override if os.path.exists(override) else ""
+    return shutil.which("neubox") or ""
+
+
+@functools.lru_cache(maxsize=4)
+def neubox_version(path: str) -> tuple[int, ...] | None:
+    """跑 ``neubox version`` 解析出元组版本号；解析不了返回 None。"""
+    try:
+        result = subprocess.run(
+            [path, "version"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def describe_neubox() -> str:
+    """报告头里的那一行 —— 明确区分"跑了"和"跳过了"。"""
+    path = client_binary()
+    if not path:
+        return "neubox:       (未安装 → client 组会跳过)"
+    version = neubox_version(path)
+    if version is None:
+        return f"neubox:       {path} (version 输出无法解析)"
+    rendered = ".".join(str(part) for part in version)
+    required = ".".join(str(part) for part in MIN_NEUBOX_VERSION)
+    if version < MIN_NEUBOX_VERSION:
+        return f"neubox:       {path} ({rendered} < 要求 {required})"
+    return f"neubox:       {path} ({rendered})"
 
 
 def pytest_addoption(parser) -> None:
@@ -111,6 +164,7 @@ def pytest_report_header(config) -> list[str]:
         lines.append(f"收尸周期:     {interval:.0f}s")
     except Exception:  # 读不到就只少一行，不影响验收本身
         pass
+    lines.append(describe_neubox())
     return lines
 
 
@@ -324,3 +378,38 @@ def reaper_ready(deployment: Deployment, single_card: Deployment) -> Deployment:
             pytrace=False,
         )
     return deployment
+
+
+@pytest.fixture(scope="session")
+def neubox_bin(deployment: Deployment) -> str:
+    """client(neubox) 组的前置：二进制存在**且版本达标**。
+
+    这是本层唯一允许"缺前置就跳过"的组：neubox 是另一个仓库的产物，worker 的
+    发布流程不该因为部署机上没装它而失败（跳过原因会打印在报告头与 ``-ra`` 摘要
+    里，避免"一直跳过却没人发现"）。
+
+    但"装了却版本不够"按**失败**处理：这个版本没有 ``cancel`` / release
+    ``host_pid`` 等本次新增的行为，跑下去只会得到一堆看不懂的失败 —— 装作能用
+    比没装更危险。
+    """
+    path = client_binary()
+    if not path:
+        pytest.skip(
+            "neubox 不存在：跳过 client 组（安装 neubox，或用 NEU_BOX_CLIENT_BIN "
+            "指定二进制路径后重跑）"
+        )
+    version = neubox_version(path)
+    if version is None:
+        pytest.fail(
+            f"neubox {path} 的 version 子命令不可用或输出无法解析",
+            pytrace=False,
+        )
+    if version < MIN_NEUBOX_VERSION:
+        pytest.fail(
+            f"neubox {path} 是 {'.'.join(map(str, version))}，低于要求的 "
+            f"{'.'.join(map(str, MIN_NEUBOX_VERSION))}：client 组需要 cancel 与 "
+            f"release host_pid 等新行为，请升级 neubox（或设 NEU_BOX_CLIENT_BIN "
+            f"指向新版）",
+            pytrace=False,
+        )
+    return path

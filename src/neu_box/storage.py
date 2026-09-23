@@ -59,6 +59,11 @@ REQUIRED_COLUMNS = {
         "init_host_pid", "init_start_time", "sandbox_name", "state",
         "created_at",
     ),
+    "sessions": (
+        "request_id", "owner", "pid", "device_num", "device_ids", "priority",
+        "state", "sandbox_name", "devices", "code", "requested_at",
+        "acquired_at", "finished_at",
+    ),
 }
 REQUIRED_INDEXES = (
     "idx_tasks_user",
@@ -66,9 +71,23 @@ REQUIRED_INDEXES = (
     "idx_tasks_created",
     "idx_tasks_priority",
     "idx_containers_sandbox",
+    "idx_sessions_state",
+    "idx_sessions_sandbox",
 )
 CONTAINER_ACTIVE = "ACTIVE"
 CONTAINER_DESTROYING = "DESTROYING"
+
+# acquire 会话的状态。终态只有下面四个；queued/allocating/active 是"在途"。
+SESSION_QUEUED = "queued"
+SESSION_ALLOCATING = "allocating"
+SESSION_ACTIVE = "active"
+SESSION_RELEASED = "released"
+SESSION_CANCELLED = "cancelled"
+SESSION_FAILED = "failed"
+SESSION_INTERRUPTED = "interrupted"
+SESSION_TERMINAL_STATES = (
+    SESSION_RELEASED, SESSION_CANCELLED, SESSION_FAILED, SESSION_INTERRUPTED,
+)
 
 
 def database_path() -> str:
@@ -194,10 +213,11 @@ class Database:
         return [self._row_to_dict(r) for r in rows]
 
     def get_recent_tasks(self, limit: int = 100) -> list[dict]:
-        """返回最近完成的任务列表。"""
+        """返回最近结束的任务列表（含被取消的）。"""
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status IN ('completed','failed') "
+            "SELECT * FROM tasks "
+            "WHERE status IN ('completed','failed','cancelled') "
             "ORDER BY finished_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
@@ -215,7 +235,7 @@ class Database:
         conn.execute(
             "DELETE FROM tasks WHERE task_id IN ("
             "  SELECT task_id FROM tasks "
-            "  WHERE status IN ('completed','failed') "
+            "  WHERE status IN ('completed','failed','cancelled') "
             "  ORDER BY finished_at DESC "
             "  LIMIT -1 OFFSET ?"
             ")", (keep,))
@@ -316,6 +336,128 @@ class Database:
         conn = self._get_conn()
         conn.execute('DELETE FROM sandboxes WHERE name=?', (name,))
         conn.commit()
+
+    # ── acquire 会话账本 ───────────────────────────────────────────
+    # 状态推进只写"变了的列"，天然幂等（最后一次写覆盖前面的）。
+
+    def insert_session(self, request_id: str, owner: str, pid: int,
+                       *, device_num: int = 0, device_ids: list | None = None,
+                       priority: int = 0, requested_at: float | None = None):
+        if not isinstance(priority, int) or isinstance(priority, bool) \
+                or not 0 <= priority <= 1:
+            raise ValueError(
+                f'priority 只能是 0（普通）或 1（赶论文）: {priority!r}')
+        conn = self._get_conn()
+        conn.execute(
+            'INSERT OR REPLACE INTO sessions (request_id, owner, pid, '
+            'device_num, device_ids, priority, state, sandbox_name, devices, '
+            'code, requested_at, acquired_at, finished_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, NULL, NULL)',
+            (request_id, owner, int(pid), int(device_num),
+             json.dumps([str(item) for item in (device_ids or [])]),
+             int(priority), SESSION_QUEUED, json.dumps([]),
+             float(requested_at if requested_at is not None else time.time())))
+        conn.commit()
+
+    def update_session_state(self, request_id: str, state: str, *,
+                             sandbox_name: str | None = None,
+                             devices: list | None = None,
+                             code: str | None = None,
+                             acquired_at: float | None = None,
+                             finished_at: float | None = None) -> bool:
+        """推进会话状态；只更新显式给出的列，返回是否命中行。"""
+        if state not in (
+                SESSION_QUEUED, SESSION_ALLOCATING, SESSION_ACTIVE,
+                SESSION_RELEASED, SESSION_CANCELLED, SESSION_FAILED,
+                SESSION_INTERRUPTED):
+            raise ValueError(f'未知的会话状态: {state!r}')
+        assignments = ['state=?']
+        values: list = [state]
+        if sandbox_name is not None:
+            assignments.append('sandbox_name=?')
+            values.append(str(sandbox_name))
+        if devices is not None:
+            assignments.append('devices=?')
+            values.append(json.dumps([str(item) for item in devices]))
+        if code is not None:
+            assignments.append('code=?')
+            values.append(str(code))
+        if acquired_at is not None:
+            assignments.append('acquired_at=?')
+            values.append(float(acquired_at))
+        if finished_at is not None:
+            assignments.append('finished_at=?')
+            values.append(float(finished_at))
+        values.append(request_id)
+        conn = self._get_conn()
+        cursor = conn.execute(
+            f'UPDATE sessions SET {", ".join(assignments)} WHERE request_id=?',
+            values,
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+    def get_session(self, request_id: str) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            'SELECT * FROM sessions WHERE request_id=?', (request_id,)).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def list_active_sessions(self) -> list[dict]:
+        """在途会话（排队 / 建沙盒 / 已借出），按调度顺序。"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            'SELECT * FROM sessions WHERE state IN (?, ?, ?) '
+            'ORDER BY CASE state WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, '
+            'priority DESC, requested_at ASC, request_id ASC',
+            (SESSION_QUEUED, SESSION_ALLOCATING, SESSION_ACTIVE,
+             SESSION_ACTIVE, SESSION_ALLOCATING),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_recent_sessions(self, limit: int = 30) -> list[dict]:
+        """最近的终态会话，按收尾时间倒序。"""
+        conn = self._get_conn()
+        placeholders = ', '.join('?' for _ in SESSION_TERMINAL_STATES)
+        rows = conn.execute(
+            f'SELECT * FROM sessions WHERE state IN ({placeholders}) '
+            f'ORDER BY finished_at DESC LIMIT ?',
+            (*SESSION_TERMINAL_STATES, int(limit)),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def close_interrupted_sessions(self) -> int:
+        """把没有收尾的会话行标成 interrupted；返回影响行数。
+
+        只做"修表"，不碰运行时：进程崩溃/重启后，排队中的请求本来就不存在了
+        （pending 是内存态），而 state=active 且沙盒**还在**的会话是真活着的，
+        保持原样 —— 那种情况由调用方按沙盒重建运行时的记账。
+        """
+        conn = self._get_conn()
+        cursor = conn.execute(
+            'UPDATE sessions SET state=?, finished_at=? '
+            'WHERE state IN (?, ?) '
+            '   OR (state=? AND (sandbox_name IS NULL OR sandbox_name NOT IN '
+            '       (SELECT name FROM sandboxes)))',
+            (SESSION_INTERRUPTED, time.time(),
+             SESSION_QUEUED, SESSION_ALLOCATING, SESSION_ACTIVE),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    def cleanup_old_sessions(self, keep: int = 200) -> int:
+        """只保留最近 ``keep`` 条终态会话。"""
+        placeholders = ', '.join('?' for _ in SESSION_TERMINAL_STATES)
+        conn = self._get_conn()
+        cursor = conn.execute(
+            f'DELETE FROM sessions WHERE state IN ({placeholders}) AND '
+            f'request_id NOT IN (SELECT request_id FROM sessions '
+            f'WHERE state IN ({placeholders}) '
+            f'ORDER BY finished_at DESC LIMIT ?)',
+            (*SESSION_TERMINAL_STATES, *SESSION_TERMINAL_STATES, int(keep)),
+        )
+        conn.commit()
+        return cursor.rowcount
 
     def get_sandbox(self, name: str) -> dict | None:
         conn = self._get_conn()

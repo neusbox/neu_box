@@ -17,6 +17,8 @@ def _queue():
     """绕开 __init__（它要连 DB / 跑恢复），只搭出队列结构。"""
     queue = TaskQueue.__new__(TaskQueue)
     queue._lock = threading.RLock()
+    queue._round_lock = threading.Lock()
+    queue._dispatching = 0
     queue._queues = {1: {}, 0: {}}
     return queue
 
@@ -155,7 +157,9 @@ def test_consume_loop_lets_spawned_coroutines_run():
         queue._running_flag = False
         return None
 
-    async def dispatch(kind, identifier):
+    def dispatch(kind, identifier):
+        # `_dispatch` 现在是同步函数（回合锁内跑完），create_task 只是把协程放进
+        # 循环 —— 所以"让权"这件事仍然必须由主循环负责。
         task = asyncio.create_task(work())
         queue._active.add(task)
         task.add_done_callback(queue._active.discard)
@@ -165,3 +169,28 @@ def test_consume_loop_lets_spawned_coroutines_run():
 
     asyncio.run(queue._consume_loop())
     assert ran == ['ran'], '主循环没让权，派发出去的协程没跑'
+
+
+def test_acquire_row_sorts_by_requested_at():
+    """统一队列的顺序：会话 DB 行的 ``requested_at`` 要当成提交时间。
+
+    ``sessions`` 表的列名是 ``requested_at``，而内存里的 ``AcquireRequest``
+    只有 ``created_at``。只认后者时，统一视图里那条 acquire 会按 0.0 排到所有
+    任务前面，``position``/``eta`` 从第一条就错（真机用例 80 的回归）。
+    """
+    from neu_box.scheduling import entries
+
+    session_row = {
+        'request_id': 'a1', 'owner': 'root', 'priority': 0,
+        'requested_at': 200.0, 'state': 'queued',
+    }
+    task_row = {'task_id': 't1', 'priority': 0, 'created_at': 100.0}
+
+    assert entries.created_at(session_row) == 200.0, (
+        '会话行的时间没有从 requested_at 取到'
+    )
+    ordered = sorted([session_row, task_row], key=entries.sort_key)
+    assert entries.identifier(ordered[0]) == 't1', (
+        f'先提交的 task 应当排在前面，实际顺序：'
+        f'{[entries.identifier(item) for item in ordered]}'
+    )

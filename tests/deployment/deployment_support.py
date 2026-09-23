@@ -191,6 +191,24 @@ class WorkerClient:
     def list_tasks(self) -> HttpResult:
         return self.get("/tasks")
 
+    def cancel_entry(self, identifier: str, *, kind: str = "task",
+                     host_pid: int | None = None) -> HttpResult:
+        """统一取消入口：``DELETE /tasks/<id>?kind=``。
+
+        acquire 已经拿到卡时，``host_pid`` 是调用方自报的 PID（Worker 会先把它搬出
+        沙盒 cgroup，否则它会被自己这次释放带走）。
+        """
+        payload = {"host_pid": int(host_pid)} if host_pid is not None else {}
+        path = f"/tasks/{urllib.parse.quote(identifier)}?kind={kind}"
+        return self.delete(path, payload)
+
+    def list_tasks_view(self, *, kind: str | None = None,
+                        state: str | None = None) -> HttpResult:
+        """统一队列视图；``kind``/``state`` 为空时不带过滤条件。"""
+        params = {key: value for key, value in
+                  (("kind", kind), ("state", state)) if value}
+        return self.get("/tasks", params=params or None)
+
     def task(self, task_id: str) -> HttpResult:
         return self.get(f"/tasks/{task_id}")
 
@@ -210,8 +228,17 @@ class WorkerClient:
         return self.get(f"/sandbox/acquire/{request_id}")
 
     def release(self, sandbox_name: str, **kwargs) -> HttpResult:
-        """释放沙盒；销毁要收容器，可能比普通请求慢，允许调用方放宽超时。"""
-        return self.post("/sandbox/release", {"sandbox_name": sandbox_name}, **kwargs)
+        """释放沙盒；销毁要收容器，可能比普通请求慢，允许调用方放宽超时。
+
+        ``host_pid`` 用于"从沙盒内部发起 release"：调用方自己就是沙盒 cgroup
+        的成员（`neubox release` 是被借的 shell fork 出来的），报上 PID 之后
+        Worker 会先把它搬出去，否则它会跟着自己这次销毁一起被杀。
+        """
+        payload = {"sandbox_name": sandbox_name}
+        host_pid = kwargs.pop("host_pid", None)
+        if host_pid is not None:
+            payload["host_pid"] = int(host_pid)
+        return self.post("/sandbox/release", payload, **kwargs)
 
     def dev_list(self, username: str | None = None) -> HttpResult:
         params = {"username": username} if username else None
@@ -478,14 +505,17 @@ class Deployment:
             )
         return result.json()
 
+    # 任务的终态：`cancelled` 是本次新增的独立终态（取消不再混进 failed）。
+    TASK_TERMINAL_STATES = ("completed", "failed", "cancelled")
+
     def wait_task(self, task_id: str, *, timeout: float | None = None) -> dict:
-        """等任务进入终态（completed / failed）并返回它的完整表示。"""
+        """等任务进入终态（completed / failed / cancelled）并返回它的完整表示。"""
         deadline = time.time() + (timeout or self.task_timeout)
         state = ""
         while time.time() < deadline:
             task = self.get_task(task_id)
             state = task.get("status", "")
-            if state in {"completed", "failed"}:
+            if state in set(self.TASK_TERMINAL_STATES):
                 return task
             time.sleep(self.poll)
         pytest.fail(
@@ -503,7 +533,7 @@ class Deployment:
             state = task.get("status", "")
             if state == "running":
                 return task
-            if state in {"completed", "failed"}:
+            if state in set(self.TASK_TERMINAL_STATES):
                 pytest.fail(
                     f"任务 {task_id} 在观察到 running 之前就结束了（状态 {state}）；"
                     f"日志:\n{self.task_log_text(task_id)[:2000]}",
@@ -550,13 +580,17 @@ class Deployment:
             command += f"; rc=$?; sleep {hold}; exit $rc"
         return command
 
-    def queue(self) -> list[dict]:
-        """``GET /tasks`` 的快照：running → queued → **最近完成的**。
+    def queue(self, *, kind: str | None = None,
+              state: str | None = None) -> list[dict]:
+        """``GET /tasks`` 的**统一视图**：running/active → 排队中 → 最近结束的。
 
-        注意最后一段：最近完成的任务仍然带着它们的 ``devices``，判断"谁在占用
-        卡"时要按 ``status`` 过滤，别把它们算进去。
+        两类条目都在里面，靠 ``kind``（``task``/``acquire``）区分；``kind``/
+        ``state`` 过滤走服务端参数。
+
+        注意最后一段：最近结束的条目仍然带着它们的 ``devices``，判断"谁在占用卡"
+        时要按 ``status`` 过滤，别把它们算进去。
         """
-        result = self.client.list_tasks()
+        result = self.client.list_tasks_view(kind=kind, state=state)
         if result.status != 200:
             pytest.fail(
                 f"GET /tasks 失败（HTTP {result.status}）: {result.text[:1000]}",
@@ -567,6 +601,14 @@ class Deployment:
     def queue_entry(self, task_id: str) -> dict | None:
         for entry in self.queue():
             if entry.get("task_id") == task_id:
+                return entry
+        return None
+
+    def queue_item(self, identifier: str, *,
+                   kind: str | None = None) -> dict | None:
+        """在统一视图里按 id 找条目（任务的 task_id / 会话的 request_id）。"""
+        for entry in self.queue(kind=kind):
+            if entry.get("id") == identifier or entry.get("task_id") == identifier:
                 return entry
         return None
 
@@ -806,6 +848,16 @@ class Deployment:
             pytrace=False,
         )
 
+    def track_sandbox(self, sandbox_name: str) -> None:
+        """把"别处建出来的沙盒"登记进收尾清单。
+
+        ``neubox acquire`` / ``neubox docker run`` 走的 CLI 不经过
+        ``acquire_sandbox``，不登记的话用例中途失败时这个沙盒会漏在场上占着卡
+        （acquire 出来的沙盒不会被收尸器兜底）—— 那正是收尾机制要避免的事。
+        """
+        if sandbox_name:
+            self.created_sandboxes.append(sandbox_name)
+
     def release_sandbox(self, sandbox_name: str) -> HttpResult:
         result = self.client.release(sandbox_name)
         if result.status == 200 and sandbox_name in self.created_sandboxes:
@@ -915,6 +967,38 @@ class Deployment:
 
     # ── 本机进程 ────────────────────────────────────────────────
 
+    def sandbox_shell(self, seconds: int = 1800) -> "SandboxShell":
+        """起一个"被借进沙盒之后还能跑命令"的 shell。
+
+        `neubox docker run` 是按**自己 PID 的 cgroup** 反查沙盒的（
+        `GET /sandbox/status?pid=`），所以它必须在沙盒里跑 —— 而被 acquire 借出去
+        的进程本身不能执行命令。这里让 bash 等一个放行文件，收到之后执行我们写的
+        脚本：脚本是那个进程的子进程，cgroup 成员身份随 fork 继承，于是它就在
+        沙盒里。
+
+        用法：先 `acquire_payload(shell.pid, ...)` 把 shell 借进沙盒，再
+        `shell.run("neubox docker run ...")`。
+        """
+        tag = f"sbxshell-{secrets.token_hex(4)}"
+        script = os.path.join(self.tempdir, f"{tag}.sh")
+        gate = os.path.join(self.tempdir, f"{tag}.go")
+        output = os.path.join(self.tempdir, f"{tag}.out")
+        rc_file = os.path.join(self.tempdir, f"{tag}.rc")
+        for path in (gate, output, rc_file):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        process = self.spawn(
+            ["bash", "-c",
+             f"while [ ! -e {shlex.quote(gate)} ]; do sleep 0.2; done; "
+             f"bash {shlex.quote(script)} > {shlex.quote(output)} 2>&1; "
+             f"echo $? > {shlex.quote(rc_file)}; "
+             f"sleep {int(seconds)}"],
+            user=self.user,
+        )
+        return SandboxShell(process, script, gate, output, rc_file)
+
     def spawn(self, argv: list[str], *, user: str | None = None,
               env: dict | None = None, cwd: str | None = None) -> subprocess.Popen:
         """起一个本机进程（默认就是测试用户身份）。"""
@@ -1023,12 +1107,15 @@ class Deployment:
         )
 
     def fork_child_in_place(self, seconds: int = 600,
-                            tag: str = "child") -> tuple[subprocess.Popen, int]:
-        """起一个"接到放行信号就 fork 一个子进程、然后等着"的进程。
+                            tag: str = "child",
+                            count: int = 1) -> tuple[subprocess.Popen, int]:
+        """起一个"接到放行信号就 fork ``count`` 个子进程、然后等着"的进程。
 
         返回 (父进程, 子进程 PID)。父进程被 kill 之后子进程留在同一个 cgroup
         里 —— Reaper 用例要的正是"父进程死了、子进程还活着"这个状态；fork 必
-        须发生在 acquire 之后，所以要用 :meth:`fork_now` 分两步走。
+        须发生在 acquire 之后，所以要用 :meth:`fork_now` / :meth:`fork_children`
+        分两步走。``count > 1`` 是给"release 时谁该被杀"那类用例用的：同一个
+        借出去的父进程下面挂几个"沙盒里长出来的"子进程。
         """
         gate = os.path.join(self.tempdir, f"{tag}.go")
         pid_file = os.path.join(self.tempdir, f"{tag}.pid")
@@ -1040,14 +1127,17 @@ class Deployment:
         process = self.spawn(
             ["bash", "-c",
              f"while [ ! -e {shlex.quote(gate)} ]; do sleep 0.2; done; "
-             f"setsid sleep {int(seconds)} & echo $! > {shlex.quote(pid_file)}; "
+             f"for _ in $(seq 1 {int(count)}); do "
+             f"setsid sleep {int(seconds)} & echo $! >> {shlex.quote(pid_file)}; "
+             f"done; "
              f"wait"],
             user=self.user,
         )
         return process, 0
 
-    def fork_now(self, tag: str = "child", timeout: float = 10.0) -> int:
-        """放行上一步的父进程，返回它 fork 出来的子进程 PID。"""
+    def fork_children(self, tag: str = "child", count: int = 1,
+                      timeout: float = 10.0) -> list[int]:
+        """放行上一步的父进程，按创建顺序返回它 fork 出来的子进程 PID。"""
         gate = os.path.join(self.tempdir, f"{tag}.go")
         pid_file = os.path.join(self.tempdir, f"{tag}.pid")
         with open(gate, "w", encoding="utf-8"):
@@ -1056,16 +1146,22 @@ class Deployment:
         while time.time() < deadline:
             try:
                 with open(pid_file, encoding="utf-8") as stream:
-                    child = int(stream.read().strip() or 0)
+                    children = [
+                        int(line) for line in stream.read().split() if line
+                    ]
             except (OSError, ValueError):
-                child = 0
-            if child > 0:
-                return child
+                children = []
+            if len(children) >= count:
+                return children[:count]
             time.sleep(0.1)
         pytest.fail(
             f"子进程没有在 {timeout:.0f}s 内写出 PID 文件 {pid_file}",
             pytrace=False,
         )
+
+    def fork_now(self, tag: str = "child", timeout: float = 10.0) -> int:
+        """放行上一步的父进程，返回它 fork 出来的第一个子进程 PID。"""
+        return self.fork_children(tag=tag, count=1, timeout=timeout)[0]
 
     def kill(self, pid: int) -> None:
         """杀掉本用例起的进程；已经没了就当成功。"""
@@ -1374,6 +1470,35 @@ class Deployment:
             pytrace=False,
         )
 
+    def wait_container_stopped(self, reference: str, timeout: float = 90.0) -> None:
+        """等容器**停下来**：容器还在（``docker inspect`` 成功），但不再 running。
+
+        释放沙盒只停容器、**不删**（删了可写层就没了，用户可能还要 commit /
+        cp 出来），所以判据是 ``State.Running == false``，不是"记录消失"。
+        容器整个不见了也算失败 —— 那条路正是我们不想再走的 ``docker rm``。
+        """
+        deadline = time.time() + timeout
+        state = "(还没查)"
+        while time.time() < deadline:
+            result = self.docker(
+                "inspect", "--format", "{{.State.Running}}", reference, timeout=30,
+            )
+            if result.returncode != 0:
+                pytest.fail(
+                    f"容器 {reference} 已经不存在了 —— 释放沙盒只该停容器、不该删"
+                    f"（可写层要留给用户）：{(result.stdout or '')[:500]}",
+                    pytrace=False,
+                )
+            state = (result.stdout or "").strip()
+            if state == "false":
+                return
+            time.sleep(self.poll)
+        pytest.fail(
+            f"容器 {reference} 在 {timeout:.0f}s 内没有停下来（State.Running="
+            f"{state!r}）；它还在跑就意味着授权没撤干净",
+            pytrace=False,
+        )
+
     def local_images(self) -> list[str]:
         """本机已有的镜像（``仓库:标签``）。"""
         result = self.docker(
@@ -1540,6 +1665,37 @@ def require_container_not_running(d: "Deployment", reference: str, *,
         )
 
 
+def neubox_cli(binary: str, *args: str, timeout: float = 120.0) -> str:
+    """跑一条**真 neubox** 命令，要求退出码 0，返回合并后的输出。
+
+    client 组（``test_client.py`` / ``test_client_docker.py``）共用：那两组验的
+    就是 CLI 自己的参数拼装、退出码与轮询逻辑，所以命令必须走真二进制，不能绕
+    到 HTTP 客户端上。
+    """
+    result = subprocess.run(
+        [binary, *args], capture_output=True, text=True, timeout=timeout,
+    )
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    if result.returncode != 0:
+        pytest.fail(
+            f"`neubox {' '.join(args)}` 退出码 {result.returncode}:\n{output}",
+            pytrace=False,
+        )
+    return output
+
+
+def neubox_sandbox_name(binary: str, *args: str, timeout: float = 180.0) -> str:
+    """跑一条会建沙盒的 ``neubox`` 命令，从输出里解析出沙盒名。"""
+    output = neubox_cli(binary, *args, timeout=timeout)
+    match = re.search(r"(sbx_\S+\.slice)", output)
+    if not match:
+        pytest.fail(
+            f"`neubox {' '.join(args)}` 的输出里没有沙盒名：\n{output}",
+            pytrace=False,
+        )
+    return match.group(1)
+
+
 def current_user() -> str:
     """当前进程的 Linux 用户名。"""
     try:
@@ -1554,6 +1710,51 @@ def user_exists(name: str) -> bool:
     except KeyError:
         return False
     return True
+
+
+class SandboxShell:
+    """被借进沙盒的 shell（见 :meth:`Deployment.sandbox_shell`）。
+
+    ``run()`` 把命令写进脚本、放行、等 rc 文件，返回 ``(rc, 输出)``。
+    """
+
+    def __init__(self, process: subprocess.Popen, script: str, gate: str,
+                 output: str, rc_file: str):
+        self.process = process
+        self._script = script
+        self._gate = gate
+        self._output = output
+        self._rc = rc_file
+
+    @property
+    def pid(self) -> int:
+        return self.process.pid
+
+    def run(self, command: str, *, timeout: float = 180.0) -> tuple[int, str]:
+        """在这个 shell（= 沙盒里）执行一条命令，返回 (退出码, 输出)。"""
+        with open(self._script, "w", encoding="utf-8") as stream:
+            stream.write("#!/bin/bash\nset -u\n" + command + "\n")
+        with open(self._gate, "w", encoding="utf-8"):
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with open(self._rc, encoding="utf-8") as stream:
+                    raw = stream.read().strip()
+            except OSError:
+                raw = ""
+            if raw:
+                try:
+                    text = open(self._output, encoding="utf-8",
+                                errors="replace").read()
+                except OSError:
+                    text = ""
+                return int(raw), text
+            time.sleep(0.1)
+        pytest.fail(
+            f"沙盒 shell 里的命令没有在 {timeout:.0f}s 内结束：{command[:200]}",
+            pytrace=False,
+        )
 
 
 def process_alive(pid: int) -> bool:

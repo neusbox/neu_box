@@ -35,3 +35,35 @@ class AcquireFailure(RuntimeError):
     def __init__(self, message: str, code: str = "sandbox_acquire_failed"):
         self.code = code
         super().__init__(message)
+
+
+def public(session: dict) -> dict:
+    """会话在统一队列视图里的对外表示（``kind='acquire'``）。
+
+    字段与任务的 ``public`` 尽量对齐（``id/status/user_id/priority/created_at/
+    started_at/finished_at/device_num/devices``），额外给 ``pid``/``sandbox_name``/
+    ``code``；它没有 ``command``、日志和 ``returncode`` —— 它不是命令任务，消费方
+    按 ``kind`` 分支渲染。
+
+    ``status`` 是会话状态（queued/allocating/active/released/cancelled/failed/
+    interrupted），不复用任务的 completed/failed 那套词。
+    """
+    return {
+        'kind': 'acquire',
+        'id': session.get('request_id'),
+        'request_id': session.get('request_id'),
+        'user_id': session.get('owner') or '',
+        'status': session.get('state') or '',
+        'pid': session.get('pid'),
+        'sandbox_name': session.get('sandbox_name'),
+        'device_num': session.get('device_num', 0) or 0,
+        'device_ids': session.get('device_ids') or [],
+        'devices': session.get('devices') or [],
+        'priority': session.get('priority', 0) or 0,
+        'code': session.get('code'),
+        'position': session.get('position', 0),
+        'eta': session.get('eta'),
+        'created_at': session.get('requested_at'),
+        'started_at': session.get('acquired_at'),
+        'finished_at': session.get('finished_at'),
+    }

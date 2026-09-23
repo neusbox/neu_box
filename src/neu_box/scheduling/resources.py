@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
+from neu_box.scheduling import entries
 from neu_box.runtime import devices
 from neu_box.runtime.sandbox import SbxManager
 from neu_box.storage import Database
@@ -47,16 +48,10 @@ def free_devices(allocated: Optional[set] = None) -> List[str]:
 def device_request(value) -> tuple[List[str], int]:
     """从条目里取出 ``(device_ids, device_num)``。
 
-    命令任务是 dict，acquire 是 ``AcquireRequest`` dataclass —— 调度器只关心
-    "要哪几张卡 / 要几张"，所以在这里把两种形状抹平，调用方不用管 kind。
+    形状的抹平在 :mod:`neu_box.scheduling.entries`（命令任务是 dict、acquire 是
+    dataclass，加第三类条目只改那里）；这里保留同名函数给既有的调用方。
     """
-    if isinstance(value, dict):
-        ids = value.get('device_ids') or []
-        num = value.get('device_num', 0) or 0
-    else:
-        ids = getattr(value, 'device_ids', None) or []
-        num = getattr(value, 'device_num', 0) or 0
-    return list(ids), int(num)
+    return entries.device_request(value)
 
 
 def is_schedulable(value, free: List[str]) -> bool:

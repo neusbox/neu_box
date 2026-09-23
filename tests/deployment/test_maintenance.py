@@ -1,4 +1,4 @@
-"""第 3 层 · 停机维护（manifest 17、18、36、41、43、54）。
+"""第 3 层 · 停机维护（manifest 17、18、36、41、43、54、81、82）。
 
 这一组全是**会动服务**的用例：`POST /maintenance/pause`、SIGTERM MainPID、
 `neuboxctl setup` 起服、停服窗口里的容器行为、以及重启时的对账。它们必须排在
@@ -22,9 +22,13 @@ import secrets
 import pytest
 
 from deployment_support import (
+    CONTAINER_OPEN_OK,
+    CONTAINER_PROBE_MARKER,
+    container_probe_command,
     process_alive,
     require_container_not_running,
     run_container,
+    wait_container_log_count,
 )
 
 
@@ -320,3 +324,120 @@ def test_pause_keeps_queued_task_until_setup(basic):
         f"{basic.task_log_text(queued)[:1000]}"
     )
     basic.wait_idle_at_least(baseline)
+
+
+@pytest.mark.deployment_restart
+def test_restart_fails_running_task_and_cleans_its_sandbox(single_card):
+    """81 · 崩溃重启：占卡的 running 任务标失败、任务沙盒被清、卡回池。
+
+    18 号用的是一条**不占卡**的任务，只验了"标 failed"；这里把占卡那条走完 ——
+    重启时那个任务的子进程可能还活在它的任务沙盒 cgroup 里，光把 DB 行标失败
+    等于让一张"账面空闲"的卡继续被人用（cgroup.kill 之前它不会真的回来）。
+
+    口径是"重启不原地恢复"：任务必须重新提交，等价于失败；它的沙盒是确定性的
+    （``sbx_<user>_<task_id>.slice``）且可丢弃，所以启动恢复要连着 cgroup 一起清。
+    """
+    single_card.require_service_control()
+    baseline = single_card.idle_devices()
+    device = single_card.require_idle(1)[0]
+
+    task_id = single_card.submit("sleep 600", device_ids=[device])
+    single_card.wait_task_running(task_id)
+    single_card.wait_idle_at_most(baseline - 1)
+
+    single_card.restart_worker()
+
+    task = single_card.wait_task(task_id)
+    assert task["status"] == "failed", (
+        f"重启前还在 running 的占卡任务，重启后应为 failed，实际 "
+        f"{task['status']}: {task.get('result')}"
+    )
+    assert "重启" in (task["result"].get("error") or ""), (
+        f"失败原因没有说明是 Worker 重启: {task['result']}"
+    )
+
+    sandbox = f"sbx_{single_card.user}_{task_id}.slice"
+    single_card.wait_sandbox_gone(sandbox)
+    single_card.wait_idle_at_least(baseline)
+    status = single_card.client.maintenance().json() or {}
+    errors = (status.get("maintenance") or {}).get("maintenance_errors") or {}
+    assert sandbox not in errors, (
+        f"孤儿任务沙盒 {sandbox} 没清干净，维护状态里还记着错：{errors}"
+    )
+
+
+@pytest.mark.deployment_restart
+def test_restart_keeps_acquire_sandbox_but_stops_its_container(
+        container, single_card, container_image):
+    """82 · 崩溃重启：acquire 沙盒保留，但它名下**活着的**容器被停掉（授权不续）。
+
+    两条不同的口径，这里一次验完：
+
+    * 沙盒属于用户的终端，Worker 崩一次不该把它带走（清场入口是
+      ``neuboxctl pause``）；借出去的终端和它的卡都还在。
+    * 容器则相反 —— 跨崩溃续授权不闭环：容器退出监听（mnt ns fd + pidfd）是
+      内存态，重启后全丢，而驱动那张按 mnt ns 缓存的 UDA 表还在，等于把崩溃前
+      发出的授权接回来。所以启动时一律停掉（容器不删，可写层留着）。
+
+    ``docker start`` 会把这条正例收尾：重走 runtime hook，登记回同一个沙盒，
+    容器里的 NPU 照旧能用 —— 停掉不等于用户丢了容器。
+    """
+    single_card.require_service_control()
+    device = single_card.require_idle(1)[0]
+    node = single_card.device_node(device)
+    terminal = single_card.spawn_terminal()
+
+    with single_card.sandbox(
+        single_card.acquire_payload(terminal.pid, device_ids=[device]),
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
+        reference, result = run_container(
+            single_card, container_image, annotation=name,
+            command=container_probe_command(node),
+        )
+        assert result.returncode == 0, (result.stdout or "")[:2000]
+        container_id = single_card.container_id_of(reference)
+        assert single_card.wait_container_registered(container_id) == name
+        first = wait_container_log_count(
+            single_card, reference, CONTAINER_PROBE_MARKER, 1,
+        )
+        assert CONTAINER_OPEN_OK in first, first[:1000]
+
+        single_card.restart_worker()
+
+        # 沙盒与借出去的终端都还在。
+        record = single_card.find_sandbox(name)
+        assert record is not None, (
+            f"重启把 acquire 沙盒 {name} 也清掉了 —— 它属于用户的终端，"
+            f"只有 neuboxctl pause 才是清场入口"
+        )
+        assert record["state"] == "ACTIVE", record
+        assert process_alive(terminal.pid), (
+            f"重启之后借出去的终端 {terminal.pid} 不见了"
+        )
+
+        # 容器：还在、但被停掉、归属被撤（不续授权）。
+        single_card.wait_container_stopped(reference)
+        assert single_card.sandbox_of_container(container_id).json().get(
+            "sandbox_name") is None, (
+            f"重启后容器 {container_id} 的归属还挂着 —— 跨崩溃把授权续上了"
+        )
+
+        # start 回来：重新走 hook，登记回同一个沙盒，卡照旧能用。
+        started = single_card.docker("start", reference, timeout=90)
+        assert started.returncode == 0, (
+            f"沙盒 {name} 还在，`docker start` 却失败了："
+            f"{(started.stdout or '')[:1000]}"
+        )
+        assert single_card.wait_container_registered(container_id) == name, (
+            f"容器重启后没有重新登记到沙盒 {name}"
+        )
+        text = wait_container_log_count(
+            single_card, reference, CONTAINER_PROBE_MARKER, 2, timeout=90,
+        )
+        assert text.count(CONTAINER_OPEN_OK) >= 2, (
+            f"重启后容器里打不开自己沙盒的卡（登记回来了、授权没回来）：\n"
+            f"{text[:1500]}"
+        )
+
+    single_card.remove_container(reference)

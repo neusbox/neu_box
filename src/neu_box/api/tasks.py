@@ -118,6 +118,11 @@ def create_task():
 
 @command_bp.route('', methods=['DELETE'])
 def delete_tasks():
+    """删除或取消任务（兼容入口：``{"task_ids": [...]}``）。
+
+    排队中 / 运行中的任务改为"取消 + 留痕"（终态 ``cancelled``，记录与日志保留），
+    终态任务仍然真的删除记录与日志。单条取消请用 ``DELETE /tasks/<id>``。
+    """
     body = request.get_json(silent=True) or {}
     task_ids = body.get('task_ids') or []
     if not task_ids:
@@ -126,10 +131,58 @@ def delete_tasks():
     return {'deleted': deleted, 'message': f'已删除 {deleted} 个任务'}, 200
 
 
+@command_bp.route('/<identifier>', methods=['DELETE'])
+def cancel_entry(identifier: str):
+    """统一的单条取消入口：任务和 acquire 会话共用。
+
+    Query:
+      ?kind=task|acquire   缺省按任务处理（兼容老的"删任务"用法）
+
+    Body（可选）：
+      {"host_pid": 12345}   取消一个**已经拿到卡**的 acquire 时，调用方自报 PID，
+                            Worker 会先把它搬出沙盒 cgroup —— 否则它会被自己这次
+                            释放的 cgroup.kill 带走（neubox release 踩过这个坑）。
+
+    响应：
+      200 {"status": "cancelled"|"cancelling"|"released"|"deleted", ...}
+      404 这个 id 既不在队列里也不在运行中
+    """
+    kind = (request.args.get('kind') or 'task').strip().lower()
+    if kind not in ('task', 'acquire'):
+        return {'error': f'kind 只能是 task 或 acquire: {kind!r}'}, 400
+
+    body = request.get_json(silent=True) or {}
+    host_pid = body.get('host_pid')
+    if host_pid is not None:
+        try:
+            host_pid = int(host_pid)
+        except (TypeError, ValueError):
+            return {'error': 'host_pid 必须是整数'}, 400
+
+    queue = TaskQueue.get_instance()
+    try:
+        outcome = queue.cancel(kind, identifier, host_pid=host_pid)
+    except ValueError as exc:
+        return {'error': str(exc)}, 400
+    if outcome['status'] == 'unknown':
+        return {'error': '条目不存在或已经结束', 'id': identifier}, 404
+    if outcome['status'] == 'terminal' and kind == 'task':
+        # 已经是终态的任务：单条入口仍然按"删除"处理（和老的 DELETE /tasks 一致；
+        # 取消只对排队中/运行中的条目有意义）。
+        queue.delete_task_record(identifier)
+        return {'status': 'deleted', 'id': identifier, 'kind': kind}, 200
+    return outcome, 200
+
+
 @command_bp.route('', methods=['GET'])
 def list_tasks():
     queue = TaskQueue.get_instance()
-    return {'queue': queue.get_queue(), 'total_pending': queue.pending_count()}, 200
+    kind = (request.args.get('kind') or '').strip().lower() or None
+    state = (request.args.get('state') or '').strip().lower() or None
+    return {
+        'queue': queue.get_queue(kind=kind, state=state),
+        'total_pending': queue.pending_count(),
+    }, 200
 
 
 @command_bp.route('/<task_id>', methods=['GET'])

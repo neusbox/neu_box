@@ -34,11 +34,19 @@ from neu_box.storage import Database
 # 设备 fd 的进程会跟着设备预留一起被"释放"到空闲池。
 CONTAINER_EXIT_TIMEOUT = 30.0
 
+# `docker stop` 给容器的 SIGTERM 宽限（秒）。到点 Docker 自己会 SIGKILL；还停
+# 不下来就再补一次 ``kill``，最终由 ``_await_container_exit`` 判定。
+CONTAINER_STOP_GRACE = 10.0
+
+# 启动对账时等一个容器停下来的上限（秒）。启动路径不能在这里无限等：等不到就
+# 保留登记，收尸线程下一轮再收（见 ``retire_containers_on_startup``）。
+STARTUP_CONTAINER_STOP_TIMEOUT = 15.0
+
 # 容器从 Docker 建出对象到 runtime hook 完成登记的窗口（秒）。窗口内的容器
 # 可能正卡在 ``runc create`` 的 hook 上等 Worker 的锁，销毁路径里任何"碰它"
-# 的 Docker 操作都可能和它互等：``docker rm -f`` 要排在容器状态锁后面，而
+# 的 Docker 操作都可能和它互等：``docker stop`` 要排在容器状态锁后面，而
 # 容器（它的 hook）等的正是调用方手里那把锁。所以窗口内先跳过它、把销毁
-# 推迟到下一轮，窗口外的残留（崩溃留下的容器）照旧直接删。
+# 推迟到下一轮，窗口外的残留（崩溃留下的容器）照旧直接停。
 #
 # 旧代码里这个窗口由内存里的 gate 精确标记（``gates.pending_for_sandbox``，
 # 300s TTL）；gate 删除后，容器自己的创建时间是唯一留下来的、跨重启仍然
@@ -111,6 +119,8 @@ class SbxManager:
         # 容器归属的兜底对账。BPF 还没加载时 native 会拒绝，记录保留给
         # 收尸线程重试（此时 map 是空的，不存在误授权的窗口）。
         self.reconcile_containers()
+        # 崩溃重启不续授权：活着的登记容器一律停掉（不删，可写层留着）。
+        self.retire_containers_on_startup()
 
     @classmethod
     def get_instance(cls) -> 'SbxManager':
@@ -455,7 +465,7 @@ class SbxManager:
         # 走的也是这条 destroy 路径，分开写会漏一条。失败就原样保留沙盒等
         # 重试，绝不带着一个还活着的容器往下走。
         #
-        # 它必须留在锁外：这段会真的等容器（``docker rm -f`` 排在 Docker 的
+        # 它必须留在锁外：这段会真的等容器（``docker stop`` 排在 Docker 的
         # 容器状态锁后面，之后还要等 init 真的退出），而正在 ``runc create``
         # 里的那个容器的 runtime hook 要拿 ``self.lock → lifecycle_lock``
         # 才能登记 —— 持着锁等它就是"销毁等容器、容器等锁"的环。放锁外之后
@@ -846,24 +856,58 @@ class SbxManager:
 
     # ── 收容器（release / destroy 共用） ─────────────────────────
 
-    def _kill_container(self, container_ref: str) -> None:
-        """强制删掉一个容器；容器已经不在时静默返回。"""
+    def _stop_container(self, container_ref: str) -> bool:
+        """停掉一个容器；**不删**，容器已经不在时静默返回。
+
+        为什么不 ``docker rm -f``：删容器会连它的可写层一起销毁，而用户很可能
+        还要 ``docker commit`` / ``docker cp`` 把里面的产物捞出来。我们要的只是
+        "它的进程别再占着卡"，停掉就够了 —— 进程一没，那个 mount namespace 就
+        死了，驱动按 mnt ns 缓存的那张 UDA 表也就没人能用（见
+        ``docs/isolation.md``）。容器留着，下次 ``docker start`` 会重新走一遍
+        runtime hook，登记被拒就起不来（fail-closed），不会带着旧授权复活。
+
+        先 SIGTERM（``stop``，到 ``CONTAINER_STOP_GRACE`` 后 Docker 自己
+        SIGKILL），停不下来再补一次 ``kill``。这里不判定"真的停了"——
+        ``_await_container_exit`` 才是判据，报错也要由它抛出去。
+
+        返回 ``True`` 表示"这条 Docker 操作完成了"（含容器已经不存在），
+        ``False`` 表示连 Docker 都没问到 —— 调用方据此决定要不要把这一轮
+        算作"没扫干净"。
+        """
         try:
             client = docker_client(timeout=10)
         except DockerExecutorError as exc:
-            logger.error('删除容器 %s 失败（docker 不可用）: %s', container_ref, exc)
-            return
+            logger.error('停容器 %s 失败（docker 不可用）: %s', container_ref, exc)
+            return False
         # docker_client 已经成功说明 docker 装了，这里取的是异常类型本身。
         not_found = load_docker().errors.NotFound
         try:
-            client.containers.get(container_ref).remove(force=True)
+            container = client.containers.get(container_ref)
         except not_found:
-            # 容器跑完退出之后 Docker 自己会把它清掉，收尸时再来看就是 404。
-            # 这是正常路径，不能和下面那条 catch-all 合并 —— 一条 404 打两段
-            # traceback，会把真正的删除失败埋掉（排查时看到的正好相反）。
-            return
+            return True
         except Exception:
-            logger.warning('删除容器 %s 失败', container_ref, exc_info=True)
+            logger.warning('取容器 %s 失败', container_ref, exc_info=True)
+            return False
+        try:
+            try:
+                container.stop(timeout=CONTAINER_STOP_GRACE)
+            except not_found:
+                # 容器跑完退出之后 Docker 自己会把它清掉，收尸时再来看就是
+                # 404。这是正常路径，不能和下面那条 catch-all 合并 —— 一条
+                # 404 打两段 traceback 会把真正的失败埋掉。
+                return True
+            except Exception:
+                logger.warning(
+                    '停容器 %s 失败，改用 kill', container_ref, exc_info=True,
+                )
+                try:
+                    container.kill()
+                except not_found:
+                    return True
+                except Exception:
+                    logger.warning('kill 容器 %s 失败', container_ref, exc_info=True)
+                    return False
+            return True
         finally:
             try:
                 client.close()
@@ -896,11 +940,11 @@ class SbxManager:
 
         窗口内的容器可能正卡在 ``runc create`` 的 hook 上等 Worker 的锁
         （``POST /container/register`` 要 ``self.lock → lifecycle_lock``），
-        所以销毁路径**不能**碰它：``docker rm -f`` 要排在容器的状态锁后面，
+        所以销毁路径**不能**碰它：``docker stop`` 要排在容器的状态锁后面，
         而容器要等的锁正是调用方手里的 —— 两边互相等。
 
-        时间戳读不出来时按"不在窗口里"处理：那是旧行为（直接删），而把读不
-        出来的容器一律当启动中，会让真正的崩溃残留永远删不掉。
+        时间戳读不出来时按"不在窗口里"处理：那是旧行为（直接停），而把读不
+        出来的容器一律当启动中，会让真正的崩溃残留永远停不掉。
         """
         attrs = getattr(container, 'attrs', None)
         created = attrs.get('Created') if isinstance(attrs, dict) else None
@@ -912,14 +956,16 @@ class SbxManager:
     def remove_docker_containers_for_sandbox(
         self, sandbox_name: str, keep_refs=(),
     ) -> int | None:
-        """Remove Worker-created containers left before namespace registration.
+        """Stop Worker-created containers left before namespace registration.
 
         A Worker crash can happen after ``docker run`` but before the container
         row is inserted. Such a container is invisible to
         ``reconcile_containers``; the stable sandbox label is the only durable
         handle available during startup recovery. ``keep_refs`` preserves
         already-registered containers for the ordered retirement path.
-        ``None`` means the Docker scan or one of the removals was incomplete;
+        Containers are **stopped, not removed** — the writable layer belongs to
+        the user (see ``_stop_container``).
+        ``None`` means the Docker scan or one of the stops was incomplete;
         callers must retain the sandbox record and retry rather than destroy
         the reservation.  A container that is still inside its
         create-to-registration window is one of those "incomplete" cases: it is
@@ -941,7 +987,7 @@ class SbxManager:
             )
             return None
         keep = {str(ref) for ref in keep_refs if ref}
-        removed = 0
+        stopped = 0
         failed = False
         starting = False
         found = 0
@@ -968,12 +1014,18 @@ class SbxManager:
                     )
                     continue
                 try:
-                    container.remove(force=True)
-                    removed += 1
+                    # 同样只停不删（可写层留着）。已经在跑的才算一条；停下来的
+                    # 容器下一轮还会被扫到，no-op 不该反复计数/刷日志。
+                    if str(getattr(container, 'status', '') or '') == 'running':
+                        if self._stop_container(
+                                container_id or container_name) is False:
+                            failed = True
+                        else:
+                            stopped += 1
                 except Exception:
                     failed = True
                     logger.exception(
-                        '恢复时删除 sandbox %s 的容器失败', sandbox_name,
+                        '恢复时停 sandbox %s 的容器失败', sandbox_name,
                     )
         except Exception:
             failed = True
@@ -989,7 +1041,7 @@ class SbxManager:
         # evidence that an interrupted startup left no Docker orphan.  Clear
         # the marker here so a pure Host sandbox does not keep depending on
         # Docker after the next reaper cycle.
-        return None if (failed or starting) else removed
+        return None if (failed or starting) else stopped
 
     @staticmethod
     def _container_sandbox_label(container) -> Optional[str]:
@@ -1028,10 +1080,11 @@ class SbxManager:
           纯 Host 沙盒因此不需要 Docker 可用，这正是
           ``remove_docker_containers_for_sandbox`` 里那条快速返回要保住的性质；
         * 沙盒记录还在的容器一概不碰，交给它自己的销毁路径按顺序收（撤授权 →
-          ``docker rm -f`` → 等退出 → 放 pin）。
+          ``docker stop`` → 等退出 → 放 pin）。
 
-        返回删掉的容器数；dockerd 不可用、扫描失败、或有容器这一轮删不掉时返回
-        ``None``。调用方只记日志、下一轮再来，不把它当错误。
+        返回这一轮停掉的容器数（**不删**：可写层是用户的）；dockerd 不可用、
+        扫描失败、或有容器这一轮停不掉时返回 ``None``。调用方只记日志、下一轮
+        再来，不把它当错误。
         """
         get_sandbox = getattr(getattr(self, 'db', None), 'get_sandbox', None)
         if get_sandbox is None:
@@ -1044,7 +1097,7 @@ class SbxManager:
             # 只是噪音 —— 要报错的删除失败在下面单独记。
             logger.debug('清扫无主容器时无法连接 Docker，下一轮重试: %s', exc)
             return None
-        removed = 0
+        stopped = 0
         incomplete = False
         try:
             containers = client.containers.list(
@@ -1076,18 +1129,25 @@ class SbxManager:
                     continue
                 # 走到这里说明"此刻"DB 里确实没有这个名字。命令任务的沙盒名
                 # 带 uuid、不会重名；acquire 的名字是 ``sbx_<owner>_<pid>``，
-                # pid 复用后同名重建理论上留了一个极窄的误删窗口（重建要先
-                # 插沙盒行，所以只有"查完 DB 到 rm 发出"这一瞬）。
+                # pid 复用后同名重建理论上留了一个极窄的误停窗口（重建要先
+                # 插沙盒行，所以只有"查完 DB 到 stop 发出"这一瞬）。
                 try:
-                    container.remove(force=True)
-                    removed += 1
+                    # 只停不删：可写层是用户的，无主容器停掉就没有进程占卡了。
+                    # 停下来的容器下一轮还会被扫到，no-op 不该反复计数/刷日志。
+                    if str(getattr(container, 'status', '') or '') != 'running':
+                        continue
+                    if self._stop_container(
+                            getattr(container, 'id', '') or container) is False:
+                        incomplete = True
+                        continue
+                    stopped += 1
                     logger.warning(
-                        '收掉无主容器 %s（原沙盒 %s，记录已不存在）',
+                        '停掉无主容器 %s（原沙盒 %s，记录已不存在；容器保留）',
                         getattr(container, 'id', '') or container, sandbox_name,
                     )
                 except Exception:
                     incomplete = True
-                    logger.exception('清扫无主容器失败: %s', sandbox_name)
+                    logger.exception('停无主容器失败: %s', sandbox_name)
         except Exception:
             incomplete = True
             logger.exception('清扫无主容器时列出 Docker 容器失败')
@@ -1096,7 +1156,7 @@ class SbxManager:
                 client.close()
             except Exception:
                 logger.debug('关闭 Docker client 失败', exc_info=True)
-        return None if incomplete else removed
+        return None if incomplete else stopped
 
     def _await_container_exit(self, records: list) -> None:
         """等这批容器真的退出。
@@ -1130,11 +1190,15 @@ class SbxManager:
                 time.sleep(min(0.2, remaining))
 
     def _retire_containers_of(self, sandbox_name: str) -> None:
-        """沙盒销毁前收掉它名下的容器。
+        """沙盒销毁前停掉它名下的容器。
 
-        ① 撤授权（容器立刻失去新的 open 权限）→ ② 异步 ``docker rm -f``
+        ① 撤授权（容器立刻失去新的 open 权限）→ ② 异步 ``docker stop``
         → ③ 等它们真的退出 → ④ 删记录、放 pin。撤授权在最前、放 pin 在最末，
         中间不存在"账本说卡空了、实际还在用"的窗口。
+
+        **只停不删**：删容器会连可写层一起销毁，用户可能还要 commit / cp 出来。
+        停掉就够了 —— 进程一没，那个 mnt ns 就死了，驱动按它缓存的 UDA 表也就
+        没人能用；容器留着，下次 ``docker start`` 重新走 hook，登记被拒就起不来。
 
         调用方必须**不持有** ``self.lock`` / ``_lifecycle_lock``：②③ 会真的
         等容器退出，而正在 ``runc create`` 的容器的 runtime hook 要拿这两把
@@ -1170,13 +1234,14 @@ class SbxManager:
         for record in records:
             self._revoke_container(record)
 
-        # ② 再杀 —— 已经打开的 fd 不受授权影响，必须真的把进程收掉
+        # ② 再停 —— 已经打开的 fd 不受授权影响，必须真的把进程收掉；但**不删**
+        #    容器，可写层留给用户（`_stop_container` 的注释说明了为什么够用）。
         threads = []
         for record in records:
             thread = threading.Thread(
-                target=self._kill_container,
+                target=self._stop_container,
                 args=(record['container_ref'],),
-                name='docker-rm', daemon=True,
+                name='docker-stop', daemon=True,
             )
             thread.start()
             threads.append(thread)
@@ -1234,6 +1299,90 @@ class SbxManager:
     def move_pid_to_cgroup(self, pid: int, cgroup_path: str) -> bool:
         """把一个进程迁回指定的 cgroup v2 路径并核验结果。"""
         return cgroup.move_pid(pid, cgroup_path)
+
+    def evacuate_caller(self, sandbox_name: str, pid: int) -> bool:
+        """把"发起 release 的调用方"从沙盒 cgroup 里搬出去；返回是否真的搬了。
+
+        为什么需要它：沙盒销毁的最后一步是 ``cgroup.kill``
+        （``native/sandbox/src/cgroup.cpp`` 的 ``kill_processes``），cgroup 里
+        剩下的进程一律 SIGKILL。而 ``neubox release`` 本身是**被借的那个 shell
+        fork 出来的子进程** —— cgroup 成员身份随 fork 继承，所以它就在沙盒里，
+        却没有 origin（origin 只记在被借的那一个 PID 上），于是被当成"沙盒里
+        长出来的进程"一起收掉：用户看到 ``zsh: killed``、退出码 137，命令没有
+        输出，脚本里 ``release && next`` 直接断。
+
+        只搬调用方**自己**：它的子树不管，"沙盒里长出来的进程跟着沙盒一起收掉"
+        这条语义也不动（那些进程可能已经握着设备 fd）。它的"家"从父进程的
+        origin 推出来 —— 它本来就不属于这个沙盒，是被继承关系带进来的。
+
+        只搬**确实住在要销毁的这个沙盒 cgroup 里**、且父进程在本沙盒记着
+        origin 的 PID；任一条件不成立就原地不动（fail-closed，绝不把来路不明
+        的进程放出去，也不让这个接口变成"搬任意 PID"的通道）。
+        """
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 1:
+            return False
+        record = self.db.get_sandbox(sandbox_name)
+        if not record:
+            return False
+        origins = record.get('origins') or {}
+        if not isinstance(origins, dict) or not origins:
+            # 没有 origin 表的沙盒（命令任务的沙盒）没有"借来的进程"，
+            # 也就没有可回的"家"，一律不动。
+            return False
+
+        try:
+            snapshot = self._read_cgroup_snapshot(sandbox_name)
+        except OSError as exc:
+            logger.error(
+                "释放前读取沙盒 '%s' 的进程快照失败，不搬调用方 %s: %s",
+                sandbox_name, pid, exc,
+            )
+            return False
+        if snapshot is None or pid not in snapshot[0]:
+            return False
+
+        destination = origins.get(str(pid))
+        if not destination:
+            parent = self._parent_pid(pid)
+            destination = origins.get(str(parent)) if parent else None
+        if not destination:
+            logger.warning(
+                "调用方 PID %s 在沙盒 '%s' 里，但它和父进程都没有 origin，"
+                "不搬（会被销毁流程收掉）", pid, sandbox_name,
+            )
+            return False
+        if not self.move_pid_to_cgroup(pid, destination):
+            logger.error(
+                "把调用方 PID %s 从沙盒 '%s' 搬回 %s 失败",
+                pid, sandbox_name, destination,
+            )
+            return False
+        logger.warning(
+            "✓ 调用方 PID %s 已从沙盒 '%s' 搬回 %s（它自己发起的 release）",
+            pid, sandbox_name, destination,
+        )
+        return True
+
+    @staticmethod
+    def _parent_pid(pid: int) -> int:
+        """读 ``/proc/<pid>/stat`` 的 PPID；读不到返回 0。
+
+        ``comm`` 字段自己可能带空格和括号，所以按最后一个 ``)`` 切开再取字段：
+        切完之后 ``fields[0]`` 是 state，``fields[1]`` 是 ppid。
+        """
+        try:
+            with open(f'/proc/{int(pid)}/stat', encoding='utf-8') as stream:
+                fields = stream.read().rsplit(')', 1)[1].split()
+        except (OSError, ValueError, IndexError):
+            return 0
+        try:
+            return int(fields[1])
+        except (IndexError, ValueError):
+            return 0
 
     def wait_container_events(self, timeout: float) -> int:
         """阻塞等容器退出事件，顺便当收尸循环的 sleep。
@@ -1302,6 +1451,71 @@ class SbxManager:
                     record['mount_namespace'],
                 )
         return removed
+
+    def retire_containers_on_startup(self) -> int:
+        """启动时把**还活着的**登记容器停掉、撤绑定（容器不删）。
+
+        崩溃重启（systemd 拉起）和正常升级（``neuboxctl pause`` → ``setup``）
+        是两条路：只有升级会先把沙盒和容器排空。崩溃重启之后容器和 acquire
+        沙盒都还活着，而跨崩溃续授权不闭环：
+
+        * 容器退出监听（mnt ns fd + pidfd）是**内存态**，重启后全丢 —— 留着的
+          登记没人收尸，残留的 mnt ns inum 被内核复用后会让新容器白捡一份授权
+          （``reconcile_containers`` 的注释里写着这个风险）；
+        * 驱动那张按 mnt ns 缓存的 UDA 表也还在（pinned map 同样跨重启存活），
+          等于把一个"崩溃前发出的授权"接回来 —— 而授权必须由 Worker 现算。
+
+        所以启动时一律失效：**停掉容器（可写层留着）**，用户 ``docker start``
+        会重新走一遍 runtime hook 登记回来（真机正例：用例 82）。
+
+        等不到容器退出就保留登记，交给收尸线程下一轮 —— 启动路径不能在这里
+        无限等；已经死掉的登记由 ``reconcile_containers`` 撤掉。
+
+        返回撤掉的登记条数。
+        """
+        retired = 0
+        for record in self.db.list_containers():
+            if self._container_alive(record):
+                # Docker 不可用 / 停的动作没做成：保留登记直接下一轮，别在这里
+                # 干等 ``STARTUP_CONTAINER_STOP_TIMEOUT`` 把启动拖慢。
+                if self._stop_container(record['container_ref']) is False:
+                    logger.warning(
+                        "重启对账: 容器 %s 的 stop 没做成（dockerd 不可用？），"
+                        "保留登记等下一轮",
+                        record['container_ref'],
+                    )
+                    continue
+                if not self._wait_container_stopped(
+                        record, STARTUP_CONTAINER_STOP_TIMEOUT):
+                    logger.warning(
+                        "重启对账: 容器 %s 没在 %.0fs 内停下，保留登记等下一轮",
+                        record['container_ref'], STARTUP_CONTAINER_STOP_TIMEOUT,
+                    )
+                    continue
+            try:
+                self.release_container(record['mount_namespace'])
+                retired += 1
+                logger.warning(
+                    "重启对账: 撤掉容器归属 %s (mnt ns %s, 沙盒 %s)",
+                    record['container_ref'], record['mount_namespace'],
+                    record['sandbox_name'],
+                )
+            except Exception:
+                logger.exception(
+                    "重启对账: 撤容器归属失败，保留记录等待重试: mnt ns %s",
+                    record['mount_namespace'],
+                )
+        return retired
+
+    def _wait_container_stopped(self, record: dict, timeout: float) -> bool:
+        """等这个容器的 init 真的退出；超时返回 ``False``（登记留着）。"""
+        deadline = time.monotonic() + timeout
+        while True:
+            if not self._container_alive(record):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
 
     def _read_cgroup_snapshot(
         self,

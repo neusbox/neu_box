@@ -328,8 +328,9 @@ def test_cancel_running_task_releases_device(single_card):
     assert result.value("deleted") == 1, result.text
 
     task = single_card.wait_task(task_id)
-    assert task["status"] == "failed", (
-        f"取消后的任务状态应为 failed，实际为 {task['status']}"
+    assert task["status"] == "cancelled", (
+        f"取消后的任务状态应为 cancelled（取消是独立终态，不再混在 failed 里），"
+        f"实际为 {task['status']}"
     )
     assert "手动取消" in (task["result"].get("error") or ""), (
         f"取消原因不明确: {task['result']}"
@@ -413,6 +414,52 @@ def test_memory_limit_blocks_overcommit(single_card):
         f"{task.get('result')}"
     )
     assert task["result"]["returncode"] != 0, task["result"]
+    single_card.wait_idle_at_least(baseline)
+
+
+def test_release_keeps_the_caller_inside_sandbox(single_card):
+    """55 · 从沙盒里发起 release 时，调用方不能被这次销毁带走。
+
+    用户实测的路径：``neubox release`` 是 acquire 借出去的那个 shell fork 出来的
+    子进程 —— cgroup 成员身份随 fork 继承，所以它住在沙盒 cgroup 里，却没有
+    origin；而销毁的最后一步是 ``cgroup.kill``，于是它会把自己一起杀掉
+    （``zsh: killed``、退出码 137，命令不返回、脚本串联直接断）。
+
+    修法是 release 请求带上 ``host_pid``，Worker 在销毁前把**它自己**搬回父进程
+    的 origin；它的兄弟进程（同样是"沙盒里长出来的"）照旧被收掉 —— 这一条正反
+    两面都要验，否则把孤儿进程放生了也一样是 bug。
+    """
+    baseline = single_card.idle_devices()
+    device = single_card.idle_minors()[0]
+    tag = f"caller-{secrets.token_hex(4)}"
+    terminal, _ = single_card.fork_child_in_place(seconds=600, tag=tag, count=2)
+
+    with single_card.sandbox(
+        single_card.acquire_payload(terminal.pid, device_ids=[device]),
+    ) as sandbox:
+        name = sandbox["sandbox_name"]
+        caller, orphan = single_card.fork_children(tag=tag, count=2)
+        for pid in (caller, orphan):
+            assert single_card.process_cgroup(pid).endswith(f"sandbox_{name}"), (
+                f"子进程 {pid} 没有落在沙盒 cgroup 里 "
+                f"({single_card.process_cgroup(pid)})，这一条的前提不成立"
+            )
+
+        released = single_card.client.release(
+            name, host_pid=caller, timeout=single_card.task_timeout,
+        )
+        assert released.status == 200, released.text
+        single_card.wait_sandbox_gone(name)
+
+        assert process_alive(caller), (
+            f"调用方 PID {caller} 被这次 release 带走了 —— neubox release 就会"
+            f"看到 zsh: killed / 退出码 137，host_pid 没起作用"
+        )
+        assert process_alive(terminal.pid), (
+            f"借出去的终端 {terminal.pid} 没有迁回原 cgroup（或被杀）"
+        )
+        single_card.wait_process_gone(orphan)
+
     single_card.wait_idle_at_least(baseline)
 
 

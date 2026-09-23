@@ -22,7 +22,7 @@ ACTIVE 沙盒名下。
    普通开发机上每个进程都共用宿主 mnt ns —— 假容器也一样，不挡住这一条就
    永远是 409。替身只认 ``os.getpid()``，碰不到被测 PID 的任何取值。
 2. ``bind_container`` / ``unbind_container`` —— 写 BPF map，需要 root。换成记账。
-3. ``_run_native``（沙盒销毁的 native 调用）和 ``_kill_container``（``docker rm -f``）
+3. ``_run_native``（沙盒销毁的 native 调用）和 ``_stop_container``（``docker stop``）
    —— 同样需要 root / docker。前者记账，后者真的把假容器进程杀掉，好让
    ``_await_container_exit`` 走的 pidfd + epoll 那条路是真的。
 """
@@ -40,12 +40,15 @@ from flask import Flask
 
 from neu_box.api import containers as api_containers
 from neu_box.api.containers import container_bp
+from neu_box.api.sandboxes import sandbox_bp
+from neu_box.api.tasks import command_bp
 from neu_box.migrations.engine import migrate_database
 from neu_box.runtime import containers
 from neu_box.runtime import sandbox as sandbox_module
-from neu_box.runtime.containers import DockerExecutorError
+from neu_box.runtime.containers import DockerExecutorError, load_docker
 from neu_box.runtime.reaper import Reaper
 from neu_box.runtime.sandbox import SbxManager
+from neu_box.scheduling.queue import TaskQueue
 from neu_box.storage import (
     MIGRATIONS_PACKAGE,
     REQUIRED_COLUMNS,
@@ -531,7 +534,7 @@ class _Runtime:
         self.app = application
         self.bindings = []      # ('bind', 沙盒名, inum) / ('unbind', inum)
         self.natives = []       # 走到 native helper 的命令行
-        self.killed = []        # 走了 docker rm -f 的 container_ref
+        self.killed = []        # 走了 docker stop 的 container_ref
         self.scans = []         # 走了 Startup 容器扫描的 (沙盒名, 保留的 ref)
         self.docker_calls = []  # 真去连 Docker 的次数（登记路径必须是 0）
         self.activations = []   # activate_sandbox 被调用的次数与参数
@@ -613,18 +616,19 @@ def runtime(tmp_path, monkeypatch):
     manager.unbind_container = lambda mount_namespace: (
         observed.bindings.append(('unbind', int(mount_namespace))))
 
-    # ── 替身 3：native helper（要 root）与 docker rm -f ──────────
+    # ── 替身 3：native helper（要 root）与 docker stop ───────────
     def run_native(*args):
         observed.natives.append(args)
         return subprocess.CompletedProcess(args, 0, '', '')
 
-    def kill_container(container_ref):
-        """``_kill_container`` 的效果：容器真的死掉，好让后面的等待是真的。"""
+    def stop_container(container_ref):
+        """``_stop_container`` 的效果：容器真的停掉，好让后面的等待是真的。"""
         observed.killed.append(container_ref)
         process = observed.processes.get(container_ref)
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
+        return True
 
     def scan_containers(sandbox_name, keep_refs=()):
         """启动时"扫一遍 Docker 找没登记的孤儿容器"：这台机器上没有 dockerd。"""
@@ -636,7 +640,7 @@ def runtime(tmp_path, monkeypatch):
         raise DockerExecutorError('无法连接 Docker Engine', 'docker_unavailable')
 
     manager._run_native = run_native
-    manager._kill_container = kill_container
+    manager._stop_container = stop_container
     manager.remove_docker_containers_for_sandbox = scan_containers
     monkeypatch.setattr(sandbox_module, 'docker_client', docker_client)
     monkeypatch.setattr(SbxManager, '_instance', manager)
@@ -869,7 +873,7 @@ def test_registration_and_destruction_do_not_deadlock(runtime, monkeypatch):
     ① **登记先拿到锁**（销毁在门外等）。这个顺序用事件卡出来，不是靠调度碰
        运气：登记进到临界区中间（``_promote_on_registration`` 那一刻）停住，
        这时才起销毁线程 —— 它只能等。放行之后，销毁必须把刚登记进去的容器
-       一并收掉（撤授权 → ``docker rm -f`` → 等退出 → 放 pin）。
+       一并停掉（撤授权 → ``docker stop`` → 等退出 → 放 pin）。
     ② **销毁先拿到锁**。登记必须在锁里重新看一次沙盒状态，而不是信进门前那
        次 404 检查的结果。
 
@@ -926,7 +930,7 @@ def test_registration_and_destruction_do_not_deadlock(runtime, monkeypatch):
 
     assert response['result'].status_code == 201, response['result'].get_json()
     assert destroyed['result'] is True
-    # 登记落在了一个真存在的沙盒上，随后被销毁一并收掉：撤授权、杀容器、等它
+    # 登记落在了一个真存在的沙盒上，随后被销毁一并停掉：撤授权、停容器、等它
     # 真的退出、放 pin，最后沙盒行和容器行都不在。
     assert runtime.killed == [CONTAINER_ID]
     assert runtime.scans == [(SANDBOX, (CONTAINER_ID,))]
@@ -972,30 +976,40 @@ def test_registration_and_destruction_do_not_deadlock(runtime, monkeypatch):
 #
 # ``destroy_sandbox`` 的环长在"收容器"里：正在 ``runc create`` 的容器，它的
 # runtime hook 要拿 ``self.lock → lifecycle_lock`` 才登记得上，而收容器会
-# 停在那里等这个容器（``docker rm -f`` 排在 Docker 的容器状态锁后面，之后还
+# 停在那里等这个容器（``docker stop`` 排在 Docker 的容器状态锁后面，之后还
 # 要等 init 真的退出）。所以收容器必须在锁外做。
 
 
 class _FakeContainer:
     """假的 docker 容器对象：按 label 扫容器那两条路径用得到的字段都在
-    （``id`` / ``name`` / ``attrs['Created']`` / label）。
+    （``id`` / ``name`` / ``status`` / ``attrs['Created']`` / label）。
 
     label 存进 ``attrs['Config']['Labels']``，和 docker-py 的内部形状一致 ——
     真实对象的 ``Container.labels`` 属性读的就是这里。
+
+    收容器现在是 ``stop`` 而不是 ``rm``（可写层要留给用户），所以这里记的是
+    ``stopped``：停下来的容器还在，下一轮再扫到它是 no-op。
     """
 
-    def __init__(self, container_id, created, labels=None):
+    def __init__(self, container_id, created, labels=None, status='running'):
         self.id = container_id
         self.name = container_id
+        self.status = status
         self.attrs = {
             'Created': created,
             'Config': {'Labels': dict(labels or {})},
         }
-        self.removed = False
+        self.stopped = False
 
-    def remove(self, force=False):
-        assert force is True, '销毁路径必须 force'
-        self.removed = True
+    def stop(self, timeout=None):
+        self.stop_timeout = timeout
+        self.stopped = True
+        self.status = 'exited'
+
+    def kill(self):
+        self.killed = True
+        self.stopped = True
+        self.status = 'exited'
 
 
 class _FakeDocker:
@@ -1010,6 +1024,12 @@ class _FakeDocker:
             def list(self, all=False, filters=None):   # noqa: A002 - docker-py 签名
                 outer.listed.append((all, dict(filters or {})))
                 return list(containers)
+
+            def get(self, ref):
+                for container in containers:
+                    if ref in (container.id, container.name):
+                        return container
+                raise load_docker().errors.NotFound(f'no such container: {ref}')
 
         self.containers = _Containers()
 
@@ -1032,7 +1052,7 @@ def test_destroy_defers_containers_inside_the_startup_window(runtime, monkeypatc
     """启动窗口里的容器不许碰：跳过它、保留沙盒、下一轮再来。
 
     窗口内（``Created`` 还很新）的容器可能正卡在 ``runc create`` 的 hook 上等
-    锁，销毁去 ``docker rm -f`` 就是给自己造环。窗口外的（崩溃残留）照旧直接删。
+    锁，销毁去 ``docker stop`` 就是给自己造环。窗口外的（崩溃残留）照旧直接停。
 
     环真正出现的地方是"沙盒里已经有一个登记过的容器、又有一个正在创建"：
     前者让销毁必须去扫 Docker（否则扫都不扫，见 ``remove_docker_containers_
@@ -1048,7 +1068,7 @@ def test_destroy_defers_containers_inside_the_startup_window(runtime, monkeypatc
 
     # ① 直接扫：窗口内的容器一个都不许删，且必须报"没收干净"。
     assert runtime.manager.remove_docker_containers_for_sandbox(SANDBOX) is None
-    assert young.removed is False, '启动窗口里的容器被删了 —— 那是互等的入口'
+    assert young.stopped is False, '启动窗口里的容器被停了 —— 那是互等的入口'
     assert fake.closed is True
 
     # ② 销毁一个"已登记容器 + 正在创建容器"的沙盒：必须整个推迟。
@@ -1057,7 +1077,7 @@ def test_destroy_defers_containers_inside_the_startup_window(runtime, monkeypatc
     assert runtime.register(host_pid=container.pid).status_code == 201
 
     assert runtime.manager.destroy_sandbox(sandbox) is False
-    assert young.removed is False
+    assert young.stopped is False
     assert runtime.killed == [], '收容器没成，已登记的容器不该被单方面收掉'
     assert ('destroy', sandbox) not in runtime.natives, \
         '收容器没收干净就不许往下拆 native'
@@ -1066,26 +1086,27 @@ def test_destroy_defers_containers_inside_the_startup_window(runtime, monkeypatc
     assert [row['container_id'] for row in runtime.db.list_containers()] == [
         CONTAINER_ID]
 
-    # ③ 同一个容器老了（下一轮的常态）：正常删，销毁走完。
+    # ③ 同一个容器老了（下一轮的常态）：正常停，销毁走完。
     aged = _FakeContainer(OLD_CONTAINER_ID, _docker_timestamp(3600.0))
     monkeypatch.setattr(
         sandbox_module, 'docker_client', lambda **kwargs: _FakeDocker([aged]))
 
     assert runtime.manager.destroy_sandbox(sandbox) is True
-    assert aged.removed is True
-    assert runtime.killed == [CONTAINER_ID]
+    # 老掉的残留容器停掉、已登记的容器也停掉；两者都不用删。
+    assert set(runtime.killed) == {CONTAINER_ID, OLD_CONTAINER_ID}
     assert ('destroy', sandbox) in runtime.natives
     assert runtime.db.get_sandbox(sandbox) is None
     assert runtime.db.list_containers() == []
 
 
-def test_orphan_sweep_removes_containers_whose_sandbox_is_gone(
+def test_orphan_sweep_stops_containers_whose_sandbox_is_gone(
         runtime, monkeypatch):
-    """崩溃窗口的兜底：label 在、沙盒记录不在的容器必须被收掉。
+    """崩溃窗口的兜底：label 在、沙盒记录不在的容器必须被停掉（不删）。
 
     这类容器没有 ``containers`` 行，``reconcile_containers`` 看不见；沙盒记录
     被销毁路径删掉之后，按名字扫的那条路也再没有入口。全局清扫反过来按 label
-    查，只看 DB 里已经不存在的沙盒名。
+    查，只看 DB 里已经不存在的沙盒名。停掉即可 —— 没有进程就没有"占着卡"，
+    可写层还是用户的。
     """
     gone = _FakeContainer(
         OLD_CONTAINER_ID, _docker_timestamp(3600.0),
@@ -1100,8 +1121,10 @@ def test_orphan_sweep_removes_containers_whose_sandbox_is_gone(
     _active_sandbox(runtime, SANDBOX)
 
     assert runtime.manager.reap_orphan_labelled_containers() == 1
-    assert gone.removed is True, '沙盒记录已经没了的容器没被收掉'
-    assert live.removed is False, '沙盒记录还在的容器不归全局清扫管'
+    # 这个 fixture 把 ``_stop_container`` 换成了只记账的替身，所以"停没停"看
+    # ``runtime.killed`` 而不是假容器自己的标志位。
+    assert OLD_CONTAINER_ID in runtime.killed, '沙盒记录已经没了的容器没被停掉'
+    assert 'c' * 64 not in runtime.killed, '沙盒记录还在的容器不归全局清扫管'
     assert fake.closed is True
 
 
@@ -1116,7 +1139,7 @@ def test_orphan_sweep_defers_containers_inside_the_startup_window(
     monkeypatch.setattr(sandbox_module, 'docker_client', lambda **kwargs: fake)
 
     assert runtime.manager.reap_orphan_labelled_containers() is None
-    assert young.removed is False
+    assert runtime.killed == []
     assert fake.closed is True
 
 
@@ -1124,6 +1147,40 @@ def test_orphan_sweep_is_a_noop_when_docker_is_unreachable(runtime):
     """dockerd 不可用时清扫只回 ``None`` 等下一轮，不阻塞任何销毁。"""
     # fixture 已经把 ``docker_client`` 换成"连不上"的替身。
     assert runtime.manager.reap_orphan_labelled_containers() is None
+
+
+def test_startup_retires_live_registered_containers(runtime, monkeypatch):
+    """崩溃重启：还活着的登记容器要停掉、撤绑定（容器本体不删）。
+
+    跨崩溃续授权不闭环：容器退出监听（mnt ns fd + pidfd）是内存态，重启后全丢，
+    留着的登记既没人收尸，残留的 mnt ns inum 被内核复用后还会让新容器白捡一份
+    授权。所以启动时一律失效 —— 停掉容器（可写层留着），用户 ``docker start``
+    会重新走 hook 登记回来。
+    """
+    sandbox = _active_sandbox(runtime)
+    container = runtime.spawn(CONTAINER_ID)
+    response = runtime.register(host_pid=container.pid)
+    assert response.status_code == 201, response.get_json()
+    mount_namespace = response.get_json()['mount_namespace']
+    assert runtime.db.list_containers()
+
+    stopped = []
+    monkeypatch.setattr(
+        runtime.manager, '_stop_container',
+        lambda ref: stopped.append(ref) or True)
+    # 用一个"停下来了"的替身：真判据是 /proc 里的 init 进程消失，很难在单测里
+    # 精确控制时机（真机上的正例是 82）。
+    monkeypatch.setattr(
+        runtime.manager, '_wait_container_stopped',
+        lambda record, timeout: True)
+
+    assert runtime.manager.retire_containers_on_startup() == 1
+    assert stopped == [CONTAINER_ID], '活着的登记容器没有被停掉'
+    assert ('unbind', mount_namespace) in runtime.bindings, '撤授权没做'
+    assert runtime.db.list_containers() == [], '登记没有撤掉'
+    assert runtime.db.get_sandbox(sandbox) is not None, (
+        '重启对账只该管容器，不该动沙盒本身'
+    )
 
 
 def test_container_start_grace_survives_docker_timestamp_formats():
@@ -1363,3 +1420,179 @@ def test_reaper_retries_the_residue_until_native_really_cleaned_it(
     runtime.natives.clear()
     runtime.manager.reaper.run_once()
     assert ('destroy', SANDBOX) not in runtime.natives
+
+
+# ── /sandbox/release 的 host_pid：先搬调用方，再销毁 ──────────────────
+
+
+def _release_app(manager, monkeypatch):
+    monkeypatch.setattr(
+        SbxManager, 'get_instance', classmethod(lambda cls: manager))
+    application = Flask(__name__)
+    application.register_blueprint(sandbox_bp, url_prefix='/sandbox')
+    return application
+
+
+def test_release_evacuates_the_caller_before_destroying(monkeypatch):
+    """带 host_pid 时顺序必须是"先搬调用方、再销毁沙盒"。
+
+    ``neubox release`` 自己就住在沙盒 cgroup 里（它是被借的 shell fork 出来的），
+    而销毁的最后一步是 cgroup.kill —— 顺序反了它就会被自己这次销毁带走。
+    """
+    events = []
+
+    class Manager:
+        def evacuate_caller(self, name, pid):
+            events.append(('evacuate', name, pid))
+            return True
+
+        def destroy_sandbox(self, name):
+            events.append(('destroy', name))
+            return True
+
+    application = _release_app(Manager(), monkeypatch)
+    response = application.test_client().post('/sandbox/release', json={
+        'sandbox_name': SANDBOX, 'host_pid': 222,
+    })
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert events == [('evacuate', SANDBOX, 222), ('destroy', SANDBOX)], events
+
+
+def test_release_without_host_pid_keeps_the_old_contract(monkeypatch):
+    """不带 host_pid 时行为完全不变（老客户端照旧可用）。"""
+    events = []
+
+    class Manager:
+        def evacuate_caller(self, name, pid):
+            events.append(('evacuate', name, pid))
+            return False
+
+        def destroy_sandbox(self, name):
+            events.append(('destroy', name))
+            return True
+
+    application = _release_app(Manager(), monkeypatch)
+    response = application.test_client().post(
+        '/sandbox/release', json={'sandbox_name': SANDBOX})
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert events == [('destroy', SANDBOX)], events
+
+
+def test_release_rejects_host_pid_that_is_not_an_integer(monkeypatch):
+    class Manager:
+        def evacuate_caller(self, name, pid):
+            raise AssertionError('host_pid 非法时不该去搬进程')
+
+        def destroy_sandbox(self, name):
+            raise AssertionError('host_pid 非法时不该销毁沙盒')
+
+    application = _release_app(Manager(), monkeypatch)
+    response = application.test_client().post('/sandbox/release', json={
+        'sandbox_name': SANDBOX, 'host_pid': 'not-a-pid',
+    })
+
+    assert response.status_code == 400, response.get_data(as_text=True)
+
+
+# ── 统一取消入口 /tasks/<id>?kind= 与统一视图过滤 ─────────────────
+
+
+class _FakeQueue:
+    """只回答路由关心的那几件事。"""
+
+    def __init__(self):
+        self.calls = []
+        self.filters = None
+        self.deleted = []
+        self.outcome = {'status': 'released', 'sandbox_name': 'sbx_x.slice'}
+
+    def cancel(self, kind, identifier, *, host_pid=None):
+        self.calls.append((kind, identifier, host_pid))
+        return {**self.outcome, 'id': identifier, 'kind': kind}
+
+    def delete_task_record(self, task_id):
+        self.deleted.append(task_id)
+
+    def get_queue(self, kind=None, state=None):
+        self.filters = (kind, state)
+        return []
+
+    def pending_count(self):
+        return 0
+
+
+def _tasks_app(queue, monkeypatch):
+    monkeypatch.setattr(TaskQueue, 'get_instance', classmethod(lambda cls: queue))
+    application = Flask(__name__)
+    application.register_blueprint(command_bp, url_prefix='/tasks')
+    return application
+
+
+def test_cancel_entry_route_passes_kind_and_host_pid(monkeypatch):
+    queue = _FakeQueue()
+    application = _tasks_app(queue, monkeypatch)
+
+    response = application.test_client().delete(
+        '/tasks/req1?kind=acquire', json={'host_pid': 222})
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert queue.calls == [('acquire', 'req1', 222)], queue.calls
+    body = response.get_json()
+    assert body['status'] == 'released' and body['sandbox_name'] == 'sbx_x.slice'
+
+
+def test_cancel_entry_route_defaults_to_task(monkeypatch):
+    queue = _FakeQueue()
+    queue.outcome = {'status': 'cancelled'}
+    application = _tasks_app(queue, monkeypatch)
+
+    response = application.test_client().delete('/tasks/t1')
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert queue.calls == [('task', 't1', None)], queue.calls
+
+
+def test_cancel_entry_route_rejects_bad_kind_and_host_pid(monkeypatch):
+    queue = _FakeQueue()
+    application = _tasks_app(queue, monkeypatch)
+    client = application.test_client()
+
+    assert client.delete('/tasks/x?kind=bogus').status_code == 400
+    assert client.delete('/tasks/x?kind=acquire',
+                         json={'host_pid': 'abc'}).status_code == 400
+    assert queue.calls == [], '参数不合法时不该去动条目'
+
+
+def test_cancel_entry_route_404s_for_unknown_entry(monkeypatch):
+    queue = _FakeQueue()
+    queue.outcome = {'status': 'unknown'}
+    application = _tasks_app(queue, monkeypatch)
+
+    response = application.test_client().delete('/tasks/nope?kind=acquire')
+
+    assert response.status_code == 404, response.get_data(as_text=True)
+
+
+def test_cancel_entry_route_deletes_terminal_task(monkeypatch):
+    """终态任务走单条入口时仍然是"删除"（和老的 DELETE /tasks 一致）。"""
+    queue = _FakeQueue()
+    queue.outcome = {'status': 'terminal'}
+    application = _tasks_app(queue, monkeypatch)
+
+    response = application.test_client().delete('/tasks/done')
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.get_json()['status'] == 'deleted'
+    assert queue.deleted == ['done']
+
+
+def test_list_tasks_route_passes_filters(monkeypatch):
+    queue = _FakeQueue()
+    application = _tasks_app(queue, monkeypatch)
+
+    response = application.test_client().get('/tasks?kind=acquire&state=active')
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert queue.filters == ('acquire', 'active')
