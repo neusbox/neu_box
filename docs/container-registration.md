@@ -42,12 +42,14 @@ docker run --annotation sandbox_cgroup=<name> ...      ← 客户端 / 用户
                               │
                      POST /container/register           ← Worker 从这里开始
                               │
-                    ┌─────────┴─────────┐
-                 2xx/200            4xx/超时/连不上
-                    │                    │
-              hook 退 0              hook 退非 0
-                    │                    │
-            runc 继续，ENTRYPOINT 执行   runc create 失败，容器不启动
+        ┌─────────────────────┼─────────────────────┐
+     2xx / 200          404 sandbox_not_found    其它 4xx / 5xx / 超时 / 连不上
+        │              409 sandbox_not_active          │
+   hook 退 0            hook 退 0（打警告）          hook 退非 0
+   登记完成          容器无授权启动（0 张卡）              │
+        │                  │                             ▼
+        ▼                  ▼                 runc create 失败，容器不启动
+    ENTRYPOINT 执行    ENTRYPOINT 执行
 ```
 
 **Worker 是唯一写 BPF map 和数据库的人。** runtime 和 hook 不碰 BPF，只负责把
@@ -77,6 +79,59 @@ goClient 提供。
 annotation 是**传输通道，不是凭证**。真正的校验在 Worker 侧 —— 见下面「这个入口
 有多危险」。
 
+## start 借条（annotation 改不了时怎么办）
+
+annotation 是**建容器时**写死的，而 `docker start` 既不接受 `--annotation`，也
+看不到是谁在调它（启动是 dockerd 干的活）。容器配置本身也只有停掉 dockerd 才能
+改写 —— 这条路不能走。于是沙盒一 release，老容器再 start 就只剩"起得来但零卡"：
+可写层还在，卡拿不到，而用户想要的往往只是"接着用同一个容器"。
+
+`neubox docker start` 用**两段式借条**补这个洞，hook 一行都不用改：
+
+```
+neubox docker start <容器>
+        │
+        ├─ ① docker inspect 拿容器 ID（借条按 ID 记：容器名会改，ID 不会）
+        │
+        ├─ ② POST /container/intent  ← 把**本 shell 的沙盒**借给这个容器
+        │
+        ├─ ③ 真的跑 docker start（借条已在账上）
+        │        └─ hook 照旧 POST /container/register（它不知道有借条）
+        │               └─ Worker：这个 container_id 有借条 → 按借条登记
+        │
+        └─ ④ GET /container/intent 确认认领结果；没认领就明说零卡
+```
+
+谁能借、借给谁，都在第 ② 步定死，没有任何"猜"的成分：
+
+| 检查 | 不满足时 |
+|---|---|
+| `pid` 属于调用方（`/proc/<pid>/status` 的 UID） | 409 `pid_owner_mismatch` |
+| `pid` 真的在某个沙盒里（`/proc/<pid>/cgroup` 反查） | 409 `not_in_sandbox` |
+| 那个沙盒的属主就是调用方 | 409 `sandbox_owner_mismatch` |
+| 沙盒不是 `DESTROYING` | 409 `sandbox_not_active` |
+| `container_id` 是 64 位十六进制 | 400 |
+
+借条按 `(container_id, 属主)` 存，**一次性**，10 秒过期。register 认领时还要再对
+一次属主：annotation 里的属主必须等于借条的属主 —— 别人的容器借不走你的沙盒。
+三个 shell 各持一个沙盒时，在哪个 shell 敲就借哪个沙盒，互不影响；同一个容器被
+两次 start 抢，属主对不上的那张借条直接不参与匹配（结果零卡，不会串到别人头上）。
+
+**借不上不是错误，只是没卡。** 借条存不上、或者存上了但没被认领（过期、没走
+hook），`neubox docker start` 都照常把容器拉起来，只在命令行上说明"看不到 NPU"。
+和原生 `docker start` 的行为一致：能不能起来和有没有卡是两件事，后者永远靠 Worker
+明说，不靠退出码。
+
+已知边界，别当成 bug：
+
+* **借条和 start 之间只能靠 `(container_id, 时间窗)` 关联。** docker 没给更强的
+  通道（start 不带 annotation、不带 env、不带 nonce，daemon 也不告诉 Worker 是
+  谁发起的），所以窗口存在。最坏结果是"零卡"或"同一用户自己的几个沙盒之间串号"，
+  拿不到别人的卡 —— 三道属主校验都在拿卡之前。
+* **不经过 wrapper 的启动拿不到借条**：原生 `docker start`、`docker restart`、
+  `--restart=always`、daemon 重启后的 live-restore 都是如此。annotation 还指着
+  活沙盒就照旧能用；沙盒已经没了就是零卡。
+
 ## 为什么必须卡在 ENTRYPOINT 之前
 
 登记必须发生在容器 ENTRYPOINT 之前 —— 驱动在容器内第一次 NPU 初始化时建表并
@@ -84,8 +139,15 @@ annotation 是**传输通道，不是凭证**。真正的校验在 Worker 侧 �
 OCI runtime hook 是唯一能卡在这个窗口里的点（Docker 的 create 路径里，
 ENTRYPOINT 还没跑）。
 
-这也是"登记不上就绝不放行"的全部理由：放行 = 容器带着一张空 UDA 表永久坏掉。
-所以失败路径只能是 hook 退非 0、`runc create` 失败，不能是"降级放行"。
+这也是"**拿不到授权答案就绝不放行**"的全部理由：放行 = 容器带着一张空 UDA 表
+永久坏掉，而用户还以为"驱动装了没生效"。所以 Worker 明确回答"没有这个沙盒 /
+正在销毁"以外的任何失败，路径只能是 hook 退非 0、`runc create` 失败。
+
+唯一的例外是**授权的否定答案**（404 `sandbox_not_found` / 409
+`sandbox_not_active`）：沙盒已经 release 掉、用户又 `docker start` 那个老容器时，
+hook 放行 —— 容器起来（可写层还在），但一张卡都拿不到（BPF 查不到委托，驱动给
+它建的 UDA 表是空的）。这条路的判断与后果见 `neu_box_runtime/docs/runtime-hook.md`
+与 [`isolation.md`](isolation.md)。
 
 ## Worker 侧必须做到的四条
 

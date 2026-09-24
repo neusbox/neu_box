@@ -1,4 +1,4 @@
-"""第 3 层 · 驱动侧隔离（manifest 61-64、71-72）。
+"""第 3 层 · 驱动侧隔离（manifest 61-64、71-72、83）。
 
 前面几组验的是"我们这半边"：调度、沙盒、eBPF 拦 `open("/dev/davinciN")`。这一组
 验**最终结果**：Ascend 驱动给每个 mount namespace 建的 UDA 设备表里有几张卡 ——
@@ -492,6 +492,22 @@ def test_unregistered_container_sees_no_cards(
     assert row['dev_num'] == 0, (
         f"没有 sandbox_cgroup annotation 的容器竟然拿到 {row['dev_num']} 张卡"
         f"（udevid={row['udevids']}）—— 未登记的容器必须一张都拿不到，整行：{row}"
+    )
+
+
+def test_stale_annotation_starts_container_without_cards(
+        driver_isolation, single_card, container_image):
+    """83 · annotation 指向的沙盒已经不存在：容器起得来，但驱动表是 0 张。
+
+    35 验的是用户态"open 被拒"，这条读驱动自己的账。
+    """
+    missing = f"sbx_{single_card.user}_{secrets.token_hex(6)}.slice"
+    reference = _start_probe_container(
+        single_card, container_image, annotation=missing)
+    row = _wait_row(_container_pid(reference))
+    assert row['dev_num'] == 0 and row['udevids'] == [], (
+        f"沙盒 {missing} 根本不存在，容器的 UDA 表里却出现了 {row['dev_num']} 张卡"
+        f"（udevid={row['udevids']}）—— 无授权启动必须是零卡，整行：{row}"
     )
 
 

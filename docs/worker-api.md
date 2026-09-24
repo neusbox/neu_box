@@ -24,6 +24,8 @@ Neu Box `0.5.0`。Worker 默认监听 `http://<worker-host>:59075`，所有接�
 | `POST` | `/sandbox/acquire` | 为现有进程排队申请终端沙盒 |
 | `GET` | `/sandbox/acquire/<acquire_id>` | 查询终端沙盒申请 |
 | `POST` | `/container/register` | 容器归属登记（由节点 OCI runtime hook 调用，非用户接口） |
+| `POST` | `/container/intent` | 登记 start 借条（由 `neubox docker start` 调用） |
+| `GET` | `/container/intent` | 查询借条有没有被认领（`neubox docker start` 用它确认） |
 | `POST` | `/sandbox/release` | 销毁终端沙盒，释放设备 |
 | `POST` | `/sandbox/join` | 将 Host PID 加入已有沙盒 |
 | `GET` | `/sandbox/status` | 按 Host PID 或已登记容器查询沙盒 |
@@ -693,9 +695,21 @@ create 路径里，从那里调 Docker 会重入授权插件）。`container_cgr
 `mount_namespace` 只做交叉验证，与 Worker 读到的不一致返回 `409`；与宿主机共用
 mount namespace 的 PID 一律拒绝，否则等于把整机登记成受托方。
 
-容器不持有授权，只是**受托方**：它借的是它挂上的那个沙盒那一份；同一个 mount
-namespace 已经登记在别的沙盒（或别的 container_id）下时返回 `409`。成功返回
-HTTP `201`：
+容器不持有授权，只是**受托方**：它借的是它挂上的那个沙盒那一份。归属从两个地方
+来，**start 借条优先**：
+
+1. 这个 `container_id` 有一张没过期的借条（`neubox docker start` 存的，见下一节）
+   → 按借条里的沙盒登记，annotation 只当没看见；
+2. 否则按 `sandbox_cgroup` annotation 解析沙盒名。
+
+借条只在属主一致时生效：借条的属主取自它存的沙盒名 `sbx_<属主>_<id>.slice`，
+必须和 annotation 里的属主相同 —— 别人的容器借不走你的沙盒。借条是一次性的，
+认领后即作废，回到规则 2。
+
+同一个 mount namespace 已经登记在**别的 container_id** 下时返回 `409`；如果是
+**同一个容器**重复登记（`docker exec` 会带着建容器时那行 annotation 再来一次），
+以既有绑定为准、幂等返回，不跟着这次报上来的沙盒改 —— 否则按借条改绑过的容器
+一 exec 就把授权搬走了。成功返回 HTTP `201`：
 
 ```json
 {
@@ -719,15 +733,73 @@ HTTP `201`：
 | 状态 | `code` | 含义 |
 |---:|---|---|
 | `400` | — | `container_id` / `host_pid` / `sandbox_cgroup` 缺失或非法 |
-| `404` | `sandbox_not_found` | 沙盒名不是数据库里的精确沙盒名 |
-| `409` | `sandbox_not_active` | 沙盒正在销毁 |
-| `409` | `docker_container_registered_elsewhere` | 该 mount namespace 已登记给别的沙盒或别的容器 |
+| `404` | `sandbox_not_found` | 沙盒名不是数据库里的精确沙盒名。**这是"授权的否定答案"**：hook 会放行容器，但**不授予任何权限**（容器里看不到任何 NPU） |
+| `409` | `sandbox_not_active` | 沙盒正在销毁。同 `sandbox_not_found`：放行但无授权 |
+| `409` | `docker_container_registered_elsewhere` | 该 mount namespace 已登记给另一个容器 |
 | `409` | `docker_container_same_mount_namespace` | PID 与宿主机共用 mount namespace |
 | `409` | `runtime_identity_changed` | hook 报的 cgroup / mnt ns 与 Worker 读到的不一致 |
 | `409` | `docker_container_pid_invalid` | PID 不存在或已退出 |
 
-hook 收到非 2xx（或超时/连不上）会退非 0，`runc create` 失败、容器不启动 ——
-这是 fail-closed：没有登记的容器拿不到任何设备授权。
+hook 的处理分两类（见 `neu_box_runtime/docs/runtime-hook.md`）：
+
+* **`sandbox_not_found` / `sandbox_not_active`** → hook 打一行警告后**退 0**，
+  容器照常启动但**没有任何授权**：`container_owner` 里没有它的委托，`open` 全被
+  拒，驱动的 UDA 表是空的（0 张卡）。这条是给"沙盒 release 之后 `docker start`
+  老容器"用的 —— 容器能起来、可写层还在，想要卡得重新 acquire 并重建容器。
+* **其它任何非 2xx（含超时、连不上、5xx、身份冲突 409）** → hook 退非 0，
+  `runc create` 失败、容器不启动。这是 fail-closed：拿不到授权答案时绝不放行
+  （维护窗口里 BPF 可能是拆掉的，放行等于把全部卡送出去）。
+
+### 登记 / 查询 start 借条（`neubox docker start` 专用）
+
+```http
+POST /container/intent
+GET  /container/intent?container_id=<64 位十六进制>&username=<用户>&pid=<宿主机 PID>
+```
+
+```json
+// POST 请求体
+{
+  "username": "yuxd",
+  "pid": 1443967,
+  "container_id": "79c7c22eb5c7…"
+}
+```
+
+用途只有一个：`docker start` 带不了 annotation、也看不到调用方，所以由
+`neubox docker start` 在真 start **之前**声明"把我在的这个沙盒借给这个容器"，
+hook 随后报上来的 register 认领它。**借条不是给用户直接调的**，它是那一个子命令
+的后半截；字段、状态码以本节为准，流程与边界见
+[`container-registration.md`](container-registration.md)「start 借条」。
+
+借条按 `(container_id, 属主)` 存，一次性、10 秒过期。沙盒名由 Worker 从 `pid`
+自己反查（`/proc/<pid>/cgroup`），并校验 `pid` 的属主、沙盒属主都等于
+`username` —— 客户端说不出一个不属于自己的沙盒名。POST 成功返回 HTTP `200`：
+
+```json
+{
+  "container_id": "79c7c22eb5c7…",
+  "sandbox_name": "sbx_yuxd_1443967.slice",
+  "owner": "yuxd",
+  "state": "pending",
+  "expires_in": 10.0
+}
+```
+
+POST 的错误响应：
+
+| 状态 | `code` | 含义 |
+|---:|---|---|
+| `400` | — | `username` / `container_id` / `pid` 缺失或非法（容器 ID 必须 64 位十六进制） |
+| `409` | `pid_owner_mismatch` | PID 不属于该用户或进程不存在 |
+| `409` | `not_in_sandbox` | PID 不在任何沙盒里，没有可借的东西 |
+| `409` | `sandbox_owner_mismatch` | PID 所在的沙盒不是该用户的 |
+| `409` | `sandbox_not_active` | 沙盒正在销毁 |
+
+GET 返回同一形状，`state` 为 `pending`（还没被认领）、`consumed`（已认领，说明容器
+真的绑上了那张借条里的沙盒）或 `null`（没有借条 / 已过期）。同一个字段校验照做，
+所以查询也要带 `pid`。`neubox docker start` 启动后轮询它，`consumed` 才算拿到卡；
+没认领就打印一行警告（容器照常起来，只是零卡），不改退出码。
 
 ### 查询沙盒
 

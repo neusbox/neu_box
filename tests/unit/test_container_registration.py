@@ -1,4 +1,4 @@
-"""容器归属登记：登记事务本身，以及 OCI runtime hook 端点。
+"""容器归属登记：登记事务本身、OCI runtime hook 端点，以及 start 借条。
 
 端点行为按 ``docs/container-registration.md`` 校验：状态码、错误码、幂等，
 以及「读沙盒状态」和「写登记」在同一个 ``lifecycle_lock`` 临界区里。
@@ -13,10 +13,12 @@ from flask import Flask
 
 from neu_box.api.containers import container_bp
 from neu_box.runtime import containers
+from neu_box.runtime.container_intents import START_INTENT_TTL, StartIntentStore
 from neu_box.runtime.containers import ContainerIdentity, DockerExecutorError
 from neu_box.runtime.sandbox import SbxManager
 
 SANDBOX = 'sbx_user_task-1.slice'
+CONTAINER_ID = 'a' * 64
 
 
 def _identity(namespace=42, container_id='cid', host_pid=123, cgroup='/docker/cid'):
@@ -126,6 +128,33 @@ def _register(client, **overrides):
     }
     body.update(overrides)
     return client.post('/container/register', json=body)
+
+
+@pytest.fixture
+def intents(monkeypatch):
+    """每个用例一份干净的借条簿（进程内单例，不隔离会串）。"""
+    store = StartIntentStore(ttl_seconds=START_INTENT_TTL)
+    monkeypatch.setattr(
+        StartIntentStore, 'get_instance', classmethod(lambda cls: store))
+    return store
+
+
+def _lend_request(client, **overrides):
+    body = {
+        'username': 'user',
+        'container_id': CONTAINER_ID,
+        'pid': 4242,
+    }
+    body.update(overrides)
+    return client.post('/container/intent', json=body)
+
+
+def _patch_caller(monkeypatch, *, sandbox=SANDBOX, owner_ok=True):
+    """假掉"这个 pid 属于谁、在哪个沙盒里" —— 真实现读 /proc。"""
+    monkeypatch.setattr(
+        'neu_box.api.containers._verify_pid_owner', lambda pid, user: owner_ok)
+    monkeypatch.setattr(
+        'neu_box.api.containers._find_sandbox_for_pid', lambda pid: sandbox)
 
 
 # ── 登记事务（SbxManager 层） ───────────────────────────────────
@@ -282,16 +311,36 @@ def test_register_runtime_container_rejects_sandbox_being_destroyed():
     assert manager.db.activations == []
 
 
-def test_register_runtime_container_rejects_namespace_of_another_sandbox():
+def test_register_runtime_container_rejects_namespace_of_another_container():
     other = 'sbx_other_task-9.slice'
     manager = _manager(
         sandboxes={**_active_sandbox(), other: {'name': other, 'state': 'ACTIVE'}},
-        containers={42: {'sandbox_name': other, 'container_id': 'cid'}},
+        containers={42: {'sandbox_name': other, 'container_id': 'other-cid'}},
     )
 
     with pytest.raises(DockerExecutorError) as error:
         manager.register_runtime_container(SANDBOX, _identity())
     assert error.value.code == 'docker_container_registered_elsewhere'
+
+
+def test_register_runtime_container_keeps_an_existing_binding():
+    """同一个容器重复登记：以既有绑定为准，不跟着这次报上来的沙盒改。
+
+    `docker exec` 会带着建容器时那行 annotation 再登记一次，而按借条改绑过的
+    容器早就绑在别的沙盒上了 —— 那一刻不能把授权搬走。
+    """
+    other = 'sbx_other_task-9.slice'
+    manager = _manager(
+        sandboxes={**_active_sandbox(),
+                   other: {'name': other, 'state': 'ACTIVE'}},
+        containers={42: {'sandbox_name': other, 'container_id': 'cid'}},
+    )
+
+    record, created = manager.register_runtime_container(SANDBOX, _identity())
+
+    assert created is False
+    assert record['sandbox_name'] == other
+    assert manager.db.get_container(42)['sandbox_name'] == other
 
 
 # ── 端点 ────────────────────────────────────────────────────────
@@ -352,7 +401,7 @@ def test_endpoint_reports_namespace_registered_elsewhere(runtime_http, monkeypat
     manager = _manager(
         sandboxes=_active_sandbox(),
         containers={42: {'sandbox_name': 'sbx_other_task-9.slice',
-                         'container_id': 'cid'}},
+                         'container_id': 'other-cid'}},
     )
     _install(monkeypatch, manager, _identity(namespace=42))
 
@@ -473,3 +522,152 @@ def test_endpoint_registers_inside_the_lifecycle_lock(runtime_http, monkeypatch)
 
     assert blocked, 'registration did not wait for the lifecycle lock'
     assert results[0].status_code == 201
+
+
+# ── start 借条：`neubox docker start` 的两段式 ──────────────────
+
+
+def test_intent_endpoint_records_the_callers_sandbox(
+        runtime_http, monkeypatch, intents):
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()))
+    _patch_caller(monkeypatch)
+
+    response = _lend_request(runtime_http)
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['sandbox_name'] == SANDBOX
+    assert body['state'] == 'pending'
+    assert intents.peek(CONTAINER_ID, 'user')['sandbox_name'] == SANDBOX
+
+
+def test_intent_beats_a_stale_annotation(runtime_http, monkeypatch, intents):
+    """借条指到的沙盒才是这次 start 该用的那个 —— annotation 已经指向死沙盒。"""
+    other = 'sbx_lent_task-7.slice'
+    manager = _manager(sandboxes={**_active_sandbox(other)})
+    _install(monkeypatch, manager, _identity(namespace=9001, cgroup='/docker/abc'))
+    _patch_caller(monkeypatch, sandbox=other)
+    intents.lend('cid', 'user', other)
+
+    response = _register(runtime_http, container_id='cid')
+
+    assert response.status_code == 201
+    assert response.get_json()['sandbox_name'] == other
+    assert manager.db.get_container(9001)['sandbox_name'] == other
+    assert intents.peek('cid', 'user')['consumed_at'] is not None
+
+    # 借条是一次性的：第二次登记回到 annotation，那里指向一个不存在的沙盒。
+    again = _register(runtime_http, container_id='cid')
+    assert again.status_code == 404
+    assert again.get_json()['code'] == 'sandbox_not_found'
+
+
+def test_intent_only_lends_to_the_containers_own_owner(
+        runtime_http, monkeypatch, intents):
+    """属主对不上就当没有借条：别人的容器借不走我的沙盒。"""
+    other = 'sbx_lent_task-7.slice'
+    _install(monkeypatch, _manager(sandboxes={**_active_sandbox(other)}))
+    intents.lend('cid', 'someone-else', other)
+
+    response = _register(runtime_http, container_id='cid')
+
+    assert response.status_code == 404
+    assert response.get_json()['code'] == 'sandbox_not_found'
+
+
+def test_intent_endpoint_falls_back_to_the_annotation(
+        runtime_http, monkeypatch, intents):
+    """借条里的沙盒已经没了：不硬绑，退回 annotation（这里是活的）。"""
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()), _identity())
+    _patch_caller(monkeypatch, sandbox='sbx_lent_task-7.slice')
+    intents.lend('cid', 'user', 'sbx_lent_task-7.slice')
+
+    response = _register(runtime_http, container_id='cid')
+
+    assert response.status_code == 201
+    assert response.get_json()['sandbox_name'] == SANDBOX
+
+
+def test_intent_state_endpoint_reports_consumption(
+        runtime_http, monkeypatch, intents):
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()))
+    _patch_caller(monkeypatch)
+    query = {'container_id': CONTAINER_ID, 'username': 'user', 'pid': 4242}
+
+    empty = runtime_http.get('/container/intent', query_string=query)
+    assert empty.status_code == 200
+    assert empty.get_json()['state'] is None
+
+    _lend_request(runtime_http)
+    pending = runtime_http.get('/container/intent', query_string=query)
+    assert pending.get_json()['state'] == 'pending'
+
+    intents.take(CONTAINER_ID, 'user')
+    consumed = runtime_http.get('/container/intent', query_string=query)
+    assert consumed.get_json()['state'] == 'consumed'
+    assert consumed.get_json()['sandbox_name'] == SANDBOX
+
+
+def test_intent_endpoint_rejects_a_pid_outside_a_sandbox(
+        runtime_http, monkeypatch, intents):
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()))
+    _patch_caller(monkeypatch, sandbox=None)
+
+    response = _lend_request(runtime_http)
+
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 'not_in_sandbox'
+    assert intents.peek(CONTAINER_ID, 'user') is None
+
+
+def test_intent_endpoint_rejects_a_pid_of_another_user(
+        runtime_http, monkeypatch, intents):
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()))
+    _patch_caller(monkeypatch, owner_ok=False)
+
+    response = _lend_request(runtime_http)
+
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 'pid_owner_mismatch'
+    assert intents.peek(CONTAINER_ID, 'user') is None
+
+
+def test_intent_endpoint_rejects_a_sandbox_of_another_user(
+        runtime_http, monkeypatch, intents):
+    other = 'sbx_other_task-7.slice'
+    _install(monkeypatch, _manager(sandboxes={**_active_sandbox(other)}))
+    _patch_caller(monkeypatch, sandbox=other)
+
+    response = _lend_request(runtime_http)
+
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 'sandbox_owner_mismatch'
+
+
+def test_intent_endpoint_rejects_an_unavailable_sandbox(
+        runtime_http, monkeypatch, intents):
+    _install(monkeypatch, _manager(
+        sandboxes={SANDBOX: {'name': SANDBOX, 'state': 'DESTROYING'}}))
+    _patch_caller(monkeypatch)
+
+    response = _lend_request(runtime_http)
+
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 'sandbox_not_active'
+
+
+@pytest.mark.parametrize('overrides,expected', [
+    ({'container_id': ''}, 400),
+    ({'container_id': 'not-a-docker-id'}, 400),
+    ({'username': ''}, 400),
+    ({'pid': 'abc'}, 400),
+    ({'pid': 0}, 400),
+])
+def test_intent_endpoint_rejects_bad_requests(
+        runtime_http, monkeypatch, intents, overrides, expected):
+    _install(monkeypatch, _manager(sandboxes=_active_sandbox()))
+    _patch_caller(monkeypatch)
+
+    response = _lend_request(runtime_http, **overrides)
+
+    assert response.status_code == expected

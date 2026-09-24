@@ -1,4 +1,4 @@
-"""第 3 层 · client(neubox) 的容器路径（manifest 67-70、73-75）。
+"""第 3 层 · client(neubox) 的容器路径（manifest 67-70、73-75、84-85）。
 
 `test_client.py` 验的是 CLI 的基本路径（acquire / list / submit / cancel），
 不需要 dockerd。这一组把 `neubox docker run` 起的容器**从生到死**走完整：注入
@@ -17,15 +17,23 @@ exec 各条路径。最典型的那条是：
 死掉 → 驱动那张按 mnt ns 缓存的 UDA 表没人能用"+"重新 start 必然重走 hook 且
 登记被拒"。原理见 `docs/isolation.md`。
 
+84/85 走的是同一个现场的**另一条出口**：annotation 改不了，但 `neubox docker
+start` 可以把这个 shell 现在的沙盒借给容器（借条，10 秒内有效、一次性），于是
+跨 shell 换沙盒也能接着用同一个容器；而不在沙盒里的 `neubox docker start` 直接
+拒绝，不会退化成"先起来再说"。契约见 `docs/container-registration.md`。
+
 前置：`neubox` 没装整组跳过（和 `test_client.py` 同一套软缺失语义 —— 见
 `conftest.py` 的 ``neubox_bin`` fixture），装了但版本不够直接失败。
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 import shlex
 import subprocess
+
+import pytest
 
 from deployment_support import (
     CONTAINER_OPEN_OK,
@@ -53,13 +61,7 @@ def _docker_run_in_sandbox(single_card, neubox_bin, device, args: list[str], *,
     沙盒本身也用**真 neubox** 借（`neubox acquire --pid <shell>`），这一组不留
     任何绕过 CLI 的旁路。
     """
-    shell = single_card.sandbox_shell()
-    sandbox = neubox_sandbox_name(
-        neubox_bin, "acquire", "--pid", str(shell.pid), "--device", str(device),
-    )
-    # CLI 建的沙盒不走 acquire_sandbox，得自己登记进收尾清单（失败路径上要靠它
-    # 把卡放回去）。
-    single_card.track_sandbox(sandbox)
+    shell, sandbox = _shell_with_card(single_card, neubox_bin, device)
     single_card.created_containers.append(container_name)
     # 每个参数都要 quote：`-c "sleep 600"` 里的引号属于 docker 的 argv，不能
     # 在拼 shell 命令时被吃掉（否则容器跑的是 `sh -c sleep`，立刻退出）。
@@ -69,6 +71,22 @@ def _docker_run_in_sandbox(single_card, neubox_bin, device, args: list[str], *,
     )
     rc, output = shell.run(command)
     return rc, output, sandbox
+
+
+def _shell_with_card(single_card, neubox_bin, device: int):
+    """借一个 shell 进沙盒并占住一张卡；返回 ``(shell, 沙盒名)``。
+
+    用真 neubox 借（`neubox acquire --pid <shell>`）：之后在这个 shell 里跑的
+    `neubox docker run` / `neubox docker start` 都按自己 PID 的 cgroup 反查沙盒。
+    """
+    shell = single_card.sandbox_shell()
+    sandbox = neubox_sandbox_name(
+        neubox_bin, "acquire", "--pid", str(shell.pid), "--device", str(device),
+    )
+    # CLI 建的沙盒不走 acquire_sandbox，得自己登记进收尾清单（失败路径上要靠它
+    # 把卡放回去）。
+    single_card.track_sandbox(sandbox)
+    return shell, sandbox
 
 
 def _assert_open(single_card, reference: str, node: str, *, expect_ok: bool,
@@ -92,18 +110,19 @@ def _assert_open(single_card, reference: str, node: str, *, expect_ok: bool,
         )
 
 
-def _assert_start_refused(single_card, reference: str, sandbox: str) -> None:
-    """容器必须起不来：start 会重走 hook，annotation 指向的沙盒已经没了 → 404。"""
+def _start_expecting_no_cards(single_card, reference: str, node: str,
+                              sandbox: str) -> None:
+    """沙盒已释放的老容器：能 start（可写层还在），但一张卡都用不了。"""
     started = single_card.docker("start", reference, timeout=90)
-    if started.returncode == 0:
-        # 真起来了就别让它继续跑（会污染后面的用例），但这条断言必须失败。
-        single_card.docker("stop", "-t", "2", reference, timeout=60)
-    assert started.returncode != 0, (
-        f"沙盒 {sandbox} 已经销毁，容器 {reference} 却还能 `docker start` 起来 —— "
-        f"start 会重走 OCI hook、带了旧 annotation，Worker 应当 404 拒绝、"
-        f"`runc create` 必须失败。输出：{(started.stdout or '')[:500]}"
+    assert started.returncode == 0, (
+        f"沙盒 {sandbox} 已释放，`docker start` 应当放行（容器无卡可跑，可写层还"
+        f"在），实际失败：{(started.stdout or '')[:800]}"
     )
-    single_card.wait_container_stopped(reference)
+    _assert_open(single_card, reference, node, expect_ok=False,
+                 context=f"沙盒 {sandbox} 已释放，容器是无授权启动的")
+    container_id = single_card.container_id_of(reference)
+    assert single_card.sandbox_of_container(container_id).json().get(
+        "sandbox_name") is None, "无授权启动的容器不该有登记"
 
 
 def _stage_stopped_released_container(single_card, neubox_bin, container_image,
@@ -304,14 +323,13 @@ def test_client_container_stop_then_start_uses_card_again(
     single_card.wait_idle_at_least(baseline)
 
 
-def test_client_release_after_stop_keeps_container_but_kills_access(
+def test_client_release_then_start_runs_without_cards(
         neubox_bin, single_card, container_image):
-    """74 · stop 之后再 release：容器留着（可写层不丢），但再也拿不回卡。
+    """74 · stop 之后再 release：容器留着（可写层不丢），start 起得来但零卡。
 
-    这条路上 release 在 ``containers`` 表里已经看不到容器了（stop 时就注销了），
-    只剩按 label 兜底的扫描 —— 而 `neubox docker run` 起的容器没有 label，所以
-    它会**活过 release**（停着）。隔离的另一半必须接住：start 重走 hook 时
-    annotation 指向已销毁的沙盒 → 404 → 容器起不来；exec 也没得执行。
+    release 时 `containers` 表里已经看不到它了（stop 时就注销），而 `neubox
+    docker run` 起的容器没有 label，所以它会活过 release；再 start 时 hook 拿到
+    "没有这个沙盒" → 无授权放行。
     """
     baseline = single_card.idle_devices()
     device = single_card.require_idle(1)[0]
@@ -321,10 +339,10 @@ def test_client_release_after_stop_keeps_container_but_kills_access(
         single_card, neubox_bin, container_image, device, node)
 
     # 容器还在（只是停着）—— 这是"不删容器"的直接回归：可写层没丢。
-    _assert_start_refused(single_card, name, sandbox)
-    _assert_open(single_card, name, node, expect_ok=False,
-                 context=f"沙盒 {sandbox} 已释放、容器也没起来")
+    _start_expecting_no_cards(single_card, name, node, sandbox)
+    # 卡已经回池，无授权启动的容器不许把它再占回去。
     single_card.wait_idle_at_least(baseline)
+    assert device in single_card.idle_minors(), single_card.idle_minors()
 
     single_card.remove_container(name)
 
@@ -333,9 +351,8 @@ def test_client_released_card_goes_to_next_sandbox(
         neubox_bin, single_card, container_image):
     """75 · 停着的老容器不会挡住同一张卡交给下一个沙盒。
 
-    接 74 的现场：老容器还在（停着，annotation 指向已销毁的沙盒）。同一张卡用
-    真 neubox 重新 acquire，新容器登记成功、容器里能开这张卡；老容器这时 start
-    仍然起不来 —— 授权不在它手上。
+    接 74 的现场：同一张卡用真 neubox 重新 acquire，新容器能开这张卡；老容器
+    start 起来也开不了卡，抢不走。
     """
     baseline = single_card.idle_devices()
     device = single_card.require_idle(1)[0]
@@ -344,6 +361,8 @@ def test_client_released_card_goes_to_next_sandbox(
     sandbox, old_name, _old_id = _stage_stopped_released_container(
         single_card, neubox_bin, container_image, device, node)
     single_card.wait_container_stopped(old_name)
+    # 先把老容器拉起来：它必须是"活着但没卡"，不能把卡占回去。
+    _start_expecting_no_cards(single_card, old_name, node, sandbox)
 
     new_name = f"neu-box-client-{secrets.token_hex(4)}"
     rc, output, new_sandbox = _docker_run_in_sandbox(
@@ -360,11 +379,134 @@ def test_client_released_card_goes_to_next_sandbox(
     _assert_open(single_card, new_name, node, expect_ok=True,
                  context=f"卡 {device} 已经交给新沙盒 {new_sandbox}")
 
-    # 老容器还停着，start 依然被拒。
-    _assert_start_refused(single_card, old_name, sandbox)
+    # 老容器还活着，但依旧开不了卡。
+    _assert_open(single_card, old_name, node, expect_ok=False,
+                 context="老容器是无授权启动的，卡归新沙盒")
 
     neubox_cli(neubox_bin, "release", new_sandbox)
     single_card.wait_sandbox_gone(new_sandbox)
     single_card.wait_idle_at_least(baseline)
     single_card.remove_container(new_name)
     single_card.remove_container(old_name)
+
+
+def test_client_docker_start_lends_the_current_sandbox(
+        neubox_bin, single_card, container_image):
+    """84 · 跨 shell：`neubox docker start` 把当前沙盒借给老容器，容器照旧能用卡。
+
+    这是"annotation 改不了"的正解。现场和 74/75 一样（容器停着、沙盒已 release、
+    annotation 还指着那个死沙盒），区别只在最后一步：在**新沙盒的 shell 里**敲
+    `neubox docker start`，借条被 hook 认领，容器绑到**现在的**沙盒上 —— 容器还是
+    原来那个（ID 不变、可写层还在、annotation 一个字没改）。
+    """
+    baseline = single_card.idle_devices()
+    device = single_card.require_idle(1)[0]
+    node = single_card.device_node(device)
+    name = f"neu-box-client-{secrets.token_hex(4)}"
+
+    # ① 沙盒 A 里用真 neubox 起容器，确认它真能用卡。
+    rc, output, sandbox_a = _docker_run_in_sandbox(
+        single_card, neubox_bin, device,
+        _docker_run_args(name, node, container_image, "sleep 600"),
+        container_name=name,
+    )
+    assert rc == 0, f"`neubox docker run` 失败（rc={rc}）：\n{output[:2000]}"
+    container_id = single_card.container_id_of(name)
+    assert single_card.wait_container_registered(container_id) == sandbox_a
+    _assert_open(single_card, name, node, expect_ok=True,
+                 context=f"沙盒 {sandbox_a} 持有卡 {device}")
+
+    # ② stop + release：容器留着（停着），卡回池，annotation 还指着死掉的沙盒 A。
+    stopped = single_card.docker("stop", "-t", "2", name, timeout=90)
+    assert stopped.returncode == 0, (stopped.stdout or "")[:500]
+    single_card.wait_container_unregistered(container_id)
+    neubox_cli(neubox_bin, "release", sandbox_a)
+    single_card.wait_sandbox_gone(sandbox_a)
+    single_card.wait_idle_at_least(baseline)
+    single_card.wait_container_stopped(name)
+
+    annotation = single_card.docker(
+        "inspect", "-f", '{{index .HostConfig.Annotations "sandbox_cgroup"}}',
+        name, timeout=60,
+    )
+    assert annotation.returncode == 0, annotation.stderr[:500]
+    assert annotation.stdout.strip() == sandbox_a, (
+        f"容器上的 annotation 不该被改写，实际 {annotation.stdout.strip()!r}"
+    )
+
+    # ③ 另一个 shell 借走同一张卡 —— 这就是"跨 shell 换沙盒"。
+    shell_b, sandbox_b = _shell_with_card(single_card, neubox_bin, device)
+    assert sandbox_b != sandbox_a, "新沙盒名不该复用旧名字"
+    rc, output = shell_b.run(" ".join(
+        shlex.quote(str(item))
+        for item in [neubox_bin, "docker", "start", name]
+    ))
+    assert rc == 0, (
+        f"沙盒 {sandbox_b} 里的 `neubox docker start` 失败（rc={rc}）：\n{output[:2000]}"
+    )
+
+    assert single_card.container_id_of(name) == container_id, (
+        "借条改绑不该换容器：还是同一个容器，可写层不能丢"
+    )
+    assert single_card.wait_container_registered(container_id) == sandbox_b, (
+        f"容器没有绑到借条里的沙盒 {sandbox_b}（借条没被认领？）"
+    )
+    _assert_open(single_card, name, node, expect_ok=True,
+                 context=f"借条生效后容器该能用沙盒 {sandbox_b} 的卡 {device}")
+
+    # ④ 收尾：release 新沙盒 → 按它登记的容器被一并停掉。
+    neubox_cli(neubox_bin, "release", sandbox_b)
+    single_card.wait_sandbox_gone(sandbox_b)
+    single_card.wait_container_stopped(name)
+    single_card.wait_idle_at_least(baseline)
+    single_card.remove_container(name)
+
+
+def test_client_docker_start_without_a_sandbox_runs_without_cards(
+        neubox_bin, single_card, container_image):
+    """85 · 不在沙盒里的 `neubox docker start`：容器照样起来，但一张卡都没有。
+
+    借条借不上（这里根本没有沙盒可借）不该拦住 start —— 用户可能只是想进可写层
+    看看。判据是"起来了 + 没登记 + 开不了卡 + 命令行明说没拿到 NPU"，不是退出码。
+    """
+    caller = single_card.client.sandbox_status(pid=os.getpid()).json()
+    if caller.get("sandbox_name"):
+        pytest.fail(
+            "前置缺失：跑验收的进程自己就在沙盒 "
+            f"{caller['sandbox_name']} 里，测不了'不在沙盒里'的分支；"
+            "请从不在沙盒里的 shell 执行 sudo neuboxctl test",
+            pytrace=False,
+        )
+
+    baseline = single_card.idle_devices()
+    device = single_card.require_idle(1)[0]
+    node = single_card.device_node(device)
+
+    sandbox, name, container_id = _stage_stopped_released_container(
+        single_card, neubox_bin, container_image, device, node)
+    single_card.wait_container_stopped(name)
+
+    result = subprocess.run(
+        [neubox_bin, "docker", "start", name],
+        capture_output=True, text=True, timeout=120,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 0, (
+        f"借不到沙盒不该拦住 start（沙盒 {sandbox} 已经 release）："
+        f"rc={result.returncode}\n{output[:1000]}"
+    )
+    running = single_card.docker(
+        "inspect", "--format", "{{.State.Running}}", name, timeout=30)
+    assert running.stdout.strip() == "true", (
+        f"容器应当照常起来（零卡），实际 State.Running={running.stdout.strip()!r}"
+    )
+    _assert_open(single_card, name, node, expect_ok=False,
+                 context="没有沙盒可借，容器应当拿不到卡")
+    assert single_card.sandbox_of_container(container_id).json().get(
+        "sandbox_name") is None, "没有借条就不该有登记"
+    assert "看不到 NPU" in output, (
+        f"命令行要说清这次没拿到卡：\n{output[:1000]}"
+    )
+
+    single_card.wait_idle_at_least(baseline)
+    single_card.remove_container(name)

@@ -27,7 +27,6 @@ from deployment_support import (
     CONTAINER_OPEN_OK,
     CONTAINER_PROBE_MARKER,
     container_probe_command,
-    require_container_not_running,
     run_container,
     wait_container_log_count,
 )
@@ -145,23 +144,34 @@ def test_container_without_annotation_gets_no_device(
     single_card.remove_container(reference)
 
 
-def test_annotation_pointing_at_unknown_sandbox_blocks_start(
+def test_annotation_pointing_at_unknown_sandbox_starts_without_cards(
         container, container_image):
-    """35 · annotation 指向不存在的沙盒 → 容器起不来。"""
+    """35 · annotation 指向不存在的沙盒 → 容器起得来，但一张卡都没有。
+
+    Worker 明确回答"没有这个沙盒"时 hook 无授权放行（可写层还在）；连不上 Worker
+    仍然起不来，那条边界见 36。
+    """
     missing = f"sbx_{container.user}_{secrets.token_hex(6)}.slice"
+    node = container.device_node(container.require_idle(1)[0])
     reference, result = run_container(
-        container, container_image, annotation=missing, command="sleep 60",
-        detach=False,
+        container, container_image, annotation=missing,
+        command=container_probe_command(node),
     )
-    assert result.returncode != 0, (
-        f"annotation 指向不存在的沙盒 {missing} 时容器竟然起来了；"
-        f"hook 必须退非 0、runc create 必须失败（绝不降级放行）:\n"
-        f"{(result.stdout or '')[:2000]}"
+    assert result.returncode == 0, (
+        f"annotation 指向不存在的沙盒 {missing} 时容器没起来；Worker 已经明确回答"
+        f"「没有这个沙盒」，hook 应当无授权放行:\n{(result.stdout or '')[:2000]}"
     )
-    require_container_not_running(
-        container, reference,
-        context=f"hook 拒绝了不存在的沙盒 {missing}",
+    text = wait_container_log_count(
+        container, reference, CONTAINER_PROBE_MARKER, 1)
+    assert CONTAINER_OPEN_OK not in text, (
+        f"沙盒 {missing} 根本不存在，容器里却打开了 {node} —— 无授权启动必须是"
+        f"零卡：BPF 查不到委托就该拒:\n{text[:2000]}"
     )
+    # 账号上也不该有登记。
+    container_id = container.container_id_of(reference)
+    status = container.sandbox_of_container(container_id)
+    assert status.status == 200, status.text
+    assert status.json().get("sandbox_name") is None, status.text[:500]
     container.remove_container(reference)
 
 
@@ -326,17 +336,20 @@ def test_container_restart_registers_again(container, single_card, container_ima
 
 
 def test_docker_task_opens_only_its_reserved_devices(container, container_image):
-    """51 · docker 多卡任务：自己申请的卡能开，别人预留的卡开不了。
+    """51 · docker 任务容器：自己申请的卡能开，别人预留的卡开不了。
 
     容器拿到的 ``--device`` 是**全部**受管节点（``devices.node_paths()``，驱动
     初始化需要 manager/hdc），真正的闸门是 BPF 对 ``davinciN`` 的 open 判定。
-    所以这条用例两件事一起验：申请到的两张卡在容器里打得开；同一时刻另一张被
-    别的沙盒预留的卡，在容器里打不开。
+    两件事一起验：申请到的那张卡在容器里打得开；同一时刻被另一个沙盒预留的卡
+    打不开。
+
+    只要 **2 张空闲卡**：一张给 docker 任务，另一张借给旁观沙盒 —— 之前要 3 张
+    （任务占 2 张 + 旁观 1 张），别的作业一占卡这条就报前置缺失（真机踩过）。
     """
-    first, second, bystander = container.require_idle(3)
+    first, bystander = container.require_idle(2)
     nodes = {
         minor: container.device_node(minor)
-        for minor in (first, second, bystander)
+        for minor in (first, bystander)
     }
     baseline = container.idle_devices()
 
@@ -357,30 +370,27 @@ def test_docker_task_opens_only_its_reserved_devices(container, container_image)
         probes = "; ".join(
             f"out=$( ( exec 3<{nodes[minor]} ) 2>&1 ); rc=$?; "
             f"echo SBX_PROBE_{minor}=$rc"
-            for minor in (first, second, bystander)
+            for minor in (first, bystander)
         )
         task_id = container.submit(
             f"sh -c '{probes}'",
-            device_ids=[first, second],
+            device_ids=[first],
             target={"type": "docker", "image": container_image},
         )
         task = container.wait_task(
             task_id, timeout=max(container.task_timeout, 90.0),
         )
         assert task["status"] == "completed", (
-            f"多卡 docker 任务没有完成: {task}\n"
+            f"docker 任务没有完成: {task}\n"
             f"{container.task_log_text(task_id)[:2000]}"
         )
-        assert sorted(_minor(item) for item in task["devices"]) == sorted(
-            [first, second]
-        ), task["devices"]
+        assert [_minor(item) for item in task["devices"]] == [first], task["devices"]
 
         text = container.task_log_text(task_id)
-        for minor in (first, second):
-            assert f"SBX_PROBE_{minor}=0" in text, (
-                f"容器里打不开自己申请的卡 {minor}（{nodes[minor]}）—— 登记在、"
-                f"BPF 授权没生效:\n{text[:2000]}"
-            )
+        assert f"SBX_PROBE_{first}=0" in text, (
+            f"容器里打不开自己申请的卡 {first}（{nodes[first]}）—— 登记在、"
+            f"BPF 授权没生效:\n{text[:2000]}"
+        )
         assert f"SBX_PROBE_{bystander}=1" in text, (
             f"别的沙盒预留的卡 {bystander}（{nodes[bystander]}）在容器里的探测结果"
             f"不是被拒绝（退出码 1 = 权限类错误）：退出码 0 说明容器越权打开了"

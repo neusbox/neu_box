@@ -62,8 +62,11 @@ _FILE_ORDER = (
 # 0.3.0 起有 `cancel` 与 release 的 `host_pid`；0.3.1 起 SIGINT 的 handler 在
 # **第一次请求之前**就装好 —— 之前它只在轮询开始时装，`neubox acquire` 刚发出
 # 请求、还没开始轮询的窗口里按 Ctrl-C 会走 Go 的默认动作被信号打死（退出码 -2，
-# 既不取消也不按 130 退），用例 66 会间歇性失败。
-MIN_NEUBOX_VERSION = (0, 3, 1)
+# 既不取消也不按 130 退），用例 66 会间歇性失败。0.3.2 起有 `docker start`
+# （借条式改绑，用例 84/85），老客户端没有这个子命令；0.3.3 起借不上沙盒也照常
+# start（只打警告）—— 0.3.2 有段时间同时存在"拦住 start"和"放行 start"两份
+# 二进制，版本号一样，所以这里按 0.3.3 卡。
+MIN_NEUBOX_VERSION = (0, 3, 3)
 
 
 def client_binary() -> str:

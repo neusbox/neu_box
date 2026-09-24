@@ -141,6 +141,9 @@ def test_restart_recovers_state(basic):
 def test_worker_down_blocks_annotated_container(container, container_image):
     """36 · Worker 停掉 → 容器起不来。
 
+    口径：只有 Worker 明确回答"沙盒不存在 / 正在销毁"才无授权放行（35、83）；
+    连不上属于"拿不到答案"，必须继续挡住。
+
     停服用 ``stop_worker()``（SIGTERM MainPID，和 ``pause`` 停服做的事一样；
     ``systemctl stop`` 被单元的 ``RefuseManualStop=yes`` 拒绝），恢复用
     ``start_worker()``（``neuboxctl setup``）。这里不能用
