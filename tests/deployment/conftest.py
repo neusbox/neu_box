@@ -1,0 +1,418 @@
+"""第 3 层实机验收的 pytest fixture、收集顺序与收集隔离。
+
+**这一层不跳过。** 每组一个 fixture，fixture 里检查该组的前置条件，缺什么就直接
+``pytest.fail`` 并把缺的东西写进消息 —— 这是部署验收，不是开发机上的便利
+测试。``tests/integration/`` 那两层的 skip 语义在这里是反的。
+
+七个文件就是七个组，按"越靠后越贵"排（``_FILE_ORDER``）：基本盘（不碰卡）→
+单卡 → 多卡 → 调度 → 容器 → 收尸（要跨收尸周期）→ 维护（停/起服，独占，必须
+最后）。pytest 默认按文件名字母序收集，和这个顺序不一样（``scheduling`` 会插到
+``single_device`` 前面、``reaper`` 会跑到最后），所以顺序在这里显式钉住。
+
+收集隔离：这套用例默认**不参与**开发机上的 ``pytest tests/`` —— 它打真实
+任务、真实设备、真实容器，最后几条用例还会停/起 Worker（SIGTERM MainPID +
+``setup``）。只有显式设置 ``NEU_BOX_DEPLOYMENT_TESTS=1``（``neuboxctl
+test`` 与 ``tests/deployment/run.py`` 都会设置）时才收集。
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import re
+import shutil
+import subprocess
+
+import pytest
+
+from deployment_support import (  # noqa: E402  (同目录，pytest 已把它放进 sys.path)
+    DEFAULT_CONFIG,
+    DEFAULT_MANIFEST,
+    DEFAULT_SERVICE,
+    DEFAULT_URL,
+    DEFAULT_CTL,
+    REAPER_TIMEOUT,
+    TASK_TIMEOUT,
+    Deployment,
+)
+import deployment_support as support
+
+_SELECTED = os.environ.get("NEU_BOX_DEPLOYMENT_TESTS") == "1"
+
+# 非验收模式下这个目录里什么都不收：开发机上 `pytest tests/` 必须保持干净。
+collect_ignore_glob: list[str] = [] if _SELECTED else ["test_*.py"]
+
+# 组顺序：越靠后的组越贵，也越有破坏性。``test_maintenance`` 会停/起 Worker，
+# 所有带 ``deployment_restart`` 的用例都在那里，所以它排最后。
+_FILE_ORDER = (
+    "test_basic.py",          # 1. 基本盘：不碰卡，API/日志/参数校验
+    "test_single_device.py",  # 2. 单卡
+    "test_multi_device.py",   # 3. 多卡
+    "test_scheduling.py",     # 4. 调度与优先级
+    "test_containers.py",     # 5. 容器 / OCI runtime
+    "test_client.py",         # 6. client(neubox) 基本路径：前置软缺失，没装就跳过
+    "test_client_docker.py",  # 7. client 的容器路径：docker run / stop / start / release
+    "test_driver_isolation.py",  # 8. 驱动侧隔离：读 /proc/uda 验 UDA 表
+    "test_reaper.py",         # 9. 收尸：每条都要跨收尸周期
+    "test_maintenance.py",    # 10. 停机维护：停/起服，必须最后
+)
+
+# client 组要求的最低 neubox 版本。
+#
+# 0.3.0 起有 `cancel` 与 release 的 `host_pid`；0.3.1 起 SIGINT 的 handler 在
+# **第一次请求之前**就装好 —— 之前它只在轮询开始时装，`neubox acquire` 刚发出
+# 请求、还没开始轮询的窗口里按 Ctrl-C 会走 Go 的默认动作被信号打死（退出码 -2，
+# 既不取消也不按 130 退），用例 66 会间歇性失败。0.3.2 起有 `docker start`
+# （借条式改绑，用例 84/85），老客户端没有这个子命令；0.3.3 起借不上沙盒也照常
+# start（只打警告）—— 0.3.2 有段时间同时存在"拦住 start"和"放行 start"两份
+# 二进制，版本号一样，所以这里按 0.3.3 卡。
+MIN_NEUBOX_VERSION = (0, 3, 3)
+
+
+def client_binary() -> str:
+    """neubox 二进制的路径；没装返回空串。"""
+    override = os.environ.get("NEU_BOX_CLIENT_BIN", "").strip()
+    if override:
+        return override if os.path.exists(override) else ""
+    return shutil.which("neubox") or ""
+
+
+@functools.lru_cache(maxsize=4)
+def neubox_version(path: str) -> tuple[int, ...] | None:
+    """跑 ``neubox version`` 解析出元组版本号；解析不了返回 None。"""
+    try:
+        result = subprocess.run(
+            [path, "version"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def describe_neubox() -> str:
+    """报告头里的那一行 —— 明确区分"跑了"和"跳过了"。"""
+    path = client_binary()
+    if not path:
+        return "neubox:       (未安装 → client 组会跳过)"
+    version = neubox_version(path)
+    if version is None:
+        return f"neubox:       {path} (version 输出无法解析)"
+    rendered = ".".join(str(part) for part in version)
+    required = ".".join(str(part) for part in MIN_NEUBOX_VERSION)
+    if version < MIN_NEUBOX_VERSION:
+        return f"neubox:       {path} ({rendered} < 要求 {required})"
+    return f"neubox:       {path} ({rendered})"
+
+
+def pytest_addoption(parser) -> None:
+    group = parser.getgroup("deployment", "第 3 层实机验收")
+    group.addoption(
+        "--url", "--deployment-url", dest="deployment_url", default=DEFAULT_URL,
+        help=f"Worker 地址（默认 {DEFAULT_URL}）",
+    )
+    group.addoption(
+        "--user", "--deployment-user", dest="deployment_user", default="",
+        help="执行任务的 Linux 用户（默认当前用户）",
+    )
+    group.addoption(
+        "--deployment-config", dest="deployment_config", default=DEFAULT_CONFIG,
+        help=f"Worker 环境配置文件（默认 {DEFAULT_CONFIG}）",
+    )
+    group.addoption(
+        "--deployment-manifest", dest="deployment_manifest", default=DEFAULT_MANIFEST,
+        help=f"安装清单（默认 {DEFAULT_MANIFEST}）",
+    )
+    group.addoption(
+        "--deployment-service", dest="deployment_service", default=DEFAULT_SERVICE,
+        help=f"Worker 的 systemd 单元（默认 {DEFAULT_SERVICE}）",
+    )
+    group.addoption(
+        "--deployment-ctl", dest="deployment_ctl",
+        default=DEFAULT_CTL,
+        help=f"管理 CLI 路径，起服用 `neuboxctl setup`（默认 {DEFAULT_CTL}）",
+    )
+    group.addoption(
+        "--task-timeout", dest="task_timeout", type=float, default=TASK_TIMEOUT,
+        help=f"单个任务的等待上限，秒（默认 {TASK_TIMEOUT:.0f}）",
+    )
+    group.addoption(
+        "--reaper-timeout", dest="reaper_timeout", type=float, default=REAPER_TIMEOUT,
+        help=f"等 Reaper 回收沙盒的上限，秒（默认 {REAPER_TIMEOUT:.0f}）",
+    )
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "deployment_restart: 会停/起 Worker 或让调度暂停，统一排到整套最后跑",
+    )
+
+
+def pytest_report_header(config) -> list[str]:
+    if not _SELECTED:
+        return []
+    lines = [
+        f"实机验收目标: {config.getoption('deployment_url')}",
+        f"执行用户:     {config.getoption('deployment_user') or support.current_user()}",
+    ]
+    # 慢组的时长基本等于收尸周期（那条用例至少要跨一轮），所以把周期打出来：
+    # 维护窗口里把它调小（worker.env 的 NEU_BOX_SANDBOX_REAPER_INTERVAL）是整套
+    # 验收最大的一笔可调开销（30s → 这套要多花 ~50s）。
+    try:
+        environment = support.read_env_file(config.getoption("deployment_config"))
+        interval = float(environment.get("NEU_BOX_SANDBOX_REAPER_INTERVAL") or 30)
+        lines.append(f"收尸周期:     {interval:.0f}s")
+    except Exception:  # 读不到就只少一行，不影响验收本身
+        pass
+    lines.append(describe_neubox())
+    return lines
+
+
+def pytest_collection_modifyitems(session, config, items) -> None:
+    """先按组排序，再把重启类用例挪到整套最后。
+
+    组的顺序见 ``_FILE_ORDER``（pytest 自己的字母序和我们的意图不一致）。
+    重启类用例会停/起 Worker，跑在中间会把并发用例的沙盒和任务一起带走；而
+    ``POST /maintenance/pause`` 之后 Worker 必须重启才能恢复调度。现在它们都
+    在 ``test_maintenance.py`` 里，这里再兜一层：以后谁在别的组写了 restart
+    用例，也会被挪到最后，而不是把后面的用例一起带崩。
+    """
+    order = {name: index for index, name in enumerate(_FILE_ORDER)}
+    ranked = sorted(
+        enumerate(items),
+        key=lambda pair: (
+            order.get(pair[1].location[0].rsplit("/", 1)[-1], len(order)),
+            pair[0],
+        ),
+    )
+    items[:] = [item for _index, item in ranked]
+
+    restart = [item for item in items if item.get_closest_marker("deployment_restart")]
+    if not restart:
+        return
+    items[:] = [item for item in items if item not in restart] + restart
+
+
+@pytest.fixture(scope="session")
+def deployment(request) -> Deployment:
+    """第 3 层要操作的对象集合；只构造，不做前置判定。"""
+    target = Deployment(
+        url=request.config.getoption("deployment_url"),
+        user=request.config.getoption("deployment_user"),
+        config=request.config.getoption("deployment_config"),
+        manifest=request.config.getoption("deployment_manifest"),
+        service=request.config.getoption("deployment_service"),
+        ctl=request.config.getoption("deployment_ctl"),
+        task_timeout=request.config.getoption("task_timeout"),
+        reaper_timeout=request.config.getoption("reaper_timeout"),
+    )
+    request.addfinalizer(target.cleanup)
+    return target
+
+
+@pytest.fixture(autouse=True)
+def case_cleanup(deployment: Deployment, request):
+    """用例级收尾：这一条造出来的东西，这一条结束时就得收干净。
+
+    会话级 finalizer 只在整套跑完才执行，所以一条用例中途失败留下的沙盒/终端
+    会一直占着卡，后面每一条要空闲卡的用例都跟着报假失败，失败现场还会被污染
+    成完全不相干的样子。这里只动本用例**新造**的东西，通过的用例照旧——
+    已经自己收干净时它是空操作。
+    """
+    mark = deployment.mark()
+    yield
+    recycled = deployment.cleanup_since(mark)
+    if recycled:
+        print(f"\n[收尾] {request.node.name}: " + "，".join(recycled))
+
+
+@pytest.fixture(scope="session")
+def basic(deployment: Deployment) -> Deployment:
+    """基本盘：Worker 在线、API 版本够、测试用户存在、安装清单可读。"""
+    try:
+        health = deployment.client.healthz()
+    except support.WorkerUnreachable as exc:
+        pytest.fail(
+            f"Worker 不可达（{deployment.url}）: {exc}\n"
+            f"前置缺失：请先确认 systemctl status {deployment.service} 正常、"
+            f"端口未被防火墙拦下",
+            pytrace=False,
+        )
+    if health.status != 200:
+        pytest.fail(
+            f"{deployment.url}/healthz 返回 HTTP {health.status}，Worker 未就绪:\n"
+            f"{health.text[:1000]}",
+            pytrace=False,
+        )
+    payload = health.json()
+    api_version = payload.get("api_version")
+    if not isinstance(api_version, int) or api_version < 2:
+        pytest.fail(
+            f"/healthz 的 api_version={api_version!r}，本层验收要求 >= 2",
+            pytrace=False,
+        )
+    if payload.get("role") != "worker":
+        pytest.fail(
+            f"/healthz 的 role={payload.get('role')!r}，应为 'worker'",
+            pytrace=False,
+        )
+    if not support.user_exists(deployment.user):
+        pytest.fail(
+            f"前置缺失：系统用户 {deployment.user!r} 不存在；"
+            f"用 --user 指定一个 Worker 宿主机上真实存在的用户",
+            pytrace=False,
+        )
+    status = deployment.status()
+    for field in ("total_devices", "idle_devices", "active_sandboxes", "dev_status"):
+        if field not in status:
+            pytest.fail(f"/status 缺少字段 {field!r}：{status}", pytrace=False)
+    deployment.manifest()  # 缺失直接失败
+    return deployment
+
+
+@pytest.fixture(scope="session")
+def single_card(deployment: Deployment, basic: Deployment) -> Deployment:
+    """单卡组：至少 1 张空闲设备。
+
+    空闲设备数是 Worker 的 fail-closed 判定结果：设备状态脚本跑不出来
+    （``NEU_BOX_DEVICE_INFO_SCRIPT`` 失败或报 total=0）时空闲数恒为 0，
+    所以这条前置同时覆盖了"驱动/状态脚本可用"。
+    """
+    idle = deployment.idle_devices()
+    total = deployment.total_devices()
+    if total <= 0:
+        pytest.fail(
+            f"前置缺失：Worker 没发现任何受管设备（total_devices=0）；"
+            f"检查 {deployment.config_path} 的 NEU_BOX_DEVICE_FILTER "
+            f"（当前 {deployment.device_filter!r}）与 /dev 下的设备节点",
+            pytrace=False,
+        )
+    if idle < 1:
+        pytest.fail(
+            f"前置缺失：没有空闲设备（idle_devices=0，total={total}）；"
+            f"本层不跳过 —— 要么让别的任务退出，要么先在维护窗口确认"
+            f"NEU_BOX_DEVICE_INFO_SCRIPT 能跑出空闲卡",
+            pytrace=False,
+        )
+    nodes = deployment.device_nodes()
+    missing = [minor for minor in range(total) if minor not in nodes]
+    if missing:
+        pytest.fail(
+            f"前置缺失：/dev 下找不到 minor={missing} 的受管设备节点；"
+            f"NEU_BOX_DEVICE_FILTER={deployment.device_filter!r}",
+            pytrace=False,
+        )
+    return deployment
+
+
+@pytest.fixture(scope="session")
+def multi_card(deployment: Deployment, single_card: Deployment) -> Deployment:
+    """多卡组：至少 2 张空闲设备。"""
+    idle = deployment.idle_devices()
+    if idle < 2:
+        pytest.fail(
+            f"前置缺失：多卡用例需要 2 张空闲设备，当前只有 {idle} 张；"
+            f"本层不跳过",
+            pytrace=False,
+        )
+    return deployment
+
+
+@pytest.fixture(scope="session")
+def container(deployment: Deployment, basic: Deployment) -> Deployment:
+    """容器组：dockerd 可用，且 default-runtime 指向 Neu Box 的 OCI runtime。
+
+    容器能不能拿到设备，取决于 OCI runtime hook 有没有被真的执行 —— 只有
+    dockerd 的 default-runtime 是 ``neu-box-runtime`` 才谈得上后面的用例。
+    这个名字是 runtime 侧（neu_box_runtime）的契约，不是短名 ``neu-box``。
+    """
+    runtime = deployment.default_runtime()
+    expected = os.environ.get("NEU_BOX_CONTAINER_RUNTIME", "neu-box-runtime")
+    if runtime != expected:
+        pytest.fail(
+            f"前置缺失：dockerd 的 default-runtime 是 {runtime or '(空)'!r}，"
+            f"应为 {expected!r}；此时 OCI runtime hook 不会被调用，"
+            f"容器登记不可能发生。修法见 neu_box_runtime 的 "
+            f"/etc/docker/daemon.json（runtimes + default-runtime，改完必须"
+            f"restart docker）",
+            pytrace=False,
+        )
+    return deployment
+
+
+@pytest.fixture(scope="session")
+def container_image(container: Deployment) -> str:
+    """容器组要用的镜像：本机已有，自带 shell，优先 NEU_BOX_CONTAINER_IMAGE。
+
+    镜像里的 ENTRYPOINT 一律被 ``--entrypoint sh`` 顶掉，所以这里只要求
+    ``/bin/sh`` 能用 —— 用例要在容器里跑探测脚本。
+    """
+    image = container.resolve_image()
+    probe = container.docker_run(
+        "--rm", "--entrypoint", "sh", image, "-c", "echo neu-box-image-ok",
+    )
+    if probe.returncode != 0 or "neu-box-image-ok" not in (probe.stdout or ""):
+        pytest.fail(
+            f"前置缺失：镜像 {image!r} 起不来或没有可用的 /bin/sh"
+            f"（docker run 退出码 {probe.returncode}）:\n"
+            f"{(probe.stdout or '')[:1500]}\n"
+            f"容器组用例要在容器里执行探测脚本；用 NEU_BOX_CONTAINER_IMAGE "
+            f"指定一个带 shell 的镜像",
+            pytrace=False,
+        )
+    return image
+
+
+@pytest.fixture(scope="session")
+def reaper_ready(deployment: Deployment, single_card: Deployment) -> Deployment:
+    """收尸组：需要 1 张空闲设备、Worker 在线、``/maintenance`` 可读。
+
+    收尸由 ``neuboxd`` 自己的后台线程做，没有开关，所以"线程在跑"只能靠用例
+    真的等一个周期来验证 —— 这也是这一组慢的原因（见 ``test_reaper.py``）。
+    """
+    maintenance = deployment.client.maintenance()
+    if maintenance.status != 200:
+        pytest.fail(
+            f"GET /maintenance 失败（HTTP {maintenance.status}）: "
+            f"{maintenance.text[:1000]}",
+            pytrace=False,
+        )
+    return deployment
+
+
+@pytest.fixture(scope="session")
+def neubox_bin(deployment: Deployment) -> str:
+    """client(neubox) 组的前置：二进制存在**且版本达标**。
+
+    这是本层唯一允许"缺前置就跳过"的组：neubox 是另一个仓库的产物，worker 的
+    发布流程不该因为部署机上没装它而失败（跳过原因会打印在报告头与 ``-ra`` 摘要
+    里，避免"一直跳过却没人发现"）。
+
+    但"装了却版本不够"按**失败**处理：这个版本没有 ``cancel`` / release
+    ``host_pid`` 等本次新增的行为，跑下去只会得到一堆看不懂的失败 —— 装作能用
+    比没装更危险。
+    """
+    path = client_binary()
+    if not path:
+        pytest.skip(
+            "neubox 不存在：跳过 client 组（安装 neubox，或用 NEU_BOX_CLIENT_BIN "
+            "指定二进制路径后重跑）"
+        )
+    version = neubox_version(path)
+    if version is None:
+        pytest.fail(
+            f"neubox {path} 的 version 子命令不可用或输出无法解析",
+            pytrace=False,
+        )
+    if version < MIN_NEUBOX_VERSION:
+        pytest.fail(
+            f"neubox {path} 是 {'.'.join(map(str, version))}，低于要求的 "
+            f"{'.'.join(map(str, MIN_NEUBOX_VERSION))}：client 组需要 cancel 与 "
+            f"release host_pid 等新行为，请升级 neubox（或设 NEU_BOX_CLIENT_BIN "
+            f"指向新版）",
+            pytrace=False,
+        )
+    return path

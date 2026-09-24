@@ -1,0 +1,17 @@
+BasedOnStyle: LLVM
+
+# Keep the native code's existing shape while using clang-format for layout.
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 100
+UseTab: Never
+BreakBeforeBraces: Attach
+BreakAfterAttributes: Always
+PointerAlignment: Left
+DerivePointerAlignment: false
+NamespaceIndentation: None
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+SortIncludes: false
+FixNamespaceComments: true

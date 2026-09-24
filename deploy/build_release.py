@@ -1,195 +1,148 @@
 #!/usr/bin/env python3
-"""Build a versioned, checksummed Neu Box worker deployment archive.
-
-2026-08-25 起本构建只产出 worker 角色（WebUI 见 neu_box_webui 仓库，
-Go 客户端见 neu_box_goClient 仓库，均独立发版）。
-
-产物: dist/neu-box-<version>-linux-<arch>.tar.gz
-包含: worker/  (PyInstaller) + neu-box-install (安装器)
-      + run.sh（交互式安装、升级、回滚与服务管理入口）
-      + config/worker.env.example + systemd/neu-box-worker.service
-      + share/neu-box/{sandbox,info} (沙盒脚本/设备状态脚本/BPF)
-      + docs/ + manifest.json + SHA256SUMS
-"""
+"""Build the native sandbox, PyInstaller bundles, and the binary RPM."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BUILD_ROOT = ROOT / "build" / "release"
 
 
-def _version() -> str:
-    namespace: dict[str, str] = {}
-    exec((ROOT / "src" / "neu_box" / "__init__.py").read_text(), namespace)
-    return namespace["__version__"]
-
-
-def _architecture() -> str:
-    machine = platform.machine().lower()
-    aliases = {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-    }
-    try:
-        return aliases[machine]
-    except KeyError as exc:
-        raise SystemExit(f"Unsupported build architecture: {machine}") from exc
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _run(
-    command: list[str],
-    *,
-    env: dict[str, str] | None = None,
-    cwd: Path = ROOT,
-) -> None:
+def _run(command: list[str], *, cwd: Path = ROOT) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=cwd, check=True, env=env)
+    subprocess.run(command, cwd=cwd, check=True)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
-    shutil.copytree(source, destination, symlinks=True)
+def _require_pidfd_open() -> None:
+    """拒绝用一个没有 os.pidfd_open 的解释器打包。
+
+    这个函数是 CPython 编译期决定的（构建时 <sys/syscall.h> 里要有
+    SYS_pidfd_open），conda 拿老 sysroot 编的解释器就没有。PyInstaller 会把
+    构建解释器的运行时一起打包，所以在缺它的解释器上打出来的 Worker，会在
+    ``/container/register`` 里抛 AttributeError、回 500 —— 装完一个容器都登记
+    不了，而单元测试全把这条路径换成了替身，构建期不拦就没人拦得住。
+    """
+    if not hasattr(os, "pidfd_open"):
+        raise SystemExit(
+            f"构建解释器 {sys.executable} 没有 os.pidfd_open，打出来的 Worker "
+            f"会登记不了容器。换一个有它的解释器（pyproject.toml 的 "
+            f"requires-python 上界就是为此设的）。"
+        )
+
+
+def _build_native(build_dir: Path) -> None:
+    shutil.rmtree(build_dir, ignore_errors=True)
+    _run([
+        "make",
+        "-C", str(ROOT / "native" / "sandbox"),
+        f"BUILD_DIR={build_dir}",
+        "all",
+        "test",
+    ])
+
+
+def _build_worker(dist_dir: Path, work_dir: Path) -> None:
+    # 多个 PyInstaller 产物共用同一个 --distpath，所以只清自己的目录。
+    shutil.rmtree(dist_dir / "neuboxd", ignore_errors=True)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    _run([
+        sys.executable,
+        "-m", "PyInstaller",
+        "--log-level=WARN",
+        "--clean",
+        "--noconfirm",
+        "--distpath", str(dist_dir),
+        "--workpath", str(work_dir),
+        str(ROOT / "deploy" / "pyinstaller" / "neuboxd.spec"),
+    ])
+
+
+def _build_ctl(dist_dir: Path, work_dir: Path) -> None:
+    # ``neuboxd`` 是 daemon，管理命令单独打 ``neuboxctl``，避免 daemon
+    # 暴露 setup/pause/resume/db。
+    shutil.rmtree(dist_dir / "neuboxctl", ignore_errors=True)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    _run([
+        sys.executable,
+        "-m", "PyInstaller",
+        "--log-level=WARN",
+        "--clean",
+        "--noconfirm",
+        "--distpath", str(dist_dir),
+        "--workpath", str(work_dir),
+        str(ROOT / "deploy" / "pyinstaller" / "neuboxctl.spec"),
+    ])
+    entry = dist_dir / "neuboxctl" / "neuboxctl"
+    _run([str(entry), "help"])
+
+
+def _build_deployment_tests(dist_dir: Path, work_dir: Path) -> None:
+    """打包第 3 层实机验收套件。
+
+    产物自带 pytest 和套件源码，部署机不需要 Python —— 装完 worker RPM 就能
+    ``neuboxctl test``。
+    """
+    shutil.rmtree(dist_dir / "neu-box-deployment-tests", ignore_errors=True)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    _run([
+        sys.executable,
+        "-m", "PyInstaller",
+        "--log-level=WARN",
+        "--clean",
+        "--noconfirm",
+        "--distpath", str(dist_dir),
+        "--workpath", str(work_dir),
+        str(ROOT / "deploy" / "pyinstaller" / "deployment_tests.spec"),
+    ])
+    # 打包期自检：产物能起来、pytest 真的在包里、套件源码齐全。
+    entry = dist_dir / "neu-box-deployment-tests" / "neu-box-deployment-tests"
+    _run([str(entry), "--self-check"])
 
 
 def main() -> int:
+    _require_pidfd_open()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", default=str(ROOT / "dist"))
-    parser.add_argument("--skip-pyinstaller", action="store_true")
+    parser.add_argument("--output-dir", default=str(ROOT / "dist" / "rpm"))
+    parser.add_argument("--release", default="1", help="RPM release number")
+    parser.add_argument(
+        "--source-only",
+        action="store_true",
+        help="compose the binary payload source archive without rpmbuild",
+    )
     args = parser.parse_args()
 
-    version = _version()
-    if not version or "/" in version or version in {".", ".."}:
-        parser.error("project version must be a non-empty path-safe value")
-    architecture = _architecture()
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    native_build = BUILD_ROOT / "native-sandbox"
+    pyinstaller_dist = BUILD_ROOT / "pyinstaller-dist"
+    pyinstaller_work = BUILD_ROOT / "pyinstaller-work"
 
-    work_root = ROOT / "build" / "release"
-    pyi_dist = work_root / "pyinstaller-dist"
-    pyi_work = work_root / "pyinstaller-work"
-    generated = work_root / "generated"
-    generated.mkdir(parents=True, exist_ok=True)
+    _build_native(native_build)
+    _build_worker(pyinstaller_dist, pyinstaller_work / "worker")
+    _build_ctl(pyinstaller_dist, pyinstaller_work / "ctl")
+    _build_deployment_tests(
+        pyinstaller_dist, pyinstaller_work / "deployment-tests",
+    )
 
-    bpf_object = generated / "device_block.o"
-    _run([
-        "clang", "-O2", "-g", "-target", "bpf", "-c",
-        str(
-            ROOT
-            / "src"
-            / "neu_box"
-            / "worker"
-            / "resources"
-            / "sandbox"
-            / "v2"
-            / "device_block.bpf.c"
-        ),
-        "-o", str(bpf_object),
-    ])
-
-    if not args.skip_pyinstaller:
-        shutil.rmtree(pyi_dist, ignore_errors=True)
-        shutil.rmtree(pyi_work, ignore_errors=True)
-        build_environment = os.environ.copy()
-        build_environment["NEU_BOX_BUILD_BPF_OBJECT"] = str(bpf_object)
-        for role in ("worker", "installer"):
-            _run([
-                sys.executable,
-                "-m",
-                "PyInstaller",
-                "--log-level=WARN",
-                "--clean",
-                "--noconfirm",
-                "--distpath",
-                str(pyi_dist),
-                "--workpath",
-                str(pyi_work / role),
-                str(ROOT / "deploy" / "pyinstaller" / f"{role}.spec"),
-            ], env=build_environment)
-
-    if not (pyi_dist / "neu-box-worker").is_dir():
-        raise SystemExit("missing PyInstaller output for worker")
-    if not (pyi_dist / "neu-box-install").is_file():
-        raise SystemExit("missing PyInstaller output for installer")
-
-    archive_name = f"neu-box-{version}-linux-{architecture}"
-    with tempfile.TemporaryDirectory(prefix="neu-box-release-") as raw_temp:
-        staging = Path(raw_temp) / archive_name
-        staging.mkdir()
-        _copy_tree(pyi_dist / "neu-box-worker", staging / "worker")
-        shutil.copy2(pyi_dist / "neu-box-install", staging / "neu-box-install")
-        os.chmod(staging / "neu-box-install", 0o755)
-        shutil.copy2(ROOT / "run.sh", staging / "run.sh")
-        os.chmod(staging / "run.sh", 0o755)
-        _copy_tree(ROOT / "deploy" / "config", staging / "config")
-        _copy_tree(ROOT / "deploy" / "systemd", staging / "systemd")
-        _copy_tree(
-            ROOT / "src" / "neu_box" / "worker" / "resources",
-            staging / "share" / "neu-box",
-        )
-        bpf_source = staging / "share" / "neu-box" / "sandbox" / "v2" / "device_block.bpf.c"
-        bpf_out = bpf_source.with_suffix("").with_suffix(".o")
-        shutil.copy2(generated / "device_block.o", bpf_out)
-        shutil.copy2(ROOT / "LICENSE", staging / "LICENSE")
-        shutil.copy2(ROOT / "README.md", staging / "README.md")
-        _copy_tree(ROOT / "docs", staging / "docs")
-
-        manifest = {
-            "format": 1,
-            "name": "neu-box",
-            "version": version,
-            "os": "linux",
-            "architecture": architecture,
-            "built_at": datetime.now(timezone.utc).isoformat(),
-            "python": platform.python_version(),
-        }
-        (staging / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-        checksums: list[str] = []
-        for path in sorted(staging.rglob("*")):
-            if path.is_file() and path.name != "SHA256SUMS":
-                relative = path.relative_to(staging)
-                checksums.append(f"{_sha256(path)}  {relative.as_posix()}")
-        (staging / "SHA256SUMS").write_text(
-            "\n".join(checksums) + "\n",
-            encoding="utf-8",
-        )
-
-        archive = output_dir / f"{archive_name}.tar.gz"
-        temporary_archive = archive.with_name(archive.name + ".tmp")
-        with tarfile.open(temporary_archive, "w:gz", format=tarfile.PAX_FORMAT) as tar:
-            tar.add(staging, arcname=archive_name)
-        os.replace(temporary_archive, archive)
-        checksum_file = archive.with_suffix(archive.suffix + ".sha256")
-        checksum_file.write_text(
-            f"{_sha256(archive)}  {archive.name}\n",
-            encoding="utf-8",
-        )
-        print(archive)
+    command = [
+        sys.executable,
+        str(ROOT / "deploy" / "rpm" / "build_rpm.py"),
+        "--release", args.release,
+        "--output-dir", str(Path(args.output_dir).expanduser().resolve()),
+        "--worker-bundle", str(pyinstaller_dist / "neuboxd"),
+        "--ctl-bundle", str(pyinstaller_dist / "neuboxctl"),
+        "--tests-bundle", str(pyinstaller_dist / "neu-box-deployment-tests"),
+        "--sandbox-executable", str(native_build / "neu-box-sandbox"),
+        "--bpf-object", str(native_build / "device_block.o"),
+    ]
+    if args.source_only:
+        command.append("--source-only")
+    _run(command)
     return 0
 
 

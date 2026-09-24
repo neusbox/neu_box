@@ -1,0 +1,6 @@
+Checks: >
+  -*,
+  clang-diagnostic-*,
+  modernize-use-trailing-return-type
+HeaderFilterRegex: '.*/native/sandbox/(src|tests)/.*'
+FormatStyle: file
