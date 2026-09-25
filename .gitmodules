@@ -1,6 +1,3 @@
 [submodule "webui"]
 	path = thirds/webui
 	url = https://github.com/neusbox/neu_box_webui.git
-[submodule "goClient"]
-	path = thirds/goClient
-	url = https://github.com/neusbox/neu_box_goClient.git

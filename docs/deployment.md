@@ -1,19 +1,16 @@
 # 部署与升级手册（worker）
 
-## 三仓库结构
-
-2026-08-25 起 Neu Box 拆分为三个独立维护、独立发版的仓库：
+## 仓库结构
 
 | 仓库 | 角色 | 版本 | 部署 |
 |---|---|---|---|
-| **neu_box**（本仓库） | worker：节点侧设备沙盒 + 任务执行 | 0.4.0+ | `/opt/neu-box/releases/<v>` + `current`（安装器 `neu-box-install`） |
+| **neu_box**（本仓库） | worker：节点侧设备沙盒 + 任务执行；neubox CLI（`client/neubox/`） | 0.4.0+，Worker 与 CLI 同版本 | `/opt/neu-box/releases/<v>` + `current`（安装器 `neu-box-install`）；CLI 链接到 `/usr/local/bin/neubox`（兼 `/usr/local/bin/neu-sbox`） |
 | [neu_box_webui](https://github.com/neusbox/neu_box_webui) | WebUI：节点池 / 转发 / 实验记录 | 0.1.0+ | Python 3.11+ 源码运行（`uv sync`，不打包） |
-| [neu_box_goClient](https://github.com/neusbox/neu_box_goClient) | `neu-sbox` Go 客户端（直连 worker） | 0.2.0+ | `/usr/local/bin/neu-sbox`（install.sh，静态二进制） |
 
-三者只通过 HTTP 契约相交（worker API 见 [worker-api.md](worker-api.md)，
-WebUI API 见 webui 仓库 docs/master-api.md）。兼容矩阵用本仓库的
-submodule 指针（`thirds/webui/`、`thirds/goClient/`）表达：指针指向的提交即该版本
-已验证的配套版本。
+两者只通过 HTTP 契约相交（worker API 见 [worker-api.md](worker-api.md)，
+WebUI API 见 webui 仓库 docs/master-api.md）。WebUI 的兼容矩阵用本仓库的
+submodule 指针（`thirds/webui/`）表达：指针指向的提交即该版本已验证的
+配套版本。neubox CLI 与 Worker 同仓同版本号，不存在独立版本线。
 
 ## 发布模型
 
@@ -21,6 +18,7 @@ submodule 指针（`thirds/webui/`、`thirds/goClient/`）表达：指针指向�
 - 包内容：`worker/`（PyInstaller 可执行目录）、`neu-box-install`（安装器）、
   `run.sh`（交互管理入口）、
   `config/worker.env.example`、`systemd/neu-box-worker.service`、
+  `share/neu-box/client/neubox`（静态 Go 客户端，与 Worker 同版本）、
   `share/neu-box/{sandbox,info}`（沙盒脚本/设备状态脚本/BPF 对象）、
   `docs/`、`manifest.json`、`SHA256SUMS`（逐文件校验和）
 - 版本钉死：同一版本号不同内容**拒绝安装**（`/opt/neu-box/releases/<v>`
@@ -37,6 +35,9 @@ submodule 指针（`thirds/webui/`、`thirds/goClient/`）表达：指针指向�
 - Docker 客户端（仅容器执行目标需要）
 
 ## 构建发布包
+
+构建需要 Go 工具链（构建静态 neubox 客户端，版本从
+`src/neu_box/__init__.py` 注入）、clang（编译 BPF 对象）和 PyInstaller：
 
 ```bash
 uv sync --frozen --all-groups             # 安装锁定依赖（含 PyInstaller）
@@ -73,6 +74,12 @@ sudo ./neu-box-install install --role worker
 安装器：校验 SHA256SUMS → 释放到 `/opt/neu-box/releases/<v>/` → 链
 `current` → 生成 `/etc/neu-box/worker.env`（已存在则保留）→ 安装
 `neu-box-worker.service` 并启动 → 健康检查（`/healthz`）。
+
+neubox 客户端随包交付：安装器把发布树内的
+`share/neu-box/client/neubox` 链接到 `/usr/local/bin/neubox`，并维护
+`/usr/local/bin/neu-sbox` 兼容符号链接。两个入口都经 `current` 指向当前
+版本，升级/回滚只切 `current`，入口本身不变；被替换的已有文件/链接会先
+快照，部署失败时恢复。
 
 ## 从 GitHub Release 在线更新
 
@@ -217,8 +224,8 @@ sudo ./neu-box-install rollback --yes    # 非交互
 ## API 版本
 
 `/healthz` 与 `/status` 上报 `api_version`（当前 `2`）。仅破坏性变更
-（删字段、改语义）时 +1；新增字段/端点不升版本。WebUI 与 Go 客户端
-据此做兼容性检查（见各自仓库文档）。
+（删字段、改语义）时 +1；新增字段/端点不升版本。WebUI 据此做兼容性检查
+（见 webui 仓库文档）；同仓的 neubox 客户端用 `neubox check` 做同样的检查。
 
 ## e2e 集成测试
 

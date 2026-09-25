@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Build a versioned, checksummed Neu Box worker deployment archive.
 
-2026-08-25 起本构建只产出 worker 角色（WebUI 见 neu_box_webui 仓库，
-Go 客户端见 neu_box_goClient 仓库，均独立发版）。
+Worker 与 Go 客户端（neubox）同仓同版本：版本号取自
+src/neu_box/__init__.py，构建时以 ldflags 注入客户端，发布包内不再保留
+独立客户端版本。WebUI 见 neu_box_webui 仓库（thirds/webui submodule）。
 
 产物: dist/neu-box-<version>-linux-<arch>.tar.gz
 包含: worker/  (PyInstaller) + neu-box-install (安装器)
       + run.sh（交互式安装、升级、回滚与服务管理入口）
       + config/worker.env.example + systemd/neu-box-worker.service
+      + share/neu-box/client/neubox (静态 Go 客户端，与 Worker 同版本)
       + share/neu-box/{sandbox,info} (沙盒脚本/设备状态脚本/BPF)
       + docs/ + manifest.json + SHA256SUMS
 """
@@ -73,6 +75,48 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True)
 
 
+def _build_client(generated: Path, version: str, architecture: str) -> Path:
+    """Build the static Linux Go client for the target architecture.
+
+    The client version is the release version: it is injected with the same
+    value that the PyInstaller worker binary carries, so the release never
+    contains an independently versioned client.
+    """
+    go = shutil.which("go")
+    if not go:
+        raise SystemExit(
+            "missing Go toolchain: install Go to build the static neubox client"
+        )
+    client = generated / "neubox"
+    client_source = ROOT / "client" / "neubox"
+    if not (client_source / "go.mod").is_file():
+        raise SystemExit(f"missing Go client source: {client_source}")
+    go_environment = os.environ.copy()
+    go_environment.update({
+        "CGO_ENABLED": "0",
+        "GOOS": "linux",
+        "GOARCH": architecture,
+        "GOTOOLCHAIN": "local",
+        "GOCACHE": str(generated.parent / "go-cache"),
+        "GOMODCACHE": str(generated.parent / "go-mod-cache"),
+    })
+    version_symbol = "github.com/neusbox/neu_box/client/neubox/internal/cli.version"
+    _run([
+        go,
+        "build",
+        "-trimpath",
+        "-buildvcs=false",
+        "-tags=netgo,osusergo",
+        "-ldflags", f"-s -w -X {version_symbol}={version}",
+        "-o",
+        str(client),
+        "./cmd/neubox",
+    ], env=go_environment, cwd=client_source)
+    if not client.is_file():
+        raise SystemExit("Go client build produced no binary")
+    return client
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default=str(ROOT / "dist"))
@@ -107,6 +151,8 @@ def main() -> int:
         ),
         "-o", str(bpf_object),
     ])
+
+    _build_client(generated, version, architecture)
 
     if not args.skip_pyinstaller:
         shutil.rmtree(pyi_dist, ignore_errors=True)
@@ -148,6 +194,10 @@ def main() -> int:
             ROOT / "src" / "neu_box" / "worker" / "resources",
             staging / "share" / "neu-box",
         )
+        client_destination = staging / "share" / "neu-box" / "client" / "neubox"
+        client_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(generated / "neubox", client_destination)
+        os.chmod(client_destination, 0o755)
         bpf_source = staging / "share" / "neu-box" / "sandbox" / "v2" / "device_block.bpf.c"
         bpf_out = bpf_source.with_suffix("").with_suffix(".o")
         shutil.copy2(generated / "device_block.o", bpf_out)

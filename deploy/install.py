@@ -169,7 +169,7 @@ def _within(path: Path, root: Path) -> bool:
         return False
 
 
-def verify_release(source: Path) -> dict:
+def verify_release(source: Path, *, require_client: bool = True) -> dict:
     source = source.resolve()
     manifest_path = source / "manifest.json"
     checksum_path = source / "SHA256SUMS"
@@ -240,6 +240,8 @@ def verify_release(source: Path) -> dict:
         ("share/neu-box/sandbox/v2/sandbox.sh", True),
         ("share/neu-box/sandbox/v2/device_block.o", False),
     ]
+    if require_client:
+        required_files.append(("share/neu-box/client/neubox", True))
     for relative, executable_required in required_files:
         path = source / relative
         if not path.is_file():
@@ -395,6 +397,63 @@ def _restore_path(snapshot: PathSnapshot) -> None:
         _atomic_copy(snapshot.backup, path)
         return
     raise InstallError(f"未知文件快照类型: {snapshot.kind}")
+
+
+def _serialize_client_snapshots(
+    snapshots: Iterable[PathSnapshot],
+) -> list[dict[str, str | None]]:
+    """Persist the pre-upgrade CLI state for rollback to split releases."""
+    result = []
+    for snapshot in snapshots:
+        result.append({
+            "name": snapshot.path.name,
+            "kind": snapshot.kind,
+            "backup": str(snapshot.backup) if snapshot.backup else None,
+            "link_target": snapshot.link_target,
+        })
+    return result
+
+
+def _deserialize_client_snapshots(
+    layout: Layout,
+    raw: object,
+) -> list[PathSnapshot]:
+    """Load and validate root-owned CLI snapshots from install state."""
+    if not isinstance(raw, list):
+        raise InstallError("回滚状态缺少旧客户端快照")
+    parsed: list[PathSnapshot] = []
+    expected_names = {"neubox", "neu-sbox"}
+    seen_names: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise InstallError("回滚状态中的客户端快照无效")
+        name = entry.get("name")
+        kind = entry.get("kind")
+        if name not in expected_names or name in seen_names:
+            raise InstallError("回滚状态中的客户端路径无效")
+        if kind not in {"missing", "file", "symlink"}:
+            raise InstallError("回滚状态中的客户端快照类型无效")
+        backup = None
+        if kind == "file":
+            raw_backup = entry.get("backup")
+            if not isinstance(raw_backup, str):
+                raise InstallError("回滚状态缺少客户端备份路径")
+            backup = Path(raw_backup)
+            if not _within(backup, layout.backups) or not backup.is_file():
+                raise InstallError(f"客户端回滚备份无效: {backup}")
+        link_target = entry.get("link_target")
+        if kind == "symlink" and not isinstance(link_target, str):
+            raise InstallError("回滚状态缺少客户端链接目标")
+        parsed.append(PathSnapshot(
+            path=layout.bin / str(name),
+            kind=str(kind),
+            backup=backup,
+            link_target=link_target if isinstance(link_target, str) else None,
+        ))
+        seen_names.add(str(name))
+    if seen_names != expected_names:
+        raise InstallError("回滚状态中的客户端快照不完整")
+    return parsed
 
 
 def _write_state(layout: Layout, state: dict) -> None:
@@ -708,6 +767,27 @@ def _install_self(layout: Layout, release: Path) -> None:
     launcher = release / "run.sh"
     if launcher.is_file() and os.access(launcher, os.X_OK):
         _atomic_copy(launcher, layout.sbin / "neu-box", 0o755)
+
+
+def _install_worker_client(layout: Layout) -> None:
+    """Install the neubox CLI and the legacy neu-sbox compatibility symlink.
+
+    Both commands symlink into the immutable release tree via ``current``,
+    so version switching and rollback only move ``current``; the links stay
+    valid for whichever release is active.
+    """
+    source = layout.current / "share" / "neu-box" / "client" / "neubox"
+    if not source.is_file() or not os.access(source, os.X_OK):
+        raise InstallError(f"发布包缺少 neubox 客户端: {source}")
+    layout.bin.mkdir(parents=True, exist_ok=True)
+    relative_target = os.path.relpath(source, start=layout.bin)
+    for name in ("neubox", "neu-sbox"):
+        destination = layout.bin / name
+        temporary = layout.bin / f".{name}-{os.getpid()}"
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+        temporary.symlink_to(relative_target)
+        os.replace(temporary, destination)
 
 
 def _systemd_available(layout: Layout, no_systemd: bool) -> bool:
@@ -1084,8 +1164,18 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
     backup_complete = False
     services_touched = False
     switched = False
+    client_snapshots: list[PathSnapshot] = []
     try:
         snapshot_dir = backup_set / "replaced-files"
+        client_snapshots.append(_snapshot_path(
+            layout.bin / "neubox",
+            snapshot_dir,
+        ))
+        client_snapshots.append(_snapshot_path(
+            layout.bin / "neu-sbox",
+            snapshot_dir,
+        ))
+        snapshots.extend(client_snapshots)
         if systemd:
             for role in roles:
                 snapshots.append(_snapshot_path(
@@ -1122,7 +1212,10 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
             _healthcheck(layout, affected, version)
         if layout.root == Path("/"):
             _install_self(layout, release)
+        _install_worker_client(layout)
         _restore_selinux_contexts(layout, [
+            layout.bin / "neubox",
+            layout.bin / "neu-sbox",
             layout.sbin / "neu-box-install",
             layout.sbin / "neu-box",
         ])
@@ -1133,6 +1226,9 @@ def deploy(args: argparse.Namespace, layout: Layout) -> int:
                 "version": previous_version,
                 "database_backups": backups,
                 "config_backup": config_backup,
+                "client_snapshots": _serialize_client_snapshots(
+                    client_snapshots,
+                ),
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
             }
         _write_state(layout, {
@@ -1179,9 +1275,22 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
     previous_release = (layout.releases / previous_version).resolve()
     if not _within(previous_release, layout.releases):
         raise InstallError("回滚版本目录越过 releases 边界")
-    manifest = verify_release(previous_release)
+    bundled_client = (
+        previous_release / "share" / "neu-box" / "client" / "neubox"
+    )
+    has_bundled_client = bundled_client.exists() or bundled_client.is_symlink()
+    manifest = verify_release(
+        previous_release,
+        require_client=has_bundled_client,
+    )
     if str(manifest.get("version")) != previous_version:
         raise InstallError("回滚目录名与 manifest 版本不一致")
+    previous_client_snapshots = None
+    if not has_bundled_client:
+        previous_client_snapshots = _deserialize_client_snapshots(
+            layout,
+            previous.get("client_snapshots"),
+        )
     systemd = _systemd_available(layout, args.no_systemd)
     _preflight_host(layout, previous_release, roles, systemd)
     if not args.yes:
@@ -1203,8 +1312,18 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
     rescue_config: str | None = None
     backup_complete = False
     services_touched = False
+    client_snapshots: list[PathSnapshot] = []
     try:
         snapshot_dir = backup_set / "replaced-files"
+        client_snapshots.append(_snapshot_path(
+            layout.bin / "neubox",
+            snapshot_dir,
+        ))
+        client_snapshots.append(_snapshot_path(
+            layout.bin / "neu-sbox",
+            snapshot_dir,
+        ))
+        snapshots.extend(client_snapshots)
         if systemd:
             for role in roles:
                 snapshots.append(_snapshot_path(
@@ -1239,6 +1358,17 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
             _healthcheck(layout, affected, str(manifest["version"]))
         if layout.root == Path("/"):
             _install_self(layout, previous_release)
+        if has_bundled_client:
+            _install_worker_client(layout)
+        else:
+            for snapshot in previous_client_snapshots or []:
+                _restore_path(snapshot)
+        _restore_selinux_contexts(layout, [
+            layout.bin / "neubox",
+            layout.bin / "neu-sbox",
+            layout.sbin / "neu-box-install",
+            layout.sbin / "neu-box",
+        ])
 
         _write_state(layout, {
             "format": STATE_FORMAT,
@@ -1248,6 +1378,9 @@ def rollback(args: argparse.Namespace, layout: Layout) -> int:
                 "version": str(state.get("current_version")),
                 "database_backups": rescue,
                 "config_backup": rescue_config,
+                "client_snapshots": _serialize_client_snapshots(
+                    client_snapshots,
+                ),
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
             },
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1285,7 +1418,8 @@ def _parser() -> argparse.ArgumentParser:
         description=(
             "安装、升级或回滚 Neu Box 的版本化发布包。\n"
             "install/upgrade 自动校验包、备份 SQLite、试跑并执行迁移、\n"
-            "切换版本、启动服务和检查健康状态；失败时恢复原状态。"
+            "切换版本、启动服务、检查健康状态并维护 neubox/neu-sbox\n"
+            "客户端符号链接；失败时恢复原状态。"
         ),
         epilog=(
             "示例：\n"

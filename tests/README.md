@@ -5,10 +5,13 @@
 ## 单元与发布流程测试
 
 ```bash
-UV_CACHE_DIR=/tmp/neu-box-uv-cache uv run --frozen pytest -q
+UV_CACHE_DIR=/tmp/neu-box-uv-cache ./run.sh test
+# 或分开执行：
+#   uv run --frozen pytest -q tests/unit
+#   cd client/neubox && go test ./... && go vet ./...
 ```
 
-它覆盖数据库迁移、应用工厂、发布包校验，以及无特权目录中的安装、升级、失败恢复和数据库回滚。`pyproject.toml` 将 pytest 默认范围限制在 `tests/unit/`，避免开发时意外向生产节点提交任务。
+它覆盖数据库迁移、应用工厂、发布包校验，以及无特权目录中的安装、升级、失败恢复和数据库回滚（含 neubox/neu-sbox 客户端符号链接的安装、升级、回滚与失败恢复）。Go 客户端的单元测试与 vet 属于同一测试入口。`pyproject.toml` 将 pytest 默认范围限制在 `tests/unit/`，避免开发时意外向生产节点提交任务。
 
 ## 已部署环境集成测试
 

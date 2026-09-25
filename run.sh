@@ -26,7 +26,7 @@ usage() {
   service-status               显示 systemd 服务状态
   logs                         跟踪 worker 日志
   build                        从源码构建发布包
-  test                         运行 worker 单元测试
+  test                         运行单元测试（Python worker + Go 客户端）
   deployment-test [测试选项]  一键验收已部署的 worker（源码仓库）
   -h, --help                   显示帮助
 
@@ -223,9 +223,13 @@ build_release() {
 run_tests() {
     require_source_tree
     require_command uv
+    require_command go
     cd "$SCRIPT_DIR"
     unset VIRTUAL_ENV || true
     uv run --frozen pytest -q tests/unit
+    cd "$SCRIPT_DIR/client/neubox"
+    go test ./...
+    go vet ./...
 }
 
 run_deployment_test() {
@@ -613,7 +617,7 @@ menu() {
   8) 查看服务状态
   9) 跟踪服务日志
  10) 构建发布包（源码仓库）
- 11) 运行单元测试（源码仓库）
+ 11) 运行单元测试（Python+Go，源码仓库）
  12) 一键验收已部署 Worker（源码仓库）
  13) 从 GitHub Release 在线更新
   0) 退出

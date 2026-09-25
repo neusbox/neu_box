@@ -49,6 +49,29 @@ def _write_checksums(release: Path) -> None:
     )
 
 
+def _client_binary(release: Path, version: str) -> Path:
+    client = release / "share" / "neu-box" / "client" / "neubox"
+    client.parent.mkdir(parents=True)
+    client.write_text(f"fake-neubox-{version}\n", encoding="utf-8")
+    client.chmod(0o755)
+    return client
+
+
+def _client_links(layout: install.Layout) -> dict[str, Path]:
+    """Resolve both client command names and assert they land in the active release."""
+    resolved = {}
+    for name in ("neubox", "neu-sbox"):
+        link = layout.bin / name
+        assert link.is_symlink(), f"{name} 不是符号链接: {link}"
+        target = link.resolve()
+        assert target.is_file(), f"{name} 指向无效文件: {target}"
+        assert str(target).startswith(str(layout.releases.resolve())), (
+            f"{name} 没有指向发布树: {target}"
+        )
+        resolved[name] = target
+    return resolved
+
+
 def _fake_release(tmp_path: Path, version: str) -> Path:
     release = tmp_path / f"source-{version}"
     for role in install.ROLES:
@@ -67,6 +90,7 @@ def _fake_release(tmp_path: Path, version: str) -> Path:
     sandbox_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     sandbox_script.chmod(0o755)
     (sandbox / "device_block.o").write_bytes(b"fake-bpf-object")
+    _client_binary(release, version)
     config = release / "config"
     config.mkdir()
     (config / "worker.env.example").write_text(
@@ -107,6 +131,141 @@ def _deploy(
         "--source", str(source),
         "--no-start",
     ])
+
+
+def test_release_without_client_is_rejected(tmp_path):
+    release = _fake_release(tmp_path, "1.0.0")
+    (release / "share" / "neu-box" / "client" / "neubox").unlink()
+    _write_checksums(release)
+
+    try:
+        install.verify_release(release)
+    except install.InstallError as exc:
+        assert "share/neu-box/client/neubox" in str(exc)
+    else:
+        raise AssertionError("release without client binary was accepted")
+
+
+def test_install_creates_client_and_compatibility_links(tmp_path):
+    root = tmp_path / "root"
+    release = _fake_release(tmp_path, "1.0.0")
+
+    assert _deploy(root, release) == 0
+    layout = install.Layout(root)
+    resolved = _client_links(layout)
+    expected = layout.current / "share" / "neu-box" / "client" / "neubox"
+    assert resolved["neubox"] == expected.resolve()
+    assert resolved["neu-sbox"] == expected.resolve()
+    assert expected.read_text(encoding="utf-8") == "fake-neubox-1.0.0\n"
+
+
+def test_upgrade_points_client_links_at_new_release(tmp_path):
+    root = tmp_path / "root"
+    release_one = _fake_release(tmp_path, "1.0.0")
+    release_two = _fake_release(tmp_path, "1.1.0")
+
+    assert _deploy(root, release_one) == 0
+    assert _deploy(root, release_two, "upgrade") == 0
+    layout = install.Layout(root)
+    assert install._current_release(layout).name == "1.1.0"
+    resolved = _client_links(layout)
+    expected = layout.current / "share" / "neu-box" / "client" / "neubox"
+    assert resolved["neubox"] == expected.resolve()
+    assert resolved["neu-sbox"] == expected.resolve()
+    assert expected.read_text(encoding="utf-8") == "fake-neubox-1.1.0\n"
+
+
+def test_rollback_points_client_links_at_previous_release(tmp_path):
+    root = tmp_path / "root"
+    release_one = _fake_release(tmp_path, "1.0.0")
+    release_two = _fake_release(tmp_path, "1.1.0")
+    assert _deploy(root, release_one) == 0
+    assert _deploy(root, release_two, "upgrade") == 0
+    assert install.main([
+        "--root", str(root),
+        "--no-systemd",
+        "rollback",
+        "--yes",
+        "--no-start",
+    ]) == 0
+
+    layout = install.Layout(root)
+    assert install._current_release(layout).name == "1.0.0"
+    resolved = _client_links(layout)
+    expected = layout.current / "share" / "neu-box" / "client" / "neubox"
+    assert resolved["neubox"] == expected.resolve()
+    assert resolved["neu-sbox"] == expected.resolve()
+    assert expected.read_text(encoding="utf-8") == "fake-neubox-1.0.0\n"
+
+
+def test_rollback_to_pre_merge_release_restores_external_clients(tmp_path):
+    root = tmp_path / "root"
+    release_one = _fake_release(tmp_path / "one", "1.0.0")
+    release_two = _fake_release(tmp_path / "two", "1.1.0")
+    assert _deploy(root, release_one) == 0
+    layout = install.Layout(root)
+
+    # Simulate a release created before neubox was bundled.  Its CLI lived
+    # outside the release tree and must survive the first merged upgrade.
+    installed_old = layout.releases / "1.0.0"
+    (installed_old / "share" / "neu-box" / "client" / "neubox").unlink()
+    _write_checksums(installed_old)
+    for name in ("neubox", "neu-sbox"):
+        (layout.bin / name).unlink()
+    (layout.bin / "neubox").write_text(
+        "legacy-external-client\n",
+        encoding="utf-8",
+    )
+    (layout.bin / "neu-sbox").symlink_to("neubox")
+
+    assert _deploy(root, release_two, "upgrade") == 0
+    assert install.main([
+        "--root", str(root),
+        "--no-systemd",
+        "rollback",
+        "--yes",
+        "--no-start",
+    ]) == 0
+
+    assert install._current_release(layout).name == "1.0.0"
+    assert not (layout.bin / "neubox").is_symlink()
+    assert (layout.bin / "neubox").read_text(
+        encoding="utf-8",
+    ) == "legacy-external-client\n"
+    assert (layout.bin / "neu-sbox").is_symlink()
+    assert (layout.bin / "neu-sbox").readlink() == Path("neubox")
+
+
+def test_failed_upgrade_restores_client_links_and_user_file(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "root"
+    release_one = _fake_release(tmp_path / "one", "1.0.0")
+    release_two = _fake_release(tmp_path / "two", "1.1.0")
+    assert _deploy(root, release_one) == 0
+    layout = install.Layout(root)
+
+    # 模拟用户手工替换 neubox（例如旧 goClient 独立安装留下的普通文件）
+    override = layout.bin / "neubox"
+    override.unlink()
+    override.write_text("user-managed\n", encoding="utf-8")
+    sbox_target_before = (layout.bin / "neu-sbox").readlink()
+
+    def fail_write_state(_layout, _state):
+        raise install.InstallError("simulated state write failure")
+
+    monkeypatch.setattr(install, "_write_state", fail_write_state)
+    assert _deploy(root, release_two, "upgrade") == 1
+
+    assert install._current_release(layout).name == "1.0.0"
+    # neubox 恢复为用户文件；neu-sbox 恢复为升级前符号链接
+    assert not override.is_symlink()
+    assert override.read_text(encoding="utf-8") == "user-managed\n"
+    assert (layout.bin / "neu-sbox").is_symlink()
+    assert (layout.bin / "neu-sbox").readlink() == sbox_target_before
+    expected = layout.current / "share" / "neu-box" / "client" / "neubox"
+    assert (layout.bin / "neu-sbox").resolve() == expected.resolve()
 
 
 def test_staged_install_upgrade_and_database_rollback(tmp_path):
