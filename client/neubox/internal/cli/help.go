@@ -20,8 +20,9 @@ func (a *app) printHelpTo(writer io.Writer) {
     neubox [--json] docker run <docker 参数...>
     neubox [--json] docker start <容器> [docker 参数...]
     neubox [--json] {list|status|check|join|result} [参数]
-    neubox [--json] tasks [--all] [--since 4h]
-    neubox wait <task_id> [--interval 2s] [--timeout 0]
+    neubox [--json] tasks [--all | --since 4h] [--no-command]
+    neubox [--json] tasks [--task-id ID] [--health]
+    neubox [--json] wait <task_id> [<task_id> ...] [--interval 2s] [--timeout 0]
 
 全局选项:
     --json                 只输出机器可读 JSON；失败信息写入 stderr
@@ -31,7 +32,7 @@ func (a *app) printHelpTo(writer io.Writer) {
     JSON 模式              --json 可放在子命令前或紧跟子命令
                            成功结果写入 stdout，失败对象写入 stderr
     result --json          在任务元数据中增加 log 字段
-    wait                   增量输出任务日志并等待终态；暂不支持 --json
+    wait                   等待任务结束，输出增量日志或状态快照
     submit ... -- ...      -- 后面的参数属于目标命令，不再解析为 neubox 选项
 
 命令说明:
@@ -78,8 +79,16 @@ submit 选项:
                                  结束的任务（宁少勿刷屏）
     tasks --all                  显示 worker 返回的全部任务
     tasks --since 4h             自定义时间窗（30m / 6h / 12h 均可）
+    tasks -u USER --status running -k 10
+                                 按用户、状态和条数筛选
+    tasks --command REGEX        按命令正则筛选
+    tasks --no-command           隐藏任务命令
+    tasks --health               查看结果与日志末尾
+    tasks --color / --no-color   强制启用或关闭终端颜色
     result <task_id>             查看任务输出和结果
     wait <task_id>               跟踪增量日志并等待任务结束
+    wait ID1 ID2                 跟踪多个任务的状态和日志末尾
+    --json wait ID1 [ID2 ...]     每次快照变化时输出一行 JSON
     version                      显示客户端版本
 
 示例:

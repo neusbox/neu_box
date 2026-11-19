@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,7 +37,11 @@ func (client *Client) Request(
 	query url.Values,
 	payload any,
 ) (int, []byte, error) {
-	return client.requestWithHeaders(method, path, query, "", payload)
+	return client.requestWithHeaders(context.Background(), method, path, query, "", payload)
+}
+
+func (client *Client) Get(ctx context.Context, path string, query url.Values) (int, []byte, error) {
+	return client.requestWithHeaders(ctx, http.MethodGet, path, query, "", nil)
 }
 
 func (client *Client) RequestAuth(
@@ -46,10 +51,11 @@ func (client *Client) RequestAuth(
 	token string,
 	payload any,
 ) (int, []byte, error) {
-	return client.requestWithHeaders(method, path, query, token, payload)
+	return client.requestWithHeaders(context.Background(), method, path, query, token, payload)
 }
 
 func (client *Client) requestWithHeaders(
+	ctx context.Context,
 	method string,
 	path string,
 	query url.Values,
@@ -70,7 +76,7 @@ func (client *Client) requestWithHeaders(
 		body = bytes.NewReader(encoded)
 	}
 
-	request, err := http.NewRequest(method, endpoint, body)
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return 0, nil, fmt.Errorf("创建 HTTP 请求: %w", err)
 	}

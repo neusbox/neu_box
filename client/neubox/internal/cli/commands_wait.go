@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +21,7 @@ const (
 )
 
 type waitOptions struct {
-	taskID   string
+	taskIDs  []string
 	interval time.Duration
 	timeout  time.Duration
 }
@@ -31,15 +33,16 @@ type taskLogResponse struct {
 }
 
 func (a *app) runWait(args []string) int {
-	if a.jsonOutput {
-		return a.usageError("wait 会连续输出日志，暂不支持 --json；请直接使用 neubox wait <task_id>")
-	}
 	options, err := parseWaitOptions(args)
 	if err != nil {
 		return a.usageError(err.Error())
 	}
 
-	pathID := url.PathEscape(options.taskID)
+	if a.jsonOutput || len(options.taskIDs) > 1 {
+		return a.waitForTaskSnapshots(options)
+	}
+	taskID := options.taskIDs[0]
+	pathID := url.PathEscape(taskID)
 	started := time.Now()
 	logOffset := int64(0)
 	lastStatus := ""
@@ -49,7 +52,7 @@ func (a *app) runWait(args []string) int {
 			return code
 		}
 		if response.Status != lastStatus {
-			fmt.Fprintf(a.errOut, "[neubox] task %s status: %s\n", options.taskID, response.Status)
+			fmt.Fprintf(a.errOut, "[neubox] task %s status: %s\n", taskID, response.Status)
 			lastStatus = response.Status
 		}
 
@@ -77,11 +80,68 @@ func (a *app) runWait(args []string) int {
 		if options.timeout > 0 && time.Since(started) >= options.timeout {
 			return a.internalError(
 				"wait_timeout",
-				fmt.Errorf("等待任务 %s 超时；远端任务仍会继续运行", options.taskID),
+				fmt.Errorf("等待任务 %s 超时；远端任务仍会继续运行", taskID),
 			)
 		}
 		time.Sleep(options.interval)
 	}
+}
+
+func (a *app) waitForTaskSnapshots(options waitOptions) int {
+	ctx := context.Background()
+	if options.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, options.timeout)
+		defer cancel()
+	}
+	var previous string
+	for {
+		rows, code := a.taskHealthSnapshot(ctx, options.taskIDs)
+		if code != 0 {
+			return code
+		}
+		encoded, err := json.Marshal(rows)
+		if err != nil {
+			return a.internalError("invalid_worker_response", err)
+		}
+		if string(encoded) != previous {
+			if a.jsonOutput {
+				fmt.Fprintln(a.out, string(encoded))
+			} else {
+				a.printTaskHealth(rows, nil)
+			}
+			previous = string(encoded)
+		}
+		terminal, success := true, true
+		for _, row := range rows {
+			switch row.Status {
+			case "completed":
+				success = success && row.Result != nil && row.Result.ReturnCode != nil && *row.Result.ReturnCode == 0
+			case "failed", "cancelled", "canceled":
+				success = false
+			default:
+				terminal = false
+			}
+		}
+		if terminal {
+			if success {
+				return 0
+			}
+			return 1
+		}
+		timer := time.NewTimer(options.interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return a.waitSnapshotTimeout()
+		case <-timer.C:
+		}
+	}
+}
+
+func (a *app) waitSnapshotTimeout() int {
+	a.printError("wait_timeout", "监控超时，远端任务仍会继续运行")
+	return 124
 }
 
 func parseWaitOptions(args []string) (waitOptions, error) {
@@ -115,14 +175,14 @@ func parseWaitOptions(args []string) (waitOptions, error) {
 			if strings.HasPrefix(argument, "-") {
 				return options, fmt.Errorf("未知 wait 选项: %s", argument)
 			}
-			if argument == "" || options.taskID != "" {
-				return options, errors.New("用法: neubox wait <task_id> [--interval 2s] [--timeout 0]")
+			if argument == "" {
+				return options, errors.New("用法: neubox wait <task_id> [<task_id> ...] [--interval 2s] [--timeout 0]")
 			}
-			options.taskID = argument
+			options.taskIDs = append(options.taskIDs, argument)
 		}
 	}
-	if options.taskID == "" {
-		return options, errors.New("用法: neubox wait <task_id> [--interval 2s] [--timeout 0]")
+	if len(options.taskIDs) == 0 {
+		return options, errors.New("用法: neubox wait <task_id> [<task_id> ...] [--interval 2s] [--timeout 0]")
 	}
 	return options, nil
 }

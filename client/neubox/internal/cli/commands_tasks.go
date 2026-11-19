@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,16 +24,55 @@ type taskQueueResponse struct {
 const defaultTasksWindow = 2 * time.Hour
 
 type tasksOptions struct {
-	all   bool
-	since time.Duration
+	all, health, noCommand bool
+	since                  time.Duration
+	topk                   int
+	ids                    []string
+	status, user           string
+	command                *regexp.Regexp
+	color                  *bool
 }
 
 func parseTasksOptions(args []string) (tasksOptions, error) {
-	options := tasksOptions{since: defaultTasksWindow}
+	options := tasksOptions{since: defaultTasksWindow, topk: -1}
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
 		case "--all":
 			options.all = true
+		case "--health":
+			options.health = true
+		case "--no-command":
+			options.noCommand = true
+		case "--color", "--no-color":
+			color := args[index] == "--color"
+			options.color = &color
+		case "--topk", "-k", "--hash", "--task-id", "--status", "--user", "-u", "--command":
+			name := args[index]
+			raw, err := optionValue(args, &index)
+			if err != nil {
+				return options, err
+			}
+			switch name {
+			case "--topk", "-k":
+				options.topk, err = strconv.Atoi(raw)
+				if err != nil || options.topk < -1 {
+					return options, fmt.Errorf("--topk 必须是大于等于 -1 的整数: %q", raw)
+				}
+			case "--hash", "--task-id":
+				if strings.TrimSpace(raw) == "" {
+					return options, fmt.Errorf("%s 需要任务 ID", name)
+				}
+				options.ids = append(options.ids, raw)
+			case "--status":
+				options.status = raw
+			case "--user", "-u":
+				options.user = raw
+			case "--command":
+				options.command, err = regexp.Compile(raw)
+				if err != nil {
+					return options, fmt.Errorf("--command: %w", err)
+				}
+			}
 		case "--since":
 			raw, err := optionValue(args, &index)
 			if err != nil {
@@ -53,6 +95,9 @@ func (a *app) runTasks(args []string) int {
 	if err != nil {
 		return a.usageError(err.Error())
 	}
+	if options.health && len(options.ids) > 0 {
+		return a.runTaskHealth(options.ids, options)
+	}
 	status, raw, err := a.worker.Request(
 		http.MethodGet,
 		"/tasks",
@@ -69,13 +114,34 @@ func (a *app) runTasks(args []string) int {
 	if err := api.DecodeJSON(raw, &response); err != nil {
 		return a.internalError("invalid_worker_response", err)
 	}
-	visible, hidden := filterTaskList(response.Queue, options)
+	recent, hidden := filterTaskList(response.Queue, options)
+	visible := options.selectTasks(recent)
+	if options.health {
+		ids := make([]string, 0, len(visible))
+		for _, entry := range visible {
+			var task taskResultResponse
+			if json.Unmarshal(entry, &task) == nil && entryID(task) != "" {
+				ids = append(ids, entryID(task))
+			}
+		}
+		return a.runTaskHealth(ids, options)
+	}
 
 	if a.jsonOutput {
-		if hidden == 0 {
+		if len(visible) == len(response.Queue) && !options.noCommand {
 			// 没有过滤掉任何条目：直接透传 Worker 原始响应。
 			_ = printJSON(a.out, raw)
 		} else {
+			if options.noCommand {
+				for index, entry := range visible {
+					var fields map[string]json.RawMessage
+					if err := api.DecodeJSON(entry, &fields); err != nil {
+						return a.internalError("invalid_worker_response", err)
+					}
+					delete(fields, "command")
+					visible[index], _ = json.Marshal(fields)
+				}
+			}
 			// RawMessage 保留 Worker 返回的全部字段（eta/priority/target 等）。
 			_ = printJSONValue(a.out, struct {
 				Queue        []json.RawMessage `json:"queue"`
@@ -104,10 +170,10 @@ func (a *app) runTasks(args []string) int {
 	}
 	for _, task := range tasks {
 		fmt.Fprintln(a.out)
-		fmt.Fprintf(a.out, "    %s\n", entryID(task))
+		fmt.Fprintf(a.out, "    %s\n", a.taskColor(options.color, "1;36", entryID(task)))
 		fmt.Fprintf(a.out, "        kind: %s\n", entryKind(task))
-		fmt.Fprintf(a.out, "        status: %s\n", task.Status)
-		fmt.Fprintf(a.out, "        user: %s\n", task.UserID)
+		fmt.Fprintf(a.out, "        status: %s\n", a.taskColor(options.color, taskStatusColors[task.Status], task.Status))
+		fmt.Fprintf(a.out, "        user: %s\n", a.taskColor(options.color, "35", task.UserID))
 		if entryKind(task) == "acquire" {
 			// acquire 是会话不是命令任务：没有 command / 日志 / 退出码。
 			if task.PID != 0 {
@@ -116,7 +182,7 @@ func (a *app) runTasks(args []string) int {
 			if task.Sandbox != "" {
 				fmt.Fprintf(a.out, "        sandbox: %s\n", task.Sandbox)
 			}
-		} else {
+		} else if !options.noCommand {
 			fmt.Fprintf(a.out, "        command: %s\n", task.Command)
 		}
 		if task.Position > 0 {
@@ -127,6 +193,59 @@ func (a *app) runTasks(args []string) int {
 		}
 	}
 	return 0
+}
+
+func (options tasksOptions) selectTasks(queue []json.RawMessage) []json.RawMessage {
+	if len(options.ids) > 0 || options.status != "" || options.user != "" || options.command != nil || options.health {
+		selected := make([]json.RawMessage, 0, len(queue))
+		ids := make(map[string]bool, len(options.ids))
+		for _, id := range options.ids {
+			ids[id] = true
+		}
+		for _, entry := range queue {
+			var task taskResultResponse
+			if json.Unmarshal(entry, &task) != nil ||
+				(options.health && entryKind(task) != "task") ||
+				(len(ids) > 0 && !ids[entryID(task)]) ||
+				(options.status != "" && options.status != task.Status) ||
+				(options.user != "" && options.user != task.UserID) ||
+				(options.command != nil && !options.command.MatchString(task.Command)) {
+				continue
+			}
+			selected = append(selected, entry)
+		}
+		queue = selected
+	}
+	if options.topk >= 0 && options.topk < len(queue) {
+		queue = queue[:options.topk]
+	}
+	return queue
+}
+
+var taskStatusColors = map[string]string{
+	"queued": "1;33", "pending": "1;33", "running": "1;32", "completed": "1;36",
+	"failed": "1;31", "cancelled": "1;90", "canceled": "1;90",
+}
+
+func (a *app) taskColor(color *bool, style, value string) string {
+	if style == "" || value == "" {
+		return value
+	}
+	if color != nil {
+		if !*color {
+			return value
+		}
+	} else {
+		file, ok := a.out.(*os.File)
+		if !ok || os.Getenv("TERM") == "dumb" || os.Getenv("NO_COLOR") != "" {
+			return value
+		}
+		info, err := file.Stat()
+		if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+			return value
+		}
+	}
+	return "\x1b[" + style + "m" + value + "\x1b[0m"
 }
 
 // filterTaskList 实现 tasks 默认视图：
