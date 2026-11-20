@@ -219,3 +219,31 @@ func TestTasksBadSinceRejected(t *testing.T) {
 		t.Fatalf("missing since error: %s", errOut.String())
 	}
 }
+
+func TestTasksFiltersBeforeHidingCommand(t *testing.T) {
+	application, out, errOut := testApplication(tasksQueueServer(t).URL)
+	args := []string{"tasks", "-u", "yuxd", "--status", "completed", "--command", "^echo ", "-k", "1", "--no-command"}
+	if code := application.run(args); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	if got := out.String(); !strings.Contains(got, "ok-1") || strings.Contains(got, "command:") || strings.Contains(got, "notime-1") {
+		t.Fatalf("unexpected task list: %s", got)
+	}
+
+	out.Reset()
+	if code := application.run(append([]string{"--json"}, args...)); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	var output struct {
+		Queue []map[string]any `json:"queue"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Queue) != 1 || output.Queue[0]["task_id"] != "ok-1" {
+		t.Fatalf("unexpected queue: %v", output.Queue)
+	}
+	if _, ok := output.Queue[0]["command"]; ok {
+		t.Fatalf("command was present: %v", output.Queue)
+	}
+}

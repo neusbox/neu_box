@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -89,5 +90,50 @@ func TestWaitReturnsFailureForFailedTask(t *testing.T) {
 	}
 	if out.String() != "boom\n" || !strings.Contains(errOut.String(), "finished: failed rc=2") {
 		t.Fatalf("stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+}
+
+func TestWaitSnapshotsAndTaskHealth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/tasks/ok/log", "/tasks/bad/log", "/tasks/active/log":
+			if query := request.URL.Query(); query.Get("tail") != "1500" || query.Get("raw") != "1" {
+				t.Errorf("unexpected log query: %v", query)
+			}
+			_, _ = io.WriteString(writer, "recent log\n")
+		case "/tasks/active":
+			writeJSON(t, writer, http.StatusOK, map[string]any{"task_id": "active", "status": "running"})
+		case "/tasks/ok", "/tasks/bad":
+			id := strings.TrimPrefix(request.URL.Path, "/tasks/")
+			rc := 0
+			if id == "bad" {
+				rc = 1
+			}
+			writeJSON(t, writer, http.StatusOK, map[string]any{
+				"task_id": id, "status": "completed", "result": map[string]any{"returncode": rc},
+			})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	for _, test := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"wait", "ok"}, 0},
+		{[]string{"wait", "ok", "bad"}, 1},
+		{[]string{"tasks", "--task-id", "bad", "--health"}, 0},
+		{[]string{"wait", "active", "--timeout", "100ms"}, 124},
+	} {
+		application, out, errOut := testApplication(server.URL)
+		code := application.run(append([]string{"--json"}, test.args...))
+		if code != test.code {
+			t.Fatalf("%v exit=%d, want %d (stderr=%s)", test.args, code, test.code, errOut.String())
+		}
+		if code != 124 && !strings.Contains(out.String(), `"log_tail":"recent log\n"`) {
+			t.Fatalf("missing log tail: %s", out.String())
+		}
 	}
 }

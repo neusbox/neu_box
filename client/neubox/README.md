@@ -17,6 +17,8 @@ neubox docker run DOCKER_ARGS 透传 docker run，自动补沙盒 annotation
 neubox docker start 容器 [参数] 借条式改绑：把当前 shell 的沙盒借给停着的容器
 neubox {list|status|join}      沙盒管理
 neubox tasks [--all | --since 4h]
+neubox tasks -u USER --status running -k 10 --no-command
+neubox --json tasks --task-id TASK_ID --health
                                任务队列（默认：活跃任务 + 近 2h 结束的）
 neubox {result|log} TASK_ID    结果快照 / 完整日志
 neubox wait TASK_ID            增量跟踪日志并等待任务结束
@@ -106,16 +108,28 @@ shell 换沙盒继续用同一个容器要走 `neubox docker start`；直接敲�
 调用都刷出 worker 保留的全部历史记录；`--all` 显示 worker 返回的全部条目，
 `--since 4h` 可自定义时间窗（如 `30m` / `12h`）。
 
+`--task-id`（别名 `--hash`）可重复指定。`--status`、`--user`（`-u`）和
+`--command REGEX` 用于筛选，`--topk`（`-k`）限制筛选后的条数。
+`--no-command` 在文本和 JSON 列表中隐藏任务命令。
+
+`--health` 显示任务结果和日志末尾 1500 字节。
+
 `result` 返回调用时的状态与完整日志快照。长任务应使用：
 
 ```bash
 neubox wait TASK_ID
 neubox wait TASK_ID --interval 5s --timeout 2h
+neubox wait TASK_ID OTHER_TASK_ID
+neubox --json wait TASK_ID OTHER_TASK_ID --timeout 10m
 ```
 
 `wait` 使用日志接口的字节 offset 只读取新增部分，同时轮询任务状态；进入终态后
 再拉取一次剩余日志。日志写到 stdout，状态变化写到 stderr，任务 `completed`
 退出 0，`failed` 退出非 0。中断或本地超时只停止跟踪，不会取消远端任务。
+
+指定多个任务 ID 或使用 `--json` 时，`wait` 会在状态、结果或日志末尾 1500 字节变化时
+输出快照。JSON 模式每次输出一行 JSON 数组。全部任务退出码为 0 时退出 0，
+任一任务失败时退出 1，监控超时退出 124。轮询间隔默认为 2 秒，`--timeout 0` 表示不限时。
 
 ## 环境变量
 
